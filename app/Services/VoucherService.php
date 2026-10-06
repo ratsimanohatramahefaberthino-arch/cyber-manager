@@ -264,20 +264,17 @@ class VoucherService
     }
 
     /**
-     * Les identifiants protégés sont TOUJOURS ignorés ici : la seule façon de
-     * les supprimer est de d'abord les déprotéger (bascule du cadenas dans
-     * le tableau), ce qui les rend sélectionnables.
-     *
      * @param  int[]  $ids
+     * @param  bool   $inclureProteges  true après saisie du username (déprotection explicite)
      * @return array{supprimes:int, proteges_ignores:int, echecs:int}
      */
-    public function supprimerEnMasse(array $ids): array
+    public function supprimerEnMasse(array $ids, bool $inclureProteges = false): array
     {
         $ids = array_values(array_unique(array_map('intval', $ids)));
         $resultat = ['supprimes' => 0, 'proteges_ignores' => 0, 'echecs' => 0];
 
         foreach (Voucher::whereIn('id', $ids)->get() as $voucher) {
-            if ($voucher->protege) {
+            if ($voucher->protege && !$inclureProteges) {
                 $resultat['proteges_ignores']++;
                 continue;
             }

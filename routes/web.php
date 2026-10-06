@@ -85,6 +85,9 @@ Route::middleware('auth')->group(function () {
 
     Route::get('/hotspot/imprimer/{lot}', [HotspotController::class, 'imprimerLot'])
         ->name('hotspot.imprimer.lot');
+    
+    Route::get('/hotspot/imprimer-disponibles', [HotspotController::class, 'imprimerDisponibles'])
+    ->name('hotspot.imprimer.disponibles');
 
     Route::post('/hotspot/{voucher}/proteger', [HotspotController::class, 'proteger'])
         ->name('hotspot.proteger');

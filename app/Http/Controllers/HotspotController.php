@@ -36,8 +36,19 @@ class HotspotController extends Controller
     }
 
     /** Endpoint JSON scruté toutes les 6s par le tableau (état quasi temps réel). */
+        /** Endpoint JSON scruté toutes les 6s par le tableau (état quasi temps réel). */
     public function etat(Request $request)
     {
+        // Synchronise l'état des sessions (disponible → en_cours → utilise)
+        // sans bloquer l'affichage en cas d'erreur MikroTik.
+        try {
+            if (\Illuminate\Support\Facades\Cache::add('hotspot_sync_lock', true, 15)) {
+                app(\App\Services\WifiSessionService::class)->synchroniser();
+            }
+        } catch (\Throwable $e) {
+            \Illuminate\Support\Facades\Log::debug('Sync HotSpot silencieuse échouée', ['error' => $e->getMessage()]);
+        }
+
         $filtres  = $this->filtresDepuis($request);
         $vouchers = $this->requeteBase($filtres)->paginate(self::PAR_PAGE)->withQueryString();
 
@@ -135,7 +146,7 @@ class HotspotController extends Controller
         return redirect()->route('hotspot.index')->with('success', $message);
     }
 
-    public function imprimerLot(LotVoucher $lot)
+        public function imprimerLot(LotVoucher $lot)
     {
         $vouchers = Voucher::where('lot_voucher_id', $lot->id)->orderBy('id')->get();
 
@@ -143,7 +154,41 @@ class HotspotController extends Controller
             abort(404);
         }
 
-        return view('hotspot.print-lot', ['vouchers' => $vouchers]);
+        $ssid   = config('mikrotik.ssid_default') ?: 'HotSpot';
+        $profil = $vouchers->first()->profil ?: 'default';
+        $date   = now()->format('m.d.y');
+
+        return view('hotspot.print-lot', [
+            'vouchers'   => $vouchers,
+            'titre'      => 'Lot #' . $lot->id,
+            'nomFichier' => "Voucher-{$ssid}-{$profil}-up-{$lot->id}-{$date}-",
+        ]);
+    }
+
+    public function imprimerDisponibles()
+    {
+        // Uniquement les identifiants créés AUTOMATIQUEMENT (bouton "Générer")
+        // et encore disponibles. Les identifiants créés manuellement (Ajouter)
+        // sont exclus : ils peuvent servir pour l'admin, un poste, etc.
+        $vouchers = Voucher::where('etat', 'disponible')
+            ->where('source', 'cyber_manager')
+            ->orderBy('id')
+            ->limit(500)
+            ->get();
+
+        if ($vouchers->isEmpty()) {
+            return back()->with('error', 'Aucun identifiant généré automatiquement et disponible à imprimer.');
+        }
+
+        $ssid   = config('mikrotik.ssid_default') ?: 'HotSpot';
+        $profil = $vouchers->first()->profil ?: 'default';
+        $date   = now()->format('m.d.y');
+
+        return view('hotspot.print-lot', [
+            'vouchers'   => $vouchers,
+            'titre'      => 'Identifiants disponibles',
+            'nomFichier' => "Voucher-{$ssid}-{$profil}-up-{$date}-",
+        ]);
     }
 
     public function proteger(Voucher $voucher)
@@ -180,9 +225,10 @@ class HotspotController extends Controller
         $data = $request->validate([
             'ids'   => ['required', 'array', 'min:1', 'max:200'],
             'ids.*' => ['integer'],
+            'force' => ['nullable', 'boolean'],
         ]);
 
-        $r = $this->voucherService->supprimerEnMasse($data['ids']);
+        $r = $this->voucherService->supprimerEnMasse($data['ids'], !empty($data['force']));
 
         $msg = "{$r['supprimes']} identifiant(s) supprimé(s)";
         if ($r['proteges_ignores'] > 0) {
@@ -191,8 +237,13 @@ class HotspotController extends Controller
         if ($r['echecs'] > 0) {
             $msg .= ", {$r['echecs']} en échec";
         }
+        $msg .= '.';
 
-        return back()->with('success', $msg . '.');
+        if ($request->expectsJson()) {
+            return response()->json(['message' => $msg, 'resultat' => $r]);
+        }
+
+        return back()->with('success', $msg);
     }
 
     public function poolMode(Request $request)
