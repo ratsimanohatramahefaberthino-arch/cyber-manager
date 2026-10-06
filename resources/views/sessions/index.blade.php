@@ -20,7 +20,6 @@
 
 <div class="grid grid-cols-1 lg:grid-cols-3 gap-6 mb-10">
 
-```
 <div class="lg:col-span-1 bg-white rounded-xl shadow-sm border border-gray-200 p-6">
     <h2 class="text-xl font-bold text-gray-800 mb-5">
         Activer une session
@@ -141,14 +140,37 @@
                     <tbody class="divide-y divide-gray-200 bg-white">
                         @foreach ($sessions as $session)
                             <tr>
+                                {{-- Poste ou identifiant Wi-Fi --}}
                                 <td class="px-6 py-4 whitespace-nowrap font-medium text-gray-800">
-                                    {{ $session->poste?->nom_poste ?? 'Wi-Fi' }}
+                                    @if ($session->type_session === 'wifi')
+                                        <div>Wi-Fi · {{ $session->hotspot_username ?? '—' }}</div>
+                                        @if ($session->client_ip)
+                                            <div class="text-xs text-gray-500 font-mono">
+                                                {{ $session->client_ip }}
+                                                @if ($session->client_mac)
+                                                    · {{ $session->client_mac }}
+                                                @endif
+                                            </div>
+                                        @endif
+                                    @else
+                                        {{ $session->poste?->nom_poste ?? '—' }}
+                                    @endif
                                 </td>
 
-                                <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-600">
-                                    {{ strtoupper($session->type_session) }}
+                                {{-- Type --}}
+                                <td class="px-6 py-4 whitespace-nowrap text-sm">
+                                    @if ($session->type_session === 'wifi')
+                                        <span class="px-2 py-1 rounded text-xs bg-purple-100 text-purple-800">
+                                            Wi-Fi
+                                        </span>
+                                    @else
+                                        <span class="px-2 py-1 rounded text-xs bg-blue-100 text-blue-800">
+                                            Ethernet
+                                        </span>
+                                    @endif
                                 </td>
 
+                                {{-- État --}}
                                 <td class="px-6 py-4 whitespace-nowrap">
                                     @if ($session->etat === 'en_cours')
                                         <span class="px-3 py-1 text-xs font-semibold rounded-full bg-green-100 text-green-700">
@@ -162,6 +184,10 @@
                                         <span class="px-3 py-1 text-xs font-semibold rounded-full bg-red-100 text-red-700">
                                             Expirée
                                         </span>
+                                    @elseif ($session->etat === 'terminee')
+                                        <span class="px-3 py-1 text-xs font-semibold rounded-full bg-gray-100 text-gray-700">
+                                            Terminée
+                                        </span>
                                     @else
                                         <span class="px-3 py-1 text-xs font-semibold rounded-full bg-gray-100 text-gray-700">
                                             {{ ucfirst($session->etat) }}
@@ -169,11 +195,13 @@
                                     @endif
                                 </td>
 
+                                {{-- Temps --}}
                                 <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-600">
                                     {{ $session->duree_consommee }} min /
                                     {{ $session->duree_prevue }} min
                                 </td>
 
+                                {{-- Montant --}}
                                 <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-600">
                                     {{ $session->montant_consomme }} Ar /
                                     {{ $session->montant_total }} Ar
@@ -186,7 +214,6 @@
         @endif
     </div>
 </div>
-```
 
 </div>
 @endsection

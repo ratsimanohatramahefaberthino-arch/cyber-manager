@@ -1,0 +1,3748 @@
+================================================================================
+GENERATOR — Contenu des fichiers du projet Cyber Manager
+================================================================================
+
+Projet : E:\xampp\htdocs\cyber-manager
+Nombre de fichiers demandés : 27
+
+Ce document contient le code source actuel des fichiers
+concernés par l'étape en cours. Il doit être envoyé à Claude
+en complément du prompt d'étape.
+
+================================================================================
+SOMMAIRE
+================================================================================
+
+    1. app/Services/MikroTikService.php
+    2. app/Services/MikroTik/MikrotikConnection.php
+    3. app/Services/WifiSessionService.php
+    4. app/Services/VoucherService.php
+    #5. app/Services/VoucherReplenishmentService.php
+    6. app/Services/SessionService.php
+    7. app/Services/AgentWindowsService.php
+    8. app/Models/Voucher.php
+    9. app/Models/Session.php
+   10. app/Models/LotVoucher.php
+   11. app/Models/AppareilWifi.php
+   12. app/Models/Poste.php
+   13. app/Http/Controllers/VoucherController.php
+   14. app/Http/Controllers/WifiController.php
+   15. app/Http/Controllers/SessionController.php
+   16. app/Http/Controllers/DashboardController.php
+   17. resources/views/vouchers/index.blade.php
+   18. resources/views/vouchers/create.blade.php
+   19. resources/views/layouts/cyber-manager.blade.php
+   20. config/mikrotik.php
+   21. routes/web.php
+   22. routes/console.php
+   23. app/Console/Commands/WifiSyncSessionsCommand.php
+   24. app/Console/Commands/MikrotikTestCommand.php
+   25. database/migrations/2026_09_25_093115_create_vouchers_table.php
+   26. database/migrations/2026_09_25_093109_create_lot_vouchers_table.php
+   27. database/migrations/2026_09_28_200000_add_wifi_fields_to_sessions_table.php
+
+================================================================================
+FICHIER : app/Services/MikroTikService.php
+================================================================================
+
+<?php
+
+namespace App\Services;
+
+use App\Services\MikroTik\MikrotikConnection;
+use RuntimeException;
+
+/**
+ * Façade haut niveau vers l'API RouterOS.
+ *
+ * Responsabilités :
+ *  - gérer la connexion + login ;
+ *  - exposer des méthodes métier simples (listHotspotUsers, ...) ;
+ *  - isoler toute la cuisine du protocole dans MikrotikConnection.
+ *
+ * Ne contient AUCUN accès aux Controllers, AUCUN SQL.
+ */
+class MikroTikService
+{
+    private ?MikrotikConnection $connection = null;
+    private bool $loggedIn = false;
+
+    public function __construct(
+        private array $config
+    ) {
+    }
+
+    public function connection(): MikrotikConnection
+    {
+        if ($this->connection === null) {
+            $this->connection = new MikrotikConnection(
+                host:   $this->config['host'],
+                port:   (int) $this->config['port'],
+                timeout: (float) $this->config['timeout'],
+                useSsl: (bool) $this->config['ssl'],
+            );
+        }
+        return $this->connection;
+    }
+
+    public function login(): void
+    {
+        if ($this->loggedIn) {
+            return;
+        }
+
+        $this->connection()->connect();
+
+        $reply = $this->connection()->sendSentence([
+            '/login',
+            '=name='     . $this->config['user'],
+            '=password=' . $this->config['password'],
+        ]);
+
+        if (!$this->replyHasDone($reply)) {
+            $msg = $this->extractTrapMessage($reply) ?? 'Login MikroTik échoué';
+            $this->disconnect();
+            throw new RuntimeException($msg);
+        }
+
+        $this->loggedIn = true;
+    }
+
+    public function disconnect(): void
+    {
+        if ($this->connection !== null) {
+            $this->connection->disconnect();
+        }
+        $this->connection = null;
+        $this->loggedIn   = false;
+    }
+
+    /**
+     * Vérifie la connexion et retourne les infos de base du routeur.
+     *
+     * @return array{identity: ?string, version: ?string, board_name: ?string, uptime: ?string}
+     */
+    public function testConnection(): array
+    {
+        $identity = $this->query('/system/identity/print');
+        $resource = $this->query('/system/resource/print');
+
+        return [
+            'identity'   => $identity[0]['name']       ?? null,
+            'version'    => $resource[0]['version']    ?? null,
+            'board_name' => $resource[0]['board-name'] ?? null,
+            'uptime'     => $resource[0]['uptime']     ?? null,
+        ];
+    }
+
+    /**
+     * Envoie une commande /... et retourne uniquement les enregistrements !re.
+     *
+     * @param  array<string, scalar>  $arguments
+     * @return array<int, array<string,string>>
+     */
+        public function query(string $command, array $arguments = []): array
+    {
+        $words = [$command];
+        foreach ($arguments as $key => $value) {
+            $words[] = "={$key}={$value}";
+        }
+        return $this->send($words);
+    }
+
+    public function queryFiltered(string $command, array $filters = []): array
+    {
+        $words = [$command];
+        foreach ($filters as $key => $value) {
+            $words[] = "?{$key}={$value}";
+        }
+        return $this->send($words);
+    }
+
+    public function queryWithId(string $command, string $id, array $arguments = []): array
+    {
+        $words = [$command, "=.id={$id}"];
+        foreach ($arguments as $key => $value) {
+            $words[] = "={$key}={$value}";
+        }
+        return $this->send($words);
+    }
+
+    /**
+     * @param  string[]  $words
+     * @return array<int, array<string,string>>
+     */
+    private function send(array $words): array
+    {
+        $this->login();
+
+        $reply = $this->connection()->sendSentence($words);
+
+        if ($this->replyHasTrap($reply)) {
+            $msg = $this->extractTrapMessage($reply);
+            throw new RuntimeException(
+                'MikroTik ' . ($words[0] ?? '?') . ' : ' . $msg
+            );
+        }
+
+        $records = [];
+        foreach ($reply as $item) {
+            if ($item['type'] === '!re') {
+                $records[] = $item['attributes'];
+            }
+        }
+        return $records;
+    }
+
+    /**
+     * Liste les utilisateurs HotSpot configurés.
+     */
+    public function listHotspotUsers(): array
+    {
+        return $this->query('/ip/hotspot/user/print');
+    }
+
+    /**
+     * Liste les sessions HotSpot actuellement actives.
+     */
+    public function listHotspotActive(): array
+    {
+        return $this->query('/ip/hotspot/active/print');
+    }
+
+    /**
+     * Liste les profils HotSpot.
+     */
+    public function listHotspotProfiles(): array
+    {
+        return $this->query('/ip/hotspot/user/profile/print');
+    }
+
+        /**
+     * Crée un utilisateur HotSpot.
+     *
+     * @throws \RuntimeException si la commande échoue côté RouterOS
+     */
+    public function createHotspotUser(
+        string $username,
+        string $password,
+        ?string $profile = null,
+        ?string $comment = null,
+        ?string $limitUptime = null,
+    ): void {
+        $profile ??= config('mikrotik.hotspot_profile', 'default');
+
+        $args = [
+            'name'     => $username,
+            'password' => $password,
+            'profile'  => $profile,
+        ];
+
+        if ($comment !== null && $comment !== '') {
+            $args['comment'] = $comment;
+        }
+        if ($limitUptime !== null && $limitUptime !== '') {
+            $args['limit-uptime'] = $limitUptime;
+        }
+
+        $this->query('/ip/hotspot/user/add', $args);
+    }
+
+    /**
+     * Recherche un utilisateur HotSpot par nom exact.
+     * Retourne le premier enregistrement trouvé ou null.
+     */
+    public function findHotspotUser(string $username): ?array
+    {
+        $rows = $this->queryFiltered('/ip/hotspot/user/print', [
+            'name' => $username,
+        ]);
+
+        return $rows[0] ?? null;
+    }
+
+    /**
+     * Supprime un utilisateur HotSpot par nom.
+     * Retourne true si supprimé, false s'il n'existait pas.
+     */
+    public function deleteHotspotUser(string $username): bool
+    {
+        $user = $this->findHotspotUser($username);
+
+        if ($user === null || !isset($user['.id'])) {
+            return false;
+        }
+
+        $this->queryWithId('/ip/hotspot/user/remove', $user['.id']);
+
+        return true;
+    }
+
+    /**
+     * Liste uniquement les utilisateurs créés par Cyber Manager
+     * (ceux dont le nom commence par le préfixe configuré).
+     *
+     * @return array<int, array<string,string>>
+     */
+    public function listCyberManagerHotspotUsers(): array
+    {
+        $prefix = config('mikrotik.hotspot_user_prefix', 'cm-');
+
+        return array_values(array_filter(
+            $this->listHotspotUsers(),
+            fn (array $u) => str_starts_with($u['name'] ?? '', $prefix)
+        ));
+    }
+
+        /**
+     * Baux DHCP — tous les appareils connus du réseau (même non authentifiés).
+     */
+    public function listDhcpLeases(): array
+    {
+        return $this->query('/ip/dhcp-server/lease/print');
+    }
+
+    /**
+     * Hosts connus du HotSpot — appareils ayant déjà été vus par le portail.
+     */
+    public function listHotspotHosts(): array
+    {
+        return $this->query('/ip/hotspot/host/print');
+    }
+
+    /**
+     * Détail d'une session HotSpot active par son .id.
+     */
+    public function findHotspotActive(string $id): ?array
+    {
+        $rows = $this->queryFiltered('/ip/hotspot/active/print', [
+            '.id' => $id,
+        ]);
+
+        return $rows[0] ?? null;
+    }
+
+        /**
+     * Déconnecte un client actif par son adresse MAC.
+     * Retourne true si une session active a été trouvée et supprimée.
+     */
+    public function disconnectHotspotActiveByMac(string $mac): bool
+    {
+        $rows = $this->queryFiltered('/ip/hotspot/active/print', [
+            'mac-address' => $mac,
+        ]);
+
+        if (empty($rows) || !isset($rows[0]['.id'])) {
+            return false;
+        }
+
+        $this->queryWithId('/ip/hotspot/active/remove', $rows[0]['.id']);
+
+        return true;
+    }
+
+    /**
+     * Active ou désactive un compte HotSpot.
+     */
+    public function setHotspotUserDisabled(string $username, bool $disabled): bool
+    {
+        $user = $this->findHotspotUser($username);
+
+        if ($user === null || !isset($user['.id'])) {
+            return false;
+        }
+
+        $this->queryWithId('/ip/hotspot/user/set', $user['.id'], [
+            'disabled' => $disabled ? 'yes' : 'no',
+        ]);
+
+        return true;
+    }
+
+        /**
+     * Convertit une durée en minutes au format uptime RouterOS.
+     * Ex: 30 → "30m", 90 → "1h30m", 1500 → "1d1h".
+     */
+    public static function formatUptime(int $minutes): string
+    {
+        if ($minutes <= 0) {
+            return '1m';
+        }
+
+        $days  = intdiv($minutes, 1440);
+        $hours = intdiv($minutes % 1440, 60);
+        $mins  = $minutes % 60;
+
+        $out = '';
+        if ($days  > 0) { $out .= "{$days}d"; }
+        if ($hours > 0) { $out .= "{$hours}h"; }
+        if ($mins  > 0) { $out .= "{$mins}m"; }
+
+        return $out ?: '1m';
+    }
+
+    // -----------------------------------------------------------------
+    // Helpers
+    // -----------------------------------------------------------------
+
+    private function replyHasDone(array $reply): bool
+    {
+        foreach ($reply as $item) {
+            if ($item['type'] === '!done') {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private function replyHasTrap(array $reply): bool
+    {
+        foreach ($reply as $item) {
+            if ($item['type'] === '!trap' || $item['type'] === '!fatal') {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private function extractTrapMessage(array $reply): ?string
+    {
+        foreach ($reply as $item) {
+            if ($item['type'] === '!trap' || $item['type'] === '!fatal') {
+                return $item['attributes']['message']
+                    ?? $item['attributes']['category']
+                    ?? 'Erreur inconnue';
+            }
+        }
+        return null;
+    }
+}
+
+
+================================================================================
+FICHIER : app/Services/MikroTik/MikrotikConnection.php
+================================================================================
+
+<?php
+
+namespace App\Services\MikroTik;
+
+use RuntimeException;
+
+/**
+ * Connexion TCP bas niveau à l'API RouterOS (port 8728 / 8729 SSL).
+ *
+ * Ne contient AUCUNE logique métier : uniquement l'encodage/décodage
+ * du protocole "sentences" de RouterOS.
+ *
+ * Compatible RouterOS 6.43+ (login simple) et 7.x.
+ */
+class MikrotikConnection
+{
+    /** @var resource|null */
+    private $socket = null;
+
+    public function __construct(
+        private string $host,
+        private int $port = 8728,
+        private float $timeout = 5.0,
+        private bool $useSsl = false,
+    ) {
+    }
+
+    public function connect(): void
+    {
+        if ($this->socket !== null) {
+            return;
+        }
+
+        $transport = $this->useSsl ? 'ssl' : 'tcp';
+        $address   = "{$transport}://{$this->host}:{$this->port}";
+
+        // Pour SSL auto-signé (RouterOS par défaut). À durcir plus tard.
+        $context = stream_context_create([
+            'ssl' => [
+                'verify_peer'      => false,
+                'verify_peer_name' => false,
+            ],
+        ]);
+
+        $errno  = 0;
+        $errstr = '';
+
+        $socket = @stream_socket_client(
+            $address,
+            $errno,
+            $errstr,
+            $this->timeout,
+            STREAM_CLIENT_CONNECT,
+            $context
+        );
+
+        if ($socket === false) {
+            throw new RuntimeException(
+                "Connexion MikroTik impossible ({$this->host}:{$this->port}) : "
+                . "{$errstr} (errno {$errno})"
+            );
+        }
+
+        stream_set_timeout($socket, (int) $this->timeout);
+        $this->socket = $socket;
+    }
+
+    public function disconnect(): void
+    {
+        if ($this->socket !== null) {
+            @fclose($this->socket);
+            $this->socket = null;
+        }
+    }
+
+    public function isConnected(): bool
+    {
+        return $this->socket !== null;
+    }
+
+    /**
+     * Envoie une phrase (liste de mots) et retourne la réponse complète
+     * jusqu'à !done ou !fatal.
+     *
+     * @param  string[]  $words
+     * @return array<int, array{type: string, attributes: array<string,string>}>
+     */
+    public function sendSentence(array $words): array
+    {
+        if ($this->socket === null) {
+            throw new RuntimeException('Non connecté au MikroTik.');
+        }
+
+        foreach ($words as $word) {
+            $this->writeWord($word);
+        }
+        // Fin de phrase = mot vide
+        $this->writeWord('');
+
+        return $this->readReply();
+    }
+
+    // -----------------------------------------------------------------
+    // Encodage / décodage
+    // -----------------------------------------------------------------
+
+    private function writeWord(string $word): void
+    {
+        fwrite($this->socket, $this->encodeLength(strlen($word)) . $word);
+    }
+
+    private function encodeLength(int $length): string
+    {
+        if ($length < 0x80) {
+            return chr($length);
+        }
+        if ($length < 0x4000) {
+            $length |= 0x8000;
+            return chr(($length >> 8) & 0xFF) . chr($length & 0xFF);
+        }
+        if ($length < 0x200000) {
+            $length |= 0xC00000;
+            return chr(($length >> 16) & 0xFF)
+                 . chr(($length >> 8) & 0xFF)
+                 . chr($length & 0xFF);
+        }
+        if ($length < 0x10000000) {
+            $length |= 0xE0000000;
+            return chr(($length >> 24) & 0xFF)
+                 . chr(($length >> 16) & 0xFF)
+                 . chr(($length >> 8) & 0xFF)
+                 . chr($length & 0xFF);
+        }
+        return chr(0xF0)
+             . chr(($length >> 24) & 0xFF)
+             . chr(($length >> 16) & 0xFF)
+             . chr(($length >> 8) & 0xFF)
+             . chr($length & 0xFF);
+    }
+
+    private function readLength(): int
+    {
+        $byte = ord($this->readBytes(1));
+
+        if (($byte & 0x80) === 0x00) {
+            return $byte;
+        }
+        if (($byte & 0xC0) === 0x80) {
+            $b2 = ord($this->readBytes(1));
+            return (($byte & 0x3F) << 8) | $b2;
+        }
+        if (($byte & 0xE0) === 0xC0) {
+            $rest = $this->readBytes(2);
+            return (($byte & 0x1F) << 16) | unpack('n', $rest)[1];
+        }
+        if (($byte & 0xF0) === 0xE0) {
+            $rest = $this->readBytes(3);
+            return (($byte & 0x0F) << 24) | unpack('N', "\x00" . $rest)[1];
+        }
+        if (($byte & 0xF8) === 0xF0) {
+            return unpack('N', $this->readBytes(4))[1];
+        }
+
+        throw new RuntimeException(
+            'Longueur MikroTik invalide : 0x' . dechex($byte)
+        );
+    }
+
+    private function readBytes(int $n): string
+    {
+        $buffer = '';
+        while (strlen($buffer) < $n) {
+            $chunk = fread($this->socket, $n - strlen($buffer));
+
+            if ($chunk === false || $chunk === '') {
+                $info = stream_get_meta_data($this->socket);
+                if (!empty($info['timed_out'])) {
+                    throw new RuntimeException('Timeout de lecture MikroTik.');
+                }
+                if (feof($this->socket)) {
+                    throw new RuntimeException('Connexion MikroTik fermée.');
+                }
+                throw new RuntimeException('Lecture MikroTik échouée.');
+            }
+            $buffer .= $chunk;
+        }
+        return $buffer;
+    }
+
+    /**
+     * Lit une réponse complète jusqu'à !done ou !fatal.
+     */
+    private function readReply(): array
+    {
+        $reply = [];
+
+        while (true) {
+            $sentence = $this->readSentence();
+
+            if (empty($sentence)) {
+                continue;
+            }
+
+            $type       = array_shift($sentence);
+            $attributes = [];
+
+            foreach ($sentence as $word) {
+                if ($word === '' || $word[0] !== '=') {
+                    continue;
+                }
+                $rest  = substr($word, 1);
+                $eqPos = strpos($rest, '=');
+                if ($eqPos === false) {
+                    $attributes[$rest] = '';
+                } else {
+                    $attributes[substr($rest, 0, $eqPos)] = substr($rest, $eqPos + 1);
+                }
+            }
+
+            $reply[] = [
+                'type'       => $type,
+                'attributes' => $attributes,
+            ];
+
+            if ($type === '!done' || $type === '!fatal') {
+                return $reply;
+            }
+        }
+    }
+
+    /**
+     * @return string[]
+     */
+    private function readSentence(): array
+    {
+        $words = [];
+        while (true) {
+            $length = $this->readLength();
+            if ($length === 0) {
+                return $words;
+            }
+            $words[] = $this->readBytes($length);
+        }
+    }
+}
+
+
+================================================================================
+FICHIER : app/Services/WifiSessionService.php
+================================================================================
+
+<?php
+
+namespace App\Services;
+
+use App\Models\AppareilWifi;
+use App\Models\Session;
+use App\Models\Voucher;
+use Illuminate\Support\Facades\Log;
+
+/**
+ * Synchronise les sessions HotSpot actives du MikroTik avec la base.
+ *
+ * Ne modifie JAMAIS le MikroTik. Lecture seule côté réseau.
+ * Le MikroTik reste l'autorité pour savoir "qui est connecté".
+ *
+ * Cycle de vie d'un voucher piloté ici :
+ *  - session ouverte  : disponible/utilise → en_cours
+ *  - session fermée   : temporaire → utilise (ou expire si temps épuisé)
+ *                       permanent  → disponible (réutilisable)
+ */
+class WifiSessionService
+{
+    /** @var array<string, array<string,string>>|null  MAC => bail DHCP (cache par sync) */
+    private ?array $baux = null;
+
+    /** @var array<string, array<string,string>>|null  MAC => host HotSpot (cache par sync) */
+    private ?array $hotes = null;
+
+    public function __construct(
+        private MikroTikService $mikroTik,
+    ) {
+    }
+
+    /**
+     * Point d'entrée principal.
+     *
+     * @return array{ouvertes:int, maj:int, fermees:int, erreur:?string}
+     */
+    public function synchroniser(): array
+    {
+        // Les caches ne vivent que le temps d'une synchronisation
+        $this->baux  = null;
+        $this->hotes = null;
+
+        try {
+            $actives = $this->mikroTik->listHotspotActive();
+        } catch (\Throwable $e) {
+            Log::warning('Sync sessions Wi-Fi : MikroTik injoignable', [
+                'error' => $e->getMessage(),
+            ]);
+            return ['ouvertes' => 0, 'maj' => 0, 'fermees' => 0, 'erreur' => $e->getMessage()];
+        }
+
+        $ouvertes = 0;
+        $maj      = 0;
+
+        foreach ($actives as $active) {
+            try {
+                $result = $this->traiterActive($active);
+            } catch (\Throwable $e) {
+                // Une entrée défectueuse ne doit pas bloquer les autres
+                Log::warning('Sync sessions Wi-Fi : entrée ignorée', [
+                    'active_id' => $active['.id'] ?? null,
+                    'user'      => $active['user'] ?? null,
+                    'error'     => $e->getMessage(),
+                ]);
+                continue;
+            }
+
+            if ($result === 'ouverte') {
+                $ouvertes++;
+            } elseif ($result === 'maj') {
+                $maj++;
+            }
+        }
+
+        // Fermer les sessions Wi-Fi qui ne sont plus actives côté MikroTik
+        $fermees = $this->fermerSessionsDisparues($actives);
+
+        return [
+            'ouvertes' => $ouvertes,
+            'maj'      => $maj,
+            'fermees'  => $fermees,
+            'erreur'   => null,
+        ];
+    }
+
+    /**
+     * Traite une session active MikroTik :
+     *  - déjà en base (par mikrotik_active_id) → mise à jour
+     *  - sinon → création
+     *
+     * @return 'ouverte'|'maj'|null
+     */
+    private function traiterActive(array $active): ?string
+    {
+        $activeId = $active['.id'] ?? null;
+        if ($activeId === null) {
+            return null;
+        }
+
+        $session = Session::where('mikrotik_active_id', $activeId)
+            ->where('etat', 'en_cours')
+            ->first();
+
+        if ($session !== null) {
+            $this->mettreAJour($session, $active);
+            return 'maj';
+        }
+
+        $this->creer($active);
+        return 'ouverte';
+    }
+
+    private function creer(array $active): Session
+    {
+        $username = $active['user'] ?? null;
+        $voucher  = $username
+            ? Voucher::where('username', $username)->first()
+            : null;
+
+        $appareil = $this->resoudreAppareil($active);
+        $ssid     = $this->resoudreSsid($active);
+
+        $uptimeSecondes = $this->parseUptime($active['uptime'] ?? '0s');
+        $uptimeMinutes  = (int) floor($uptimeSecondes / 60);
+
+        // Si on a un voucher, on prend ses valeurs ; sinon, valeurs neutres
+        // (durée 0 = illimité, cas des vouchers permanents)
+        $dureeTotale  = $voucher?->duree    ?? 0;
+        $montantTotal = $voucher?->montant  ?? 0;
+
+        $debut = now()->subSeconds($uptimeSecondes);
+        $finPrevue = $dureeTotale > 0
+            ? $debut->copy()->addMinutes($dureeTotale)
+            : null;
+
+        $session = Session::create(array_merge([
+            'poste_id'              => null,
+            'voucher_id'            => $voucher?->id,
+            'type_session'          => 'wifi',
+            'date_heure_debut'      => $debut,
+            'date_heure_fin_prevue' => $finPrevue,
+            'duree_prevue'          => $dureeTotale,
+            'duree_consommee'       => $uptimeMinutes,
+            'temps_restant'         => max(0, $dureeTotale - $uptimeMinutes),
+            'duree_suspension'      => 0,
+            'montant_initial'       => $montantTotal,
+            'montant_recharge'      => 0,
+            'montant_total'         => $montantTotal,
+            'montant_consomme'      => 0,
+            'montant_restant'       => $montantTotal,
+            'montant_a_reverser'    => 0,
+            'etat'                  => 'en_cours',
+            'mikrotik_active_id'    => $active['.id'] ?? null,
+            'hotspot_username'      => $username,
+            'client_mac'            => $active['mac-address'] ?? null,
+            'client_ip'             => $active['address']     ?? null,
+            'ssid'                  => $ssid,
+            'appareil_wifi_id'      => $appareil?->id,
+            'derniere_sync_at'      => now(),
+        ], $this->calculerVolumes($active)));
+
+        $this->marquerVoucherEnCours($voucher, $appareil);
+
+        return $session;
+    }
+
+    private function mettreAJour(Session $session, array $active): void
+    {
+        $uptimeSecondes = $this->parseUptime($active['uptime'] ?? '0s');
+        $uptimeMinutes  = (int) floor($uptimeSecondes / 60);
+
+        $dureePrevue  = (int) $session->duree_prevue;
+        $tempsRestant = max(0, $dureePrevue - $uptimeMinutes);
+
+        $appareil = $this->resoudreAppareil($active);
+
+        $donnees = [
+            'duree_consommee'  => $uptimeMinutes,
+            'temps_restant'    => $tempsRestant,
+            'client_ip'        => $active['address']     ?? $session->client_ip,
+            'client_mac'       => $active['mac-address'] ?? $session->client_mac,
+            'derniere_sync_at' => now(),
+        ];
+
+        if ($appareil !== null) {
+            $donnees['appareil_wifi_id'] = $appareil->id;
+        }
+
+        // Le SSID n'est résolu qu'une fois (évite des appels inutiles)
+        if (empty($session->ssid)) {
+            $ssid = $this->resoudreSsid($active);
+            if ($ssid !== null) {
+                $donnees['ssid'] = $ssid;
+            }
+        }
+
+        $session->update(array_merge($donnees, $this->calculerVolumes($active)));
+
+        // Auto-réparation : voucher d'une session déjà ouverte avant cette étape
+        $this->marquerVoucherEnCours($session->voucher, $appareil);
+    }
+
+    /**
+     * Ferme les sessions Wi-Fi en_cours dont le .id n'apparaît plus
+     * dans la liste active du MikroTik (déconnexion ou expiration).
+     */
+    private function fermerSessionsDisparues(array $actives): int
+    {
+        $idsActifs = array_filter(array_map(
+            fn($a) => $a['.id'] ?? null,
+            $actives
+        ));
+
+        $sessions = Session::where('type_session', 'wifi')
+            ->where('etat', 'en_cours')
+            ->whereNotNull('mikrotik_active_id')
+            ->whereNotIn('mikrotik_active_id', $idsActifs)
+            ->get();
+
+        $compteur = 0;
+
+        foreach ($sessions as $session) {
+            // Durée 0 = illimité (permanent, ou compte sans voucher) : jamais "expirée"
+            $illimitee = (int) $session->duree_prevue <= 0;
+            $expiree   = !$illimitee && (int) $session->temps_restant <= 0;
+
+            $session->update([
+                'date_heure_fin_reelle' => now(),
+                'etat'                  => $expiree ? 'expiree' : 'terminee',
+                'motif_fin'             => $expiree ? 'expiration' : 'deconnexion_client',
+                'derniere_sync_at'      => now(),
+            ]);
+
+            $this->relacherVoucher($session, $expiree);
+
+            $compteur++;
+        }
+
+        return $compteur;
+    }
+
+    // -----------------------------------------------------------------
+    // Vouchers
+    // -----------------------------------------------------------------
+
+    /**
+     * Passe le voucher à "en_cours", renseigne la 1re utilisation
+     * et rattache l'appareil.
+     *
+     * Temporaire : appareil_wifi_id = dernier appareil ayant utilisé le voucher.
+     * Permanent  : appareil_wifi_id = premier appareil (jamais écrasé).
+     */
+    private function marquerVoucherEnCours(?Voucher $voucher, ?AppareilWifi $appareil): void
+    {
+        if ($voucher === null) {
+            return;
+        }
+
+        $maj = [];
+
+        if (in_array($voucher->etat, ['disponible', 'utilise'], true)) {
+            $maj['etat'] = 'en_cours';
+        }
+
+        if ($voucher->date_heure_utilisation === null) {
+            $maj['date_heure_utilisation'] = now();
+        }
+
+        if ($appareil !== null) {
+            $doitRattacher = $voucher->estReutilisable()
+                ? $voucher->appareil_wifi_id === null
+                : $voucher->appareil_wifi_id !== $appareil->id;
+
+            if ($doitRattacher) {
+                $maj['appareil_wifi_id'] = $appareil->id;
+            }
+        }
+
+        if (!empty($maj)) {
+            $voucher->update($maj);
+        }
+    }
+
+    /**
+     * À la fermeture d'une session : décide du nouvel état du voucher.
+     */
+    private function relacherVoucher(Session $session, bool $expiree): void
+    {
+        if (!$session->voucher_id) {
+            return;
+        }
+
+        $voucher = Voucher::find($session->voucher_id);
+
+        if ($voucher === null || !in_array($voucher->etat, ['en_cours', 'utilise'], true)) {
+            return;
+        }
+
+        // Un autre appareil utilise encore ce voucher : on ne touche à rien
+        $autreSession = Session::where('voucher_id', $voucher->id)
+            ->where('etat', 'en_cours')
+            ->where('id', '!=', $session->id)
+            ->exists();
+
+        if ($autreSession) {
+            return;
+        }
+
+        if ($voucher->estReutilisable()) {
+            $voucher->update(['etat' => 'disponible']);
+            return;
+        }
+
+        if ($expiree) {
+            $voucher->update([
+                'etat'                  => 'expire',
+                'date_heure_expiration' => now(),
+            ]);
+            return;
+        }
+
+        $voucher->update(['etat' => 'utilise']);
+    }
+
+    // -----------------------------------------------------------------
+    // Appareil, SSID, volumes
+    // -----------------------------------------------------------------
+
+    /**
+     * Cherche ou crée l'appareil Wi-Fi à partir de la MAC du client
+     * et met à jour sa dernière connexion.
+     */
+    private function resoudreAppareil(array $active): ?AppareilWifi
+    {
+        $mac = AppareilWifi::normaliserMac($active['mac-address'] ?? null);
+
+        if ($mac === null) {
+            return null;
+        }
+
+        $bail = $this->bailPourMac($mac);
+
+        $appareil = AppareilWifi::trouverOuCreerParMac($mac, [
+            'adresse_ip' => $active['address'] ?? ($bail['address'] ?? null),
+            'host_name'  => $bail['host-name'] ?? null,
+        ]);
+
+        // À la création, les dates sont déjà posées
+        if (!$appareil->wasRecentlyCreated) {
+            $appareil->toucherDerniereConnexion();
+        }
+
+        return $appareil;
+    }
+
+    /**
+     * SSID = table de correspondance (config) appliquée au serveur HotSpot.
+     * Le serveur vient de active['server'] ou, à défaut, de /ip/hotspot/host.
+     */
+    private function resoudreSsid(array $active): ?string
+    {
+        $serveur = $active['server'] ?? null;
+
+        if ($serveur === null || $serveur === '') {
+            $mac     = AppareilWifi::normaliserMac($active['mac-address'] ?? null);
+            $serveur = $mac !== null ? ($this->hotePourMac($mac)['server'] ?? null) : null;
+        }
+
+        if ($serveur === null || $serveur === '') {
+            $defaut = config('mikrotik.ssid_default');
+            return ($defaut !== null && $defaut !== '') ? mb_substr($defaut, 0, 64) : null;
+        }
+
+        $table = config('mikrotik.ssid_map', []);
+
+        return mb_substr($table[$serveur] ?? $serveur, 0, 64);
+    }
+
+    /**
+     * Volumes vus DEPUIS LE CLIENT :
+     *  - volume_entree = données reçues par le client (download)
+     *                  = "bytes-out" RouterOS (le routeur les envoie au client)
+     *  - volume_sortie = données envoyées par le client (upload)
+     *                  = "bytes-in" RouterOS (le routeur les reçoit du client)
+     *
+     * @return array{volume_entree:int, volume_sortie:int, volume_total:int}
+     */
+    private function calculerVolumes(array $active): array
+    {
+        $bytesIn  = (int) ($active['bytes-in']  ?? 0);
+        $bytesOut = (int) ($active['bytes-out'] ?? 0);
+
+        return [
+            'volume_entree' => $bytesOut,
+            'volume_sortie' => $bytesIn,
+            'volume_total'  => $bytesIn + $bytesOut,
+        ];
+    }
+
+    /**
+     * @return array<string,string>
+     */
+    private function bailPourMac(string $mac): array
+    {
+        if ($this->baux === null) {
+            $this->baux = [];
+
+            try {
+                foreach ($this->mikroTik->listDhcpLeases() as $bail) {
+                    $m = AppareilWifi::normaliserMac($bail['mac-address'] ?? null);
+                    if ($m !== null) {
+                        $this->baux[$m] = $bail;
+                    }
+                }
+            } catch (\Throwable $e) {
+                Log::warning('Sync Wi-Fi : lecture des baux DHCP impossible', [
+                    'error' => $e->getMessage(),
+                ]);
+            }
+        }
+
+        return $this->baux[$mac] ?? [];
+    }
+
+    /**
+     * @return array<string,string>
+     */
+    private function hotePourMac(string $mac): array
+    {
+        if ($this->hotes === null) {
+            $this->hotes = [];
+
+            try {
+                foreach ($this->mikroTik->listHotspotHosts() as $hote) {
+                    $m = AppareilWifi::normaliserMac($hote['mac-address'] ?? null);
+                    if ($m !== null) {
+                        $this->hotes[$m] = $hote;
+                    }
+                }
+            } catch (\Throwable $e) {
+                Log::warning('Sync Wi-Fi : lecture des hosts HotSpot impossible', [
+                    'error' => $e->getMessage(),
+                ]);
+            }
+        }
+
+        return $this->hotes[$mac] ?? [];
+    }
+
+    /**
+     * Convertit un uptime RouterOS ("1w2d3h4m5s", "1h20m15s", "12s")
+     * en secondes. Les semaines ("w") existent en RouterOS 6 et 7.
+     */
+    private function parseUptime(string $uptime): int
+    {
+        $total = 0;
+
+        if (preg_match('/(\d+)w/', $uptime, $m)) { $total += (int)$m[1] * 604800; }
+        if (preg_match('/(\d+)d/', $uptime, $m)) { $total += (int)$m[1] * 86400; }
+        if (preg_match('/(\d+)h/', $uptime, $m)) { $total += (int)$m[1] * 3600; }
+        if (preg_match('/(\d+)m(?!s)/', $uptime, $m)) { $total += (int)$m[1] * 60; }
+        if (preg_match('/(\d+)s/', $uptime, $m)) { $total += (int)$m[1]; }
+
+        return $total;
+    }
+}
+
+
+================================================================================
+FICHIER : app/Services/VoucherService.php
+================================================================================
+
+<?php
+
+namespace App\Services;
+
+use App\Models\LotVoucher;
+use App\Models\Voucher;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Str;
+use InvalidArgumentException;
+
+class VoucherService
+{
+    public function __construct(
+        private MikroTikService $mikroTik,
+    ) {
+    }
+
+    /**
+     * Génère un identifiant unique pour un voucher.
+     */
+    public function genererIdentifiant(int $longueur = 8): string
+    {
+        do {
+            $identifiant = strtoupper(Str::random($longueur));
+        } while (
+            Voucher::where('username', $identifiant)->exists()
+            || Voucher::where('code', $identifiant)->exists()
+        );
+
+        return $identifiant;
+    }
+
+    /**
+     * Crée un voucher individuel :
+     *  1. enregistrement DB
+     *  2. tentative de création du user HotSpot MikroTik
+     *
+     * Le username et le password sont TOUJOURS fournis par l'appelant
+     * (rien n'est généré ici). Pour un voucher PERMANENT :
+     *  - il ne peut pas appartenir à un lot ;
+     *  - montant et durée peuvent valoir 0 (0 = illimité, pas de
+     *    limit-uptime côté MikroTik).
+     *
+     * Le voucher est retourné dans tous les cas. Si la sync MikroTik échoue,
+     * `mikrotik_synced_at` reste null et `mikrotik_sync_error` contient la cause.
+     */
+    public function creerVoucher(
+        string $username,
+        string $password,
+        int $montant,
+        int $duree,
+        string $source = 'manuel',
+        ?LotVoucher $lot = null,
+        ?string $description = null,
+        string $typeVoucher = Voucher::TYPE_TEMPORAIRE
+    ): Voucher {
+        if (!in_array($typeVoucher, [Voucher::TYPE_TEMPORAIRE, Voucher::TYPE_PERMANENT], true)) {
+            throw new InvalidArgumentException('Type de voucher invalide.');
+        }
+
+        $permanent = $typeVoucher === Voucher::TYPE_PERMANENT;
+
+        if (trim($username) === '' || trim($password) === '') {
+            throw new InvalidArgumentException('Le username et le mot de passe sont obligatoires.');
+        }
+
+        if ($permanent) {
+            if ($lot !== null) {
+                throw new InvalidArgumentException(
+                    'Un voucher permanent ne peut pas appartenir à un lot.'
+                );
+            }
+            if ($montant < 0) {
+                throw new InvalidArgumentException('Le montant ne peut pas être négatif.');
+            }
+            if ($duree < 0) {
+                throw new InvalidArgumentException('La durée ne peut pas être négative.');
+            }
+        } else {
+            if ($montant < 1) {
+                throw new InvalidArgumentException('Le montant doit être supérieur à 0.');
+            }
+            if ($duree < 1) {
+                throw new InvalidArgumentException('La durée doit être supérieure à 0.');
+            }
+        }
+
+        if (Voucher::where('username', $username)->exists()) {
+            throw new InvalidArgumentException('Ce username existe déjà.');
+        }
+        if (Voucher::where('code', $password)->exists()) {
+            throw new InvalidArgumentException('Ce code existe déjà.');
+        }
+
+        $voucher = Voucher::create([
+            'lot_voucher_id'      => $lot?->id,
+            'username'            => $username,
+            'password'            => $password,
+            'code'                => $password,
+            'montant'             => $montant,
+            'duree'               => $duree,
+            'etat'                => 'disponible',
+            'source'              => $source,
+            'type_voucher'        => $typeVoucher,
+            'date_heure_creation' => now(),
+            'description'         => $description,
+        ]);
+
+        $this->synchroniserVersMikroTik($voucher);
+
+        return $voucher->fresh();
+    }
+
+    /**
+     * Génère un lot de vouchers TEMPORAIRES (les permanents n'ont pas de lot).
+     *
+     * 1) DB dans une transaction
+     * 2) sync MikroTik hors transaction, en série (non bloquante)
+     */
+    public function creerLot(
+        string $nom,
+        int $quantite,
+        int $montant,
+        int $duree,
+        ?string $description = null
+    ): LotVoucher {
+        if ($quantite < 1) {
+            throw new InvalidArgumentException('La quantité doit être supérieure à 0.');
+        }
+        if ($montant < 1) {
+            throw new InvalidArgumentException('Le montant doit être supérieur à 0.');
+        }
+        if ($duree < 1) {
+            throw new InvalidArgumentException('La durée doit être supérieure à 0.');
+        }
+
+        $lot = DB::transaction(function () use (
+            $nom, $quantite, $montant, $duree, $description
+        ) {
+            $lot = LotVoucher::create([
+                'nom'              => $nom,
+                'quantite_prevue'  => $quantite,
+                'montant_unitaire' => $montant,
+                'duree_unitaire'   => $duree,
+                'quantite_generee' => 0,
+                'source'           => 'cyber_manager',
+                'description'      => $description,
+            ]);
+
+            for ($i = 0; $i < $quantite; $i++) {
+                $identifiant = $this->genererIdentifiant();
+
+                Voucher::create([
+                    'lot_voucher_id'      => $lot->id,
+                    'username'            => $identifiant,
+                    'password'            => $identifiant,
+                    'code'                => $identifiant,
+                    'montant'             => $montant,
+                    'duree'               => $duree,
+                    'etat'                => 'disponible',
+                    'source'              => 'cyber_manager',
+                    'type_voucher'        => Voucher::TYPE_TEMPORAIRE,
+                    'date_heure_creation' => now(),
+                ]);
+            }
+
+            $lot->update(['quantite_generee' => $quantite]);
+
+            return $lot->fresh();
+        });
+
+        // Sync MikroTik hors transaction — chaque échec est non bloquant
+        $vouchers = Voucher::where('lot_voucher_id', $lot->id)->get();
+        foreach ($vouchers as $voucher) {
+            $this->synchroniserVersMikroTik($voucher);
+        }
+
+        return $lot;
+    }
+
+    /**
+     * Synchronise un voucher vers le MikroTik (création du user HotSpot).
+     * Idempotent : si le user existe déjà, on ne recrée pas.
+     *
+     * Durée 0 (permanent illimité) → aucun limit-uptime n'est posé.
+     *
+     * @return bool true si OK, false sinon (le voucher reste en DB avec son erreur)
+     */
+    public function synchroniserVersMikroTik(Voucher $voucher): bool
+    {
+        try {
+            $existing = $this->mikroTik->findHotspotUser($voucher->username);
+
+            if ($existing === null) {
+                $limiteUptime = (int) $voucher->duree > 0
+                    ? MikroTikService::formatUptime((int) $voucher->duree)
+                    : null;
+
+                $this->mikroTik->createHotspotUser(
+                    username:    $voucher->username,
+                    password:    $voucher->password,
+                    profile:     config('mikrotik.hotspot_profile', 'default'),
+                    comment:     ($voucher->estReutilisable() ? 'CM permanent #' : 'CM voucher #')
+                                 . $voucher->id,
+                    limitUptime: $limiteUptime,
+                );
+
+                $existing = $this->mikroTik->findHotspotUser($voucher->username);
+            }
+
+            $voucher->update([
+                'mikrotik_id'         => $existing['.id'] ?? null,
+                'mikrotik_synced_at'  => now(),
+                'mikrotik_sync_error' => null,
+            ]);
+
+            return true;
+        } catch (\Throwable $e) {
+            Log::warning('Sync MikroTik échouée pour voucher ' . $voucher->id, [
+                'username' => $voucher->username,
+                'error'    => $e->getMessage(),
+            ]);
+
+            $voucher->update([
+                'mikrotik_sync_error' => $e->getMessage(),
+            ]);
+
+            return false;
+        }
+    }
+
+    /**
+     * Retente la synchronisation des vouchers non synchronisés.
+     *
+     * @return array{ok:int, ko:int, restants:int}
+     */
+    public function synchroniserVouchersEnAttente(?int $limite = null): array
+    {
+        $query = Voucher::query()
+            ->whereNull('mikrotik_synced_at')
+            ->where('etat', '!=', 'annule')
+            ->orderBy('id');
+
+        if ($limite !== null && $limite > 0) {
+            $query->limit($limite);
+        }
+
+        $ok = 0;
+        $ko = 0;
+
+        foreach ($query->get() as $voucher) {
+            if ($this->synchroniserVersMikroTik($voucher)) {
+                $ok++;
+            } else {
+                $ko++;
+            }
+        }
+
+        $restants = Voucher::whereNull('mikrotik_synced_at')
+            ->where('etat', '!=', 'annule')
+            ->count();
+
+        return ['ok' => $ok, 'ko' => $ko, 'restants' => $restants];
+    }
+
+    /**
+     * Marque un voucher temporaire comme utilisé.
+     * Un voucher permanent est réutilisable : il n'est jamais "utilisé".
+     */
+    public function utiliser(Voucher $voucher): Voucher
+    {
+        if ($voucher->estReutilisable()) {
+            throw new InvalidArgumentException(
+                'Un voucher permanent est réutilisable et ne peut pas être marqué utilisé.'
+            );
+        }
+
+        if ($voucher->etat !== 'disponible') {
+            throw new InvalidArgumentException('Ce voucher n’est pas disponible.');
+        }
+
+        $voucher->update([
+            'etat'                  => 'utilise',
+            'date_heure_utilisation' => now(),
+        ]);
+
+        return $voucher->fresh();
+    }
+
+    /**
+     * Annule un voucher disponible.
+     * Tente aussi la suppression du user HotSpot correspondant.
+     */
+    public function annuler(Voucher $voucher): Voucher
+    {
+        if ($voucher->etat !== 'disponible') {
+            throw new InvalidArgumentException(
+                'Seul un voucher disponible peut être annulé.'
+            );
+        }
+
+        $voucher->update(['etat' => 'annule']);
+
+        try {
+            $this->mikroTik->deleteHotspotUser($voucher->username);
+            $voucher->update([
+                'mikrotik_id'         => null,
+                'mikrotik_synced_at'  => null,
+                'mikrotik_sync_error' => null,
+            ]);
+        } catch (\Throwable $e) {
+            Log::warning(
+                'Suppression MikroTik échouée pour voucher annulé ' . $voucher->id,
+                [
+                    'username' => $voucher->username,
+                    'error'    => $e->getMessage(),
+                ]
+            );
+
+            $voucher->update([
+                'mikrotik_sync_error' => 'Annulé, suppression MikroTik échouée : '
+                    . $e->getMessage(),
+            ]);
+        }
+
+        return $voucher->fresh();
+    }
+}
+
+
+================================================================================
+FICHIER : app/Services/VoucherReplenishmentService.php
+================================================================================
+
+[FICHIER INTROUVABLE — ignoré]
+
+================================================================================
+FICHIER : app/Services/SessionService.php
+================================================================================
+
+<?php
+
+namespace App\Services;
+
+use App\Models\Poste;
+use App\Models\Recharge;
+use App\Models\Restitution;
+use App\Models\Session;
+
+class SessionService
+{
+    public function __construct(
+        private AgentWindowsService $agentWindowsService,
+        private TarifService $tarifService
+    ) {
+    }
+
+    public function calculerDuree(
+        int $montant,
+        ?\App\Models\Tarif $tarif = null
+    ): int {
+        return $this->tarifService->calculerDuree(
+            $montant,
+            $tarif
+        );
+    }
+
+    public function creerSessionEthernet(
+        Poste $poste,
+        int $montant,
+        ?string $description = null
+    ): Session {
+        if (!$poste->actif) {
+            throw new \InvalidArgumentException(
+                "Le poste {$poste->nom_poste} est désactivé."
+            );
+        }
+
+        if ($poste->etat !== 'disponible') {
+            throw new \InvalidArgumentException(
+                "Le poste {$poste->nom_poste} n'est pas disponible."
+            );
+        }
+
+        $tarif = $this->tarifService->tarifStandard();
+
+$duree = $this->calculerDuree($montant, $tarif);
+
+        $debut = now();
+        $finPrevue = $debut->copy()->addMinutes($duree);
+
+        $session = Session::create([
+            'poste_id' => $poste->id,
+            'tarif_id' => $tarif->id,
+            'type_session' => 'ethernet',
+            'date_heure_debut' => $debut,
+            'date_heure_fin_prevue' => $finPrevue,
+            'duree_prevue' => $duree,
+            'duree_consommee' => 0,
+            'temps_restant' => $duree,
+            'duree_suspension' => 0,
+            'montant_initial' => $montant,
+            'montant_recharge' => 0,
+            'montant_total' => $montant,
+            'montant_consomme' => 0,
+            'montant_restant' => $montant,
+            'montant_a_reverser' => 0,
+            'description' => $description,
+            'etat' => 'en_cours',
+            'volume_entree' => 0,
+            'volume_sortie' => 0,
+            'volume_total' => 0,
+        ]);
+
+        $poste->update([
+            'etat' => 'en_utilisation',
+        ]);
+
+        $this->deverrouillerSiAgentDisponible($poste);
+
+        return $session;
+    }
+
+    public function mettreAJourConsommation(Session $session): Session
+    {
+        if (!$session->date_heure_debut) {
+            return $session;
+        }
+
+        if ($session->etat !== 'en_cours') {
+            return $session;
+        }
+
+        $maintenant = now();
+
+        if (
+            $session->date_heure_fin_prevue &&
+            $maintenant->greaterThanOrEqualTo($session->date_heure_fin_prevue)
+        ) {
+            $session->update([
+                'date_heure_fin_reelle' => $maintenant,
+                'duree_consommee' => $session->duree_prevue,
+                'temps_restant' => 0,
+                'montant_consomme' => $session->montant_total,
+                'montant_restant' => 0,
+                'montant_a_reverser' => 0,
+                'etat' => 'expiree',
+                'motif_fin' => 'expiration',
+            ]);
+
+            if ($session->poste) {
+                $session->poste->update([
+                    'etat' => 'disponible',
+                ]);
+
+                $this->verrouillerSiAgentDisponible($session->poste);
+            }
+
+            return $session->fresh();
+        }
+
+        $secondesEcoulees =
+            $session->date_heure_debut->diffInSeconds($maintenant);
+
+        $secondesActives =
+            $secondesEcoulees - $session->duree_suspension;
+
+        if ($secondesActives < 0) {
+            $secondesActives = 0;
+        }
+
+        $minutesConsommees =
+            (int) floor($secondesActives / 60);
+
+        if ($minutesConsommees < 0) {
+            $minutesConsommees = 0;
+        }
+
+        if ($minutesConsommees > $session->duree_prevue) {
+            $minutesConsommees = $session->duree_prevue;
+        }
+
+        $tempsRestant =
+            $session->duree_prevue - $minutesConsommees;
+
+        $tarif = $session->tarif;
+
+        $montantConsomme = $tarif
+            ? $minutesConsommees * $tarif->montant_par_minute
+            : $minutesConsommees * 20;
+
+        if ($montantConsomme > $session->montant_total) {
+            $montantConsomme = $session->montant_total;
+        }
+
+        $montantRestant =
+            $session->montant_total - $montantConsomme;
+
+        $session->update([
+            'duree_consommee' => $minutesConsommees,
+            'temps_restant' => $tempsRestant,
+            'montant_consomme' => $montantConsomme,
+            'montant_restant' => $montantRestant,
+        ]);
+
+        return $session->fresh();
+    }
+
+    public function arreterSession(
+        Session $session,
+        string $motifFin = 'arret_client'
+    ): Session {
+        if ($session->etat !== 'en_cours') {
+            throw new \InvalidArgumentException(
+                "La session n'est pas en cours."
+            );
+        }
+
+        $session = $this->mettreAJourConsommation($session);
+
+        if ($session->etat !== 'en_cours') {
+            return $session;
+        }
+
+        $montantAReverser = $session->montant_restant;
+
+        $session->update([
+            'date_heure_fin_reelle' => now(),
+            'duree_consommee' => $session->duree_consommee,
+            'temps_restant' => $session->temps_restant,
+            'montant_consomme' => $session->montant_consomme,
+            'montant_restant' => $session->montant_restant,
+            'montant_a_reverser' => $montantAReverser,
+            'etat' => 'terminee',
+            'motif_fin' => $motifFin,
+        ]);
+
+        if ($montantAReverser > 0) {
+            Restitution::create([
+                'session_id' => $session->id,
+                'date_heure' => now(),
+                'montant' => $montantAReverser,
+                'motif' => $motifFin,
+                'description' =>
+                    'Restitution du montant restant après arrêt de la session.',
+            ]);
+        }
+
+        if ($session->poste) {
+            $session->poste->update([
+                'etat' => 'disponible',
+            ]);
+
+            $this->verrouillerSiAgentDisponible($session->poste);
+        }
+
+        return $session->fresh();
+    }
+
+    public function rechargerSession(
+        Session $session,
+        int $montant,
+        ?string $description = null
+    ): Session {
+        if ($session->etat !== 'en_cours') {
+            throw new \InvalidArgumentException(
+                "La session n'est pas en cours."
+            );
+        }
+
+        if ($montant <= 0) {
+            throw new \InvalidArgumentException(
+                "Le montant de recharge doit être supérieur à 0."
+            );
+        }
+
+        $session = $this->mettreAJourConsommation($session);
+
+        if ($session->etat !== 'en_cours') {
+            throw new \InvalidArgumentException(
+                "La session a expiré avant la recharge."
+            );
+        }
+
+        $dureeAjoutee = $this->calculerDuree(
+            $montant,
+            $session->tarif
+        );
+
+        $session->update([
+            'montant_recharge' =>
+                $session->montant_recharge + $montant,
+
+            'montant_total' =>
+                $session->montant_total + $montant,
+
+            'duree_prevue' =>
+                $session->duree_prevue + $dureeAjoutee,
+
+            'temps_restant' =>
+                $session->temps_restant + $dureeAjoutee,
+
+            'montant_restant' =>
+                $session->montant_restant + $montant,
+
+            'date_heure_fin_prevue' =>
+                $session->date_heure_fin_prevue
+                    ->copy()
+                    ->addMinutes($dureeAjoutee),
+        ]);
+
+        Recharge::create([
+            'session_id' => $session->id,
+            'date_heure' => now(),
+            'montant' => $montant,
+            'duree_ajoutee' => $dureeAjoutee,
+            'description' => $description,
+        ]);
+
+        return $session->fresh();
+    }
+
+    public function suspendreSession(Session $session): Session
+    {
+        if ($session->etat !== 'en_cours') {
+            throw new \InvalidArgumentException(
+                "La session n'est pas en cours."
+            );
+        }
+
+        $session = $this->mettreAJourConsommation($session);
+
+        if ($session->etat !== 'en_cours') {
+            return $session;
+        }
+
+        $maintenant = now();
+
+        $session->update([
+            'date_heure_suspension' => $maintenant,
+            'etat' => 'suspendue',
+        ]);
+
+        if ($session->poste) {
+            $session->poste->update([
+                'etat' => 'suspendu',
+            ]);
+
+            $this->verrouillerSiAgentDisponible($session->poste);
+        }
+
+        return $session->fresh();
+    }
+
+    public function reprendreSession(Session $session): Session
+    {
+        if ($session->etat !== 'suspendue') {
+            throw new \InvalidArgumentException(
+                "La session n'est pas suspendue."
+            );
+        }
+
+        if (!$session->date_heure_suspension) {
+            throw new \InvalidArgumentException(
+                "La date de suspension est introuvable."
+            );
+        }
+
+        $maintenant = now();
+
+        $dureeSuspensionActuelle =
+            $session->date_heure_suspension
+                ->diffInSeconds($maintenant);
+
+        $dureeSuspensionTotale =
+            $session->duree_suspension
+            + $dureeSuspensionActuelle;
+
+        $nouvelleFinPrevue =
+            $maintenant->copy()
+                ->addSeconds($session->temps_restant * 60);
+
+        $session->update([
+            'date_heure_reprise' => $maintenant,
+            'date_heure_fin_prevue' => $nouvelleFinPrevue,
+            'duree_suspension' => $dureeSuspensionTotale,
+            'etat' => 'en_cours',
+        ]);
+
+        if ($session->poste) {
+            $session->poste->update([
+                'etat' => 'en_utilisation',
+            ]);
+
+            $this->deverrouillerSiAgentDisponible($session->poste);
+        }
+
+        return $session->fresh();
+    }
+
+    private function verrouillerSiAgentDisponible(Poste $poste): void
+    {
+        if (empty($poste->agent_url)) {
+            return;
+        }
+
+        $this->agentWindowsService->lockTest($poste);
+    }
+
+    private function deverrouillerSiAgentDisponible(Poste $poste): void
+    {
+        if (empty($poste->agent_url)) {
+            return;
+        }
+
+        $this->agentWindowsService->unlockTest($poste);
+    }
+}
+
+
+================================================================================
+FICHIER : app/Services/AgentWindowsService.php
+================================================================================
+
+<?php
+
+namespace App\Services;
+
+use App\Models\Poste;
+use Illuminate\Support\Facades\Http;
+
+class AgentWindowsService
+{
+    /**
+     * Envoie une commande à l'agent Windows d'un poste.
+     */
+    public function envoyerCommande(
+        string $adresse,
+        string $commande,
+        array $parametres = []
+    ): array {
+        $token = config('services.agent_windows.token');
+
+        if (empty($token)) {
+            return [
+                'succes' => false,
+                'message' => 'Le token de l’agent Windows n’est pas configuré.',
+            ];
+        }
+
+        try {
+            $reponse = Http::timeout(5)
+                ->withHeaders([
+                    'X-Agent-Token' => $token,
+                ])
+                ->post($adresse . '/api/commande', [
+                    'commande' => $commande,
+                    'parametres' => (object) $parametres,
+                ]);
+
+            if ($reponse->failed()) {
+                return [
+                    'succes' => false,
+                    'message' => 'Impossible de communiquer avec l’agent Windows.',
+                    'code_http' => $reponse->status(),
+                    'details' => $reponse->body(),
+                ];
+            }
+
+            return [
+                'succes' => true,
+                'reponse' => $reponse->json(),
+            ];
+        } catch (\Throwable $exception) {
+            return [
+                'succes' => false,
+                'message' => 'Erreur de communication avec l’agent Windows.',
+                'details' => $exception->getMessage(),
+            ];
+        }
+    }
+
+    /**
+     * Vérifie que l'agent Windows répond.
+     */
+    public function ping(Poste $poste): array
+    {
+        return $this->envoyerCommande(
+            $this->adresseAgent($poste),
+            'PING'
+        );
+    }
+
+    /**
+     * Récupère l'état de l'agent Windows.
+     */
+    public function status(Poste $poste): array
+    {
+        return $this->envoyerCommande(
+            $this->adresseAgent($poste),
+            'STATUS'
+        );
+    }
+
+    /**
+     * Teste le verrouillage du poste.
+     * Pour le moment, l'agent effectue uniquement une simulation.
+     */
+    public function lockTest(Poste $poste): array
+    {
+        return $this->envoyerCommande(
+            $this->adresseAgent($poste),
+            'LOCK_TEST'
+        );
+    }
+
+    /**
+     * Teste le déverrouillage du poste.
+     * Pour le moment, l'agent effectue uniquement une simulation.
+     */
+    public function unlockTest(Poste $poste): array
+    {
+        return $this->envoyerCommande(
+            $this->adresseAgent($poste),
+            'UNLOCK_TEST'
+        );
+    }
+
+    /**
+     * Récupère et vérifie l'adresse de l'agent.
+     */
+    private function adresseAgent(Poste $poste): string
+    {
+        if (empty($poste->agent_url)) {
+            throw new \InvalidArgumentException(
+                "Aucune adresse d'agent Windows n'est configurée pour {$poste->nom_poste}."
+            );
+        }
+
+        return rtrim($poste->agent_url, '/');
+    }
+}
+
+
+================================================================================
+FICHIER : app/Models/Voucher.php
+================================================================================
+
+<?php
+
+namespace App\Models;
+
+use Illuminate\Database\Eloquent\Builder;
+use Illuminate\Database\Eloquent\Model;
+use Illuminate\Database\Eloquent\Relations\BelongsTo;
+use Illuminate\Database\Eloquent\Relations\HasOne;
+
+class Voucher extends Model
+{
+    public const TYPE_TEMPORAIRE = 'temporaire';
+    public const TYPE_PERMANENT  = 'permanent';
+
+    /** États exigés par RG57. */
+    public const ETATS = [
+        'disponible',
+        'en_cours',
+        'utilise',
+        'expire',
+        'desactive',
+        'annule',
+    ];
+
+    protected $fillable = [
+        'lot_voucher_id',
+        'username',
+        'password',
+        'code',
+        'montant',
+        'duree',
+        'etat',
+        'source',
+        'type_voucher',
+        'appareil_wifi_id',
+        'mikrotik_id',
+        'date_heure_creation',
+        'date_heure_utilisation',
+        'date_heure_expiration',
+        'derniere_synchronisation',
+        'description',
+        'mikrotik_synced_at',
+        'mikrotik_sync_error',
+    ];
+
+    protected $casts = [
+        'montant' => 'integer',
+        'duree' => 'integer',
+        'date_heure_creation' => 'datetime',
+        'date_heure_utilisation' => 'datetime',
+        'date_heure_expiration' => 'datetime',
+        'derniere_synchronisation' => 'datetime',
+        'mikrotik_synced_at' => 'datetime',
+        'mikrotik_sync_error' => 'string',
+    ];
+
+    public function lot(): BelongsTo
+    {
+        return $this->belongsTo(
+            LotVoucher::class,
+            'lot_voucher_id'
+        );
+    }
+
+    public function session(): HasOne
+    {
+        return $this->hasOne(
+            Session::class,
+            'voucher_id'
+        );
+    }
+
+    public function appareilWifi(): BelongsTo
+    {
+        return $this->belongsTo(
+            AppareilWifi::class,
+            'appareil_wifi_id'
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Scopes
+    // -----------------------------------------------------------------
+
+    public function scopePorteeTemporaires(Builder $query): Builder
+    {
+        return $query->where('type_voucher', self::TYPE_TEMPORAIRE);
+    }
+
+    public function scopePorteePermanents(Builder $query): Builder
+    {
+        return $query->where('type_voucher', self::TYPE_PERMANENT);
+    }
+
+    public function scopePorteeDisponibles(Builder $query): Builder
+    {
+        return $query->where('etat', 'disponible');
+    }
+
+    // -----------------------------------------------------------------
+    // Métier
+    // -----------------------------------------------------------------
+
+    /**
+     * Un voucher permanent est réutilisable (RG56).
+     */
+    public function estReutilisable(): bool
+    {
+        return $this->type_voucher === self::TYPE_PERMANENT;
+    }
+}
+
+
+================================================================================
+FICHIER : app/Models/Session.php
+================================================================================
+
+<?php
+
+namespace App\Models;
+
+use App\Models\Recharge;
+use Illuminate\Database\Eloquent\Relations\HasMany;
+use Illuminate\Database\Eloquent\Model;
+use Illuminate\Database\Eloquent\Relations\BelongsTo;
+use App\Models\Tarif;
+use App\Models\Voucher;
+
+class Session extends Model
+{
+    protected $table = 'cyber_sessions';
+
+    protected $fillable = [
+        'poste_id',
+        'type_session',
+        'date_heure_debut',
+        'date_heure_fin_prevue',
+        'date_heure_fin_reelle',
+        'date_heure_suspension',
+        'date_heure_reprise',
+        'duree_suspension',
+        'duree_prevue',
+        'duree_consommee',
+        'temps_restant',
+        'montant_initial',
+        'montant_recharge',
+        'montant_total',
+        'montant_consomme',
+        'montant_restant',
+        'montant_a_reverser',
+        'description',
+        'etat',
+        'motif_fin',
+        'tarif_id',
+        'voucher_id',
+        'volume_entree',
+        'volume_sortie',
+        'volume_total',
+        'mikrotik_active_id',
+        'hotspot_username',
+        'client_mac',
+        'client_ip',
+        'ssid',
+        'appareil_wifi_id',
+        'derniere_sync_at',
+    ];
+
+    protected $casts = [
+        'date_heure_debut' => 'datetime',
+        'date_heure_fin_prevue' => 'datetime',
+        'date_heure_fin_reelle' => 'datetime',
+        'date_heure_suspension' => 'datetime',
+        'date_heure_reprise' => 'datetime',
+        'duree_suspension' => 'integer',
+        'derniere_sync_at' => 'datetime',
+    ];
+
+    public function poste(): BelongsTo
+    {
+        return $this->belongsTo(Poste::class);
+    }
+
+    public function recharges()
+    {
+        return $this->hasMany(Recharge::class);
+    }
+
+    public function restitutions(): HasMany
+    {
+        return $this->hasMany(Restitution::class);
+    }
+
+    public function tarif(): BelongsTo
+    {
+        return $this->belongsTo(Tarif::class);
+    }
+
+    public function voucher(): BelongsTo
+    {
+        return $this->belongsTo(Voucher::class);
+    }
+
+    public function appareilWifi(): BelongsTo
+    {
+        return $this->belongsTo(AppareilWifi::class, 'appareil_wifi_id');
+    }
+}
+
+
+================================================================================
+FICHIER : app/Models/LotVoucher.php
+================================================================================
+
+<?php
+
+namespace App\Models;
+
+use Illuminate\Database\Eloquent\Model;
+use Illuminate\Database\Eloquent\Relations\HasMany;
+
+class LotVoucher extends Model
+{
+    protected $fillable = [
+        'nom',
+        'quantite_prevue',
+        'montant_unitaire',
+        'duree_unitaire',
+        'quantite_generee',
+        'source',
+        'description',
+    ];
+
+    protected $casts = [
+        'quantite_prevue' => 'integer',
+        'montant_unitaire' => 'integer',
+        'duree_unitaire' => 'integer',
+        'quantite_generee' => 'integer',
+    ];
+
+    public function vouchers(): HasMany
+    {
+        return $this->hasMany(Voucher::class);
+    }
+}
+
+
+================================================================================
+FICHIER : app/Models/AppareilWifi.php
+================================================================================
+
+<?php
+
+namespace App\Models;
+
+use Illuminate\Database\Eloquent\Model;
+use Illuminate\Database\Eloquent\Relations\HasMany;
+use Illuminate\Database\QueryException;
+use Illuminate\Support\Arr;
+use InvalidArgumentException;
+
+class AppareilWifi extends Model
+{
+    protected $table = 'appareils_wifi';
+
+    public const TYPES = ['telephone', 'ordinateur', 'tablette', 'inconnu'];
+
+    protected $fillable = [
+        'adresse_mac',
+        'adresse_ip',
+        'host_name',
+        'type_appareil',
+        'fabricant',
+        'modele',
+        'systeme',
+        'user_agent',
+        'premiere_connexion',
+        'derniere_connexion',
+    ];
+
+    protected $casts = [
+        'premiere_connexion' => 'datetime',
+        'derniere_connexion' => 'datetime',
+    ];
+
+    public function sessions(): HasMany
+    {
+        return $this->hasMany(Session::class, 'appareil_wifi_id');
+    }
+
+    /**
+     * Normalise une MAC au format AA:BB:CC:DD:EE:FF.
+     * Retourne null si la valeur n'est pas une MAC valide (12 hexa).
+     */
+    public static function normaliserMac(?string $mac): ?string
+    {
+        if ($mac === null) {
+            return null;
+        }
+
+        $hex = strtoupper(preg_replace('/[^0-9A-Fa-f]/', '', $mac));
+
+        if (strlen($hex) !== 12) {
+            return null;
+        }
+
+        return implode(':', str_split($hex, 2));
+    }
+
+    /**
+     * Retrouve l'appareil par sa MAC, ou le crée.
+     *
+     * - Les attributs vides/null ne PEUVENT PAS écraser une valeur existante.
+     * - Un type "inconnu" n'écrase jamais un type déjà connu.
+     * - Ne touche pas derniere_connexion sur un appareil existant
+     *   (voir toucherDerniereConnexion()).
+     *
+     * @param  array<string,mixed>  $attrs  adresse_ip, host_name, type_appareil,
+     *                                      fabricant, modele, systeme, user_agent
+     */
+    public static function trouverOuCreerParMac(string $mac, array $attrs = []): self
+    {
+        $macNormalisee = self::normaliserMac($mac);
+
+        if ($macNormalisee === null) {
+            throw new InvalidArgumentException("Adresse MAC invalide : {$mac}");
+        }
+
+        $attrs = Arr::only($attrs, [
+            'adresse_ip', 'host_name', 'type_appareil',
+            'fabricant', 'modele', 'systeme', 'user_agent',
+        ]);
+
+        $attrs = array_filter($attrs, fn ($v) => $v !== null && $v !== '');
+
+        if (
+            isset($attrs['type_appareil'])
+            && (
+                $attrs['type_appareil'] === 'inconnu'
+                || !in_array($attrs['type_appareil'], self::TYPES, true)
+            )
+        ) {
+            unset($attrs['type_appareil']);
+        }
+
+        $appareil = self::where('adresse_mac', $macNormalisee)->first();
+
+        if ($appareil === null) {
+            try {
+                return self::create(array_merge(
+                    ['type_appareil' => 'inconnu'],
+                    $attrs,
+                    [
+                        'adresse_mac'        => $macNormalisee,
+                        'premiere_connexion' => now(),
+                        'derniere_connexion' => now(),
+                    ]
+                ));
+            } catch (QueryException $e) {
+                // Course critique : un autre process vient de le créer
+                $appareil = self::where('adresse_mac', $macNormalisee)->first();
+
+                if ($appareil === null) {
+                    throw $e;
+                }
+            }
+        }
+
+        $appareil->fill($attrs);
+
+        if ($appareil->isDirty()) {
+            $appareil->save();
+        }
+
+        return $appareil;
+    }
+
+    /**
+     * Met à jour la date de dernière connexion (et la première si absente).
+     */
+    public function toucherDerniereConnexion(): void
+    {
+        $maintenant = now();
+
+        $this->derniere_connexion = $maintenant;
+
+        if ($this->premiere_connexion === null) {
+            $this->premiere_connexion = $maintenant;
+        }
+
+        $this->save();
+    }
+}
+
+
+================================================================================
+FICHIER : app/Models/Poste.php
+================================================================================
+
+<?php
+
+namespace App\Models;
+
+use App\Models\Session;
+use Illuminate\Database\Eloquent\Model;
+use Illuminate\Database\Eloquent\Relations\HasMany;
+
+class Poste extends Model
+{
+    protected $fillable = [
+        'nom_poste',
+        'nom_windows',
+        'adresse_mac',
+        'adresse_ip',
+        'type_connexion',
+        'etat',
+        'actif',
+        'derniere_communication',
+	'agent_url',
+    ];
+
+    protected $casts = [
+        'actif' => 'boolean',
+        'derniere_communication' => 'datetime',
+    ];
+
+    public function sessions(): HasMany
+    {
+        return $this->hasMany(Session::class);
+    }
+}
+
+
+================================================================================
+FICHIER : app/Http/Controllers/VoucherController.php
+================================================================================
+
+<?php
+
+namespace App\Http\Controllers;
+
+use App\Models\Voucher;
+use App\Services\VoucherService;
+use Illuminate\Http\Request;
+
+class VoucherController extends Controller
+{
+    public function __construct(
+        private VoucherService $voucherService,
+    ) {
+    }
+
+    /**
+     * Liste des vouchers avec filtres et stats.
+     */
+    public function index(Request $request)
+    {
+        $etat = $request->input('etat');
+        $sync = $request->input('sync');
+
+        $query = Voucher::query()->orderByDesc('id');
+
+        if (in_array($etat, ['disponible', 'utilise', 'annule'], true)) {
+            $query->where('etat', $etat);
+        }
+
+        if ($sync === 'synced') {
+            $query->whereNotNull('mikrotik_synced_at');
+        } elseif ($sync === 'not_synced') {
+            $query->whereNull('mikrotik_synced_at')
+                  ->where('etat', '!=', 'annule');
+        }
+
+        $vouchers = $query->paginate(50)->withQueryString();
+
+        $stats = [
+            'total'      => Voucher::count(),
+            'disponible' => Voucher::where('etat', 'disponible')->count(),
+            'utilise'    => Voucher::where('etat', 'utilise')->count(),
+            'annule'     => Voucher::where('etat', 'annule')->count(),
+            'non_sync'   => Voucher::whereNull('mikrotik_synced_at')
+                                   ->where('etat', '!=', 'annule')
+                                   ->count(),
+        ];
+
+        return view('vouchers.index', compact('vouchers', 'stats', 'etat', 'sync'));
+    }
+
+    /**
+     * Formulaire de création de lot.
+     */
+    public function create()
+    {
+        return view('vouchers.create');
+    }
+
+    /**
+     * Enregistre un nouveau lot (DB + sync MikroTik).
+     */
+    public function store(Request $request)
+    {
+        $data = $request->validate([
+            'nom'         => ['required', 'string', 'max:100'],
+            'quantite'    => ['required', 'integer', 'min:1', 'max:200'],
+            'montant'     => ['required', 'integer', 'min:1'],
+            'duree'       => ['required', 'integer', 'min:1'],
+            'description' => ['nullable', 'string', 'max:500'],
+        ]);
+
+        try {
+            $lot = $this->voucherService->creerLot(
+                nom:         $data['nom'],
+                quantite:    (int) $data['quantite'],
+                montant:     (int) $data['montant'],
+                duree:       (int) $data['duree'],
+                description: $data['description'] ?? null,
+            );
+        } catch (\Throwable $e) {
+            return back()
+                ->withInput()
+                ->withErrors(['global' => $e->getMessage()]);
+        }
+
+        $nonSync = Voucher::where('lot_voucher_id', $lot->id)
+            ->whereNull('mikrotik_synced_at')
+            ->count();
+
+        $message = "Lot « {$lot->nom} » créé : {$lot->quantite_generee} vouchers.";
+        if ($nonSync > 0) {
+            $message .= " ⚠ {$nonSync} non synchronisés avec MikroTik.";
+        }
+
+        return redirect()
+            ->route('vouchers.index')
+            ->with('success', $message);
+    }
+
+    /**
+     * Annule un voucher (et tente la suppression HotSpot).
+     */
+    public function annuler(Voucher $voucher)
+    {
+        try {
+            $this->voucherService->annuler($voucher);
+        } catch (\Throwable $e) {
+            return back()->withErrors(['global' => $e->getMessage()]);
+        }
+
+        return back()->with('success', "Voucher {$voucher->username} annulé.");
+    }
+
+    /**
+     * Resynchronise un voucher.
+     */
+    public function synchroniser(Voucher $voucher)
+    {
+        $ok = $this->voucherService->synchroniserVersMikroTik($voucher);
+
+        if (!$ok) {
+            return back()->withErrors([
+                'global' => "Sync échouée pour {$voucher->username}. " .
+                    ($voucher->fresh()->mikrotik_sync_error ?? 'Erreur inconnue.'),
+            ]);
+        }
+
+        return back()->with('success', "Voucher {$voucher->username} synchronisé.");
+    }
+
+    /**
+     * Synchronise tous les vouchers non synchronisés.
+     */
+    public function synchroniserTout()
+    {
+        $result = $this->voucherService->synchroniserVouchersEnAttente(100);
+
+        $msg = "Synchronisation : {$result['ok']} OK";
+        if ($result['ko'] > 0) {
+            $msg .= ", {$result['ko']} échec(s)";
+        }
+        $msg .= ". Restants : {$result['restants']}.";
+
+        return back()->with('success', $msg);
+    }
+}
+
+
+================================================================================
+FICHIER : app/Http/Controllers/WifiController.php
+================================================================================
+
+<?php
+
+namespace App\Http\Controllers;
+
+use App\Services\MikroTikService;
+
+class WifiController extends Controller
+{
+    public function __construct(
+        private MikroTikService $mikroTik,
+    ) {
+    }
+
+    public function index()
+    {
+        try {
+            $active = $this->mikroTik->listHotspotActive();
+            $hosts  = $this->mikroTik->listHotspotHosts();
+            $leases = $this->mikroTik->listDhcpLeases();
+            $erreur = null;
+        } catch (\Throwable $e) {
+            $active = [];
+            $hosts  = [];
+            $leases = [];
+            $erreur = $e->getMessage();
+        }
+
+        return view('wifi.index', [
+            'active' => $active,
+            'hosts'  => $hosts,
+            'leases' => $leases,
+            'erreur' => $erreur,
+        ]);
+    }
+
+    public function comptes()
+    {
+        try {
+            $users = $this->mikroTik->listHotspotUsers();
+            $erreur = null;
+        } catch (\Throwable $e) {
+            $users = [];
+            $erreur = $e->getMessage();
+        }
+
+        $prefix = config('mikrotik.hotspot_user_prefix', 'cm-');
+
+        $comptes = collect($users)->map(function ($u) use ($prefix) {
+            $u['est_cyber_manager'] = str_starts_with($u['name'] ?? '', $prefix);
+            return $u;
+        });
+
+        // Tri : Cyber Manager d'abord, puis alphabétique
+        $comptes = $comptes->sortBy([
+            fn($a, $b) => ($b['est_cyber_manager'] ?? false) <=> ($a['est_cyber_manager'] ?? false),
+            fn($a, $b) => strcmp($a['name'] ?? '', $b['name'] ?? ''),
+        ])->values();
+
+        return view('wifi.comptes', [
+            'comptes' => $comptes,
+            'erreur'  => $erreur,
+        ]);
+    }
+
+        /**
+     * Force une synchronisation immédiate des sessions Wi-Fi.
+     */
+    public function syncNow(\App\Services\WifiSessionService $sync)
+    {
+        $result = $sync->synchroniser();
+
+        if ($result['erreur']) {
+            return back()->withErrors([
+                'global' => 'MikroTik injoignable : ' . $result['erreur'],
+            ]);
+        }
+
+        $msg = "Sync : {$result['ouvertes']} ouverte(s), " .
+               "{$result['maj']} mise(s) à jour, " .
+               "{$result['fermees']} fermée(s).";
+
+        return back()->with('success', $msg);
+    }
+
+    /**
+     * Déconnecte un client actif.
+     */
+    public function deconnecter(\Illuminate\Http\Request $request)
+    {
+        $mac = (string) $request->input('mac');
+
+        if ($mac === '') {
+            return back()->withErrors(['global' => 'MAC manquante.']);
+        }
+
+        try {
+            $ok = $this->mikroTik->disconnectHotspotActiveByMac($mac);
+        } catch (\Throwable $e) {
+            return back()->withErrors(['global' => $e->getMessage()]);
+        }
+
+        if (!$ok) {
+            return back()->withErrors([
+                'global' => "Aucune session active avec la MAC {$mac}.",
+            ]);
+        }
+
+        return back()->with(
+            'success',
+            'Client déconnecté. La session sera fermée à la prochaine sync.'
+        );
+    }
+
+    /**
+     * Désactive / réactive un compte HotSpot.
+     */
+    public function toggleCompte(string $username)
+    {
+        try {
+            $user = $this->mikroTik->findHotspotUser($username);
+
+            if ($user === null) {
+                return back()->withErrors([
+                    'global' => "Compte {$username} introuvable sur le MikroTik.",
+                ]);
+            }
+
+            $estDesactive = ($user['disabled'] ?? 'false') === 'true';
+            $nouveau = !$estDesactive;
+
+            $this->mikroTik->setHotspotUserDisabled($username, $nouveau);
+
+            return back()->with(
+                'success',
+                "Compte {$username} " . ($nouveau ? 'désactivé' : 'réactivé') . '.'
+            );
+        } catch (\Throwable $e) {
+            return back()->withErrors(['global' => $e->getMessage()]);
+        }
+    }
+
+    /**
+     * Supprime un compte HotSpot.
+     */
+    public function supprimerCompte(string $username)
+    {
+        try {
+            $ok = $this->mikroTik->deleteHotspotUser($username);
+
+            if (!$ok) {
+                return back()->withErrors([
+                    'global' => "Compte {$username} introuvable.",
+                ]);
+            }
+
+            return back()->with('success', "Compte {$username} supprimé.");
+        } catch (\Throwable $e) {
+            return back()->withErrors(['global' => $e->getMessage()]);
+        }
+    }
+}
+
+
+================================================================================
+FICHIER : app/Http/Controllers/SessionController.php
+================================================================================
+
+<?php
+
+namespace App\Http\Controllers;
+
+use App\Models\Poste;
+use App\Models\Session;
+use App\Services\SessionService;
+use Illuminate\Http\Request;
+
+class SessionController extends Controller
+{
+    public function index()
+    {
+        $sessions = Session::with(['poste', 'voucher'])
+            ->orderByDesc('created_at')
+            ->get();
+
+        $postesDisponibles = Poste::where('actif', true)
+            ->where('etat', 'disponible')
+            ->orderBy('nom_poste')
+            ->get();
+
+        // Stats rapides pour l'en-tête
+        $stats = [
+            'total'      => $sessions->count(),
+            'en_cours'   => $sessions->where('etat', 'en_cours')->count(),
+            'wifi'       => $sessions->where('type_session', 'wifi')->count(),
+            'ethernet'   => $sessions->where('type_session', 'ethernet')->count(),
+        ];
+
+        return view('sessions.index', compact(
+            'sessions',
+            'postesDisponibles',
+            'stats'
+        ));
+    }
+
+    public function store(
+        Request $request,
+        SessionService $sessionService
+    ) {
+        $validated = $request->validate([
+            'poste_id'    => ['required', 'integer', 'exists:postes,id'],
+            'montant'     => ['required', 'integer', 'min:300'],
+            'description' => ['nullable', 'string', 'max:1000'],
+        ]);
+
+        $poste = Poste::findOrFail($validated['poste_id']);
+
+        try {
+            $sessionService->creerSessionEthernet(
+                $poste,
+                $validated['montant'],
+                $validated['description'] ?? null
+            );
+        } catch (\InvalidArgumentException $e) {
+            return back()
+                ->withInput()
+                ->withErrors(['session' => $e->getMessage()]);
+        }
+
+        return redirect()
+            ->route('sessions.index')
+            ->with('success', 'Session Ethernet activée avec succès.');
+    }
+}
+
+
+================================================================================
+FICHIER : app/Http/Controllers/DashboardController.php
+================================================================================
+
+<?php
+
+namespace App\Http\Controllers;
+
+use App\Services\DashboardService;
+
+class DashboardController extends Controller
+{
+    public function __construct(
+        private DashboardService $dashboard,
+    ) {
+    }
+
+    public function index()
+    {
+        return view('dashboard', [
+            'stats' => $this->dashboard->getStats(),
+        ]);
+    }
+}
+
+
+================================================================================
+FICHIER : resources/views/vouchers/index.blade.php
+================================================================================
+
+@extends('layouts.cyber-manager', ['title' => 'Vouchers — Cyber Manager'])
+
+@section('content')
+
+@if(session('success'))
+    <div class="bg-green-50 border border-green-200 text-green-800 rounded-lg p-3 mb-4 text-sm">
+        {{ session('success') }}
+    </div>
+@endif
+
+@if($errors->any())
+    <div class="bg-red-50 border border-red-200 text-red-800 rounded-lg p-3 mb-4 text-sm">
+        @foreach($errors->all() as $err)
+            <div>{{ $err }}</div>
+        @endforeach
+    </div>
+@endif
+
+
+{{-- Cartes stats --}}
+<div class="grid grid-cols-2 sm:grid-cols-4 gap-4 mb-6">
+    <div class="bg-white border border-gray-200 rounded-lg p-4">
+        <div class="text-xs text-gray-500">Total</div>
+        <div class="text-2xl font-bold">{{ $stats['total'] }}</div>
+    </div>
+    <div class="bg-white border border-gray-200 rounded-lg p-4">
+        <div class="text-xs text-gray-500">Disponibles</div>
+        <div class="text-2xl font-bold text-green-600">{{ $stats['disponible'] }}</div>
+    </div>
+    <div class="bg-white border border-gray-200 rounded-lg p-4">
+        <div class="text-xs text-gray-500">Utilisés</div>
+        <div class="text-2xl font-bold text-blue-600">{{ $stats['utilise'] }}</div>
+    </div>
+    <div class="bg-white border border-gray-200 rounded-lg p-4">
+        <div class="text-xs text-gray-500">Non synchronisés</div>
+        <div class="text-2xl font-bold {{ $stats['non_sync'] > 0 ? 'text-red-600' : 'text-gray-400' }}">
+            {{ $stats['non_sync'] }}
+        </div>
+    </div>
+</div>
+
+
+{{-- Barre filtres + actions --}}
+<div class="flex flex-wrap gap-3 items-center justify-between mb-4">
+
+    <div class="flex flex-wrap gap-2">
+        @php
+            $base = 'px-3 py-2 rounded-md text-sm';
+            $active = 'bg-blue-600 text-white';
+            $inactive = 'bg-gray-100 hover:bg-gray-200';
+        @endphp
+
+        <a href="{{ route('vouchers.index') }}"
+           class="{{ $base }} {{ !$etat && !$sync ? $active : $inactive }}">
+            Tous
+        </a>
+        <a href="{{ route('vouchers.index', ['etat' => 'disponible']) }}"
+           class="{{ $base }} {{ $etat === 'disponible' ? $active : $inactive }}">
+            Disponibles
+        </a>
+        <a href="{{ route('vouchers.index', ['etat' => 'utilise']) }}"
+           class="{{ $base }} {{ $etat === 'utilise' ? $active : $inactive }}">
+            Utilisés
+        </a>
+        <a href="{{ route('vouchers.index', ['etat' => 'annule']) }}"
+           class="{{ $base }} {{ $etat === 'annule' ? $active : $inactive }}">
+            Annulés
+        </a>
+        <a href="{{ route('vouchers.index', ['sync' => 'not_synced']) }}"
+           class="{{ $base }} {{ $sync === 'not_synced'
+                ? 'bg-red-600 text-white'
+                : 'bg-red-50 text-red-700 hover:bg-red-100' }}">
+            Non synchronisés
+        </a>
+    </div>
+
+    <div class="flex gap-2">
+        @if($stats['non_sync'] > 0)
+            <form method="POST" action="{{ route('vouchers.synchroniser-tout') }}">
+                @csrf
+                <button type="submit"
+                        class="px-4 py-2 rounded-md bg-amber-600 text-white hover:bg-amber-700 text-sm">
+                    Synchroniser tout ({{ $stats['non_sync'] }})
+                </button>
+            </form>
+        @endif
+
+        <a href="{{ route('vouchers.create') }}"
+           class="px-4 py-2 rounded-md bg-blue-600 text-white hover:bg-blue-700 text-sm">
+            + Créer un lot
+        </a>
+    </div>
+
+</div>
+
+
+{{-- Table --}}
+<div class="bg-white border border-gray-200 rounded-lg overflow-hidden">
+    <table class="w-full text-sm">
+        <thead class="bg-gray-50 text-gray-600 text-left">
+            <tr>
+                <th class="px-4 py-3">Identifiants</th>
+                <th class="px-4 py-3">Montant</th>
+                <th class="px-4 py-3">Durée</th>
+                <th class="px-4 py-3">État</th>
+                <th class="px-4 py-3">MikroTik</th>
+                <th class="px-4 py-3">Créé le</th>
+                <th class="px-4 py-3 text-right">Actions</th>
+            </tr>
+        </thead>
+        <tbody class="divide-y divide-gray-100">
+            @forelse($vouchers as $voucher)
+                @php
+                    $etatColor = [
+                        'disponible' => 'bg-green-100 text-green-800',
+                        'utilise'    => 'bg-blue-100 text-blue-800',
+                        'annule'     => 'bg-gray-100 text-gray-500',
+                    ][$voucher->etat] ?? 'bg-gray-100 text-gray-700';
+                @endphp
+                <tr class="hover:bg-gray-50">
+                    <td class="px-4 py-3 font-mono">
+                        <div>{{ $voucher->username }}</div>
+                        <div class="text-xs text-gray-400" title="Mot de passe HotSpot">
+                            mdp : {{ $voucher->password }}
+                        </div>
+                    </td>
+                    <td class="px-4 py-3">
+                        {{ number_format($voucher->montant, 0, ',', ' ') }} Ar
+                    </td>
+                    <td class="px-4 py-3">{{ $voucher->duree }} min</td>
+                    <td class="px-4 py-3">
+                        <span class="px-2 py-1 rounded text-xs {{ $etatColor }}">
+                            {{ $voucher->etat }}
+                        </span>
+                    </td>
+                    <td class="px-4 py-3">
+                        @if($voucher->etat === 'annule')
+                            <span class="text-gray-400">—</span>
+                        @elseif($voucher->mikrotik_synced_at)
+                            <span class="text-green-600 text-xs"
+                                  title="Synchronisé le {{ $voucher->mikrotik_synced_at->format('d/m/Y H:i') }}">
+                                ✓ synchronisé
+                            </span>
+                        @else
+                            <span class="text-red-600 text-xs"
+                                  title="{{ $voucher->mikrotik_sync_error }}">
+                                ⚠ non synchronisé
+                            </span>
+                        @endif
+                    </td>
+                    <td class="px-4 py-3 text-gray-500 text-xs">
+                        {{ $voucher->date_heure_creation?->format('d/m/Y H:i') ?? '—' }}
+                    </td>
+                    <td class="px-4 py-3 text-right">
+                        <div class="flex gap-3 justify-end">
+                            @if($voucher->etat !== 'annule' && !$voucher->mikrotik_synced_at)
+                                <form method="POST"
+                                      action="{{ route('vouchers.synchroniser', $voucher) }}">
+                                    @csrf
+                                    <button class="text-amber-600 hover:text-amber-800 text-xs">
+                                        Sync
+                                    </button>
+                                </form>
+                            @endif
+
+                            @if($voucher->etat === 'disponible')
+                                <form method="POST"
+                                      action="{{ route('vouchers.annuler', $voucher) }}"
+                                      onsubmit="return confirm('Annuler ce voucher ? Il sera supprimé du MikroTik.');">
+                                    @csrf
+                                    @method('DELETE')
+                                    <button class="text-red-600 hover:text-red-800 text-xs">
+                                        Annuler
+                                    </button>
+                                </form>
+                            @endif
+                        </div>
+                    </td>
+                </tr>
+            @empty
+                <tr>
+                    <td colspan="7" class="px-4 py-8 text-center text-gray-400 text-sm">
+                        Aucun voucher.
+                    </td>
+                </tr>
+            @endforelse
+        </tbody>
+    </table>
+</div>
+
+<div class="mt-4">
+    {{ $vouchers->links() }}
+</div>
+
+@endsection
+
+
+================================================================================
+FICHIER : resources/views/vouchers/create.blade.php
+================================================================================
+
+@extends('layouts.cyber-manager', ['title' => 'Créer un lot de vouchers'])
+
+@section('content')
+
+<div class="max-w-2xl">
+    <div class="bg-white border border-gray-200 rounded-lg p-6">
+        <h1 class="text-xl font-bold mb-2">Créer un lot de vouchers</h1>
+
+        <p class="text-sm text-gray-600 mb-6">
+            Les vouchers seront créés en base puis synchronisés automatiquement
+            avec le MikroTik. Chaque voucher a une durée en minutes et un montant en Ariary.
+        </p>
+
+        @if($errors->any())
+            <div class="bg-red-50 border border-red-200 text-red-800 rounded-lg p-3 mb-4 text-sm">
+                @foreach($errors->all() as $err)
+                    <div>{{ $err }}</div>
+                @endforeach
+            </div>
+        @endif
+
+        <form method="POST" action="{{ route('vouchers.store') }}" class="space-y-4">
+            @csrf
+
+            <div>
+                <label class="block text-sm font-medium text-gray-700 mb-1">
+                    Nom du lot
+                </label>
+                <input type="text" name="nom" value="{{ old('nom') }}" required
+                       placeholder="Ex : Lot promo 500 Ar"
+                       class="w-full border border-gray-300 rounded-md px-3 py-2 text-sm">
+            </div>
+
+            <div class="grid grid-cols-1 sm:grid-cols-3 gap-4">
+                <div>
+                    <label class="block text-sm font-medium text-gray-700 mb-1">
+                        Quantité
+                    </label>
+                    <input type="number" name="quantite"
+                           value="{{ old('quantite', 10) }}"
+                           min="1" max="200" required
+                           class="w-full border border-gray-300 rounded-md px-3 py-2 text-sm">
+                    <p class="text-xs text-gray-500 mt-1">Max 200 par lot.</p>
+                </div>
+
+                <div>
+                    <label class="block text-sm font-medium text-gray-700 mb-1">
+                        Montant (Ar)
+                    </label>
+                    <input type="number" name="montant"
+                           value="{{ old('montant', 500) }}"
+                           min="1" required
+                           class="w-full border border-gray-300 rounded-md px-3 py-2 text-sm">
+                </div>
+
+                <div>
+                    <label class="block text-sm font-medium text-gray-700 mb-1">
+                        Durée (min)
+                    </label>
+                    <input type="number" name="duree"
+                           value="{{ old('duree', 25) }}"
+                           min="1" required
+                           class="w-full border border-gray-300 rounded-md px-3 py-2 text-sm">
+                </div>
+            </div>
+
+            <div>
+                <label class="block text-sm font-medium text-gray-700 mb-1">
+                    Description (optionnelle)
+                </label>
+                <textarea name="description" rows="2"
+                          class="w-full border border-gray-300 rounded-md px-3 py-2 text-sm">{{ old('description') }}</textarea>
+            </div>
+
+            <div class="flex items-center gap-3 pt-2">
+                <button type="submit"
+                        class="px-4 py-2 rounded-md bg-blue-600 text-white hover:bg-blue-700 text-sm">
+                    Créer le lot
+                </button>
+                <a href="{{ route('vouchers.index') }}"
+                   class="px-4 py-2 rounded-md bg-gray-100 hover:bg-gray-200 text-sm">
+                    Annuler
+                </a>
+            </div>
+        </form>
+    </div>
+</div>
+
+@endsection
+
+
+================================================================================
+FICHIER : resources/views/layouts/cyber-manager.blade.php
+================================================================================
+
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+
+    <title>{{ $title ?? 'Cyber Manager' }}</title>
+
+    @vite(['resources/css/app.css', 'resources/js/app.js'])
+</head>
+
+<body class="bg-gray-100 text-gray-900">
+
+    <div class="min-h-screen">
+
+        <!-- Barre supérieure -->
+        <header class="bg-white border-b border-gray-200">
+            <div class="max-w-7xl mx-auto px-6 py-4 flex items-center justify-between">
+
+                <a href="{{ route('dashboard') }}"
+                   class="text-xl font-bold text-gray-800">
+                    Cyber Manager
+                </a>
+
+                <div class="flex items-center gap-4">
+
+                    <span class="text-sm text-gray-600">
+                        {{ Auth::user()->name }}
+                    </span>
+
+                    <form method="POST" action="{{ route('logout') }}">
+                        @csrf
+
+                        <button type="submit"
+                                class="text-sm text-red-600 hover:text-red-800">
+                            Déconnexion
+                        </button>
+                    </form>
+
+                </div>
+
+            </div>
+        </header>
+
+
+        <!-- Contenu principal -->
+        <div class="max-w-7xl mx-auto px-6 py-8">
+
+            <!-- Navigation -->
+            <nav class="mb-8 bg-white border border-gray-200 rounded-lg p-4">
+
+                <div class="flex flex-wrap gap-3">
+
+                    <a href="{{ route('dashboard') }}"
+                       class="px-4 py-2 rounded-md bg-gray-100 hover:bg-gray-200">
+                        Dashboard
+                    </a>
+
+                    <a href="{{ route('postes.index') }}"
+                       class="px-4 py-2 rounded-md bg-gray-100 hover:bg-gray-200">
+                        Postes
+                    </a>
+
+<a href="{{ route('sessions.index') }}" class="px-4 py-2 rounded-md bg-gray-100 hover:bg-gray-200">
+    Sessions
+</a>
+
+                    <a href="{{ route('wifi.index') }}"
+                    class="px-4 py-2 rounded-md bg-gray-100 hover:bg-gray-200">
+                        Wi-Fi
+                    </a>
+
+                    <a href="{{ route('vouchers.index') }}"
+                    class="px-4 py-2 rounded-md bg-gray-100 hover:bg-gray-200">
+                        Vouchers
+                    </a>
+
+                    <span class="px-4 py-2 rounded-md bg-gray-50 text-gray-400">
+                        Tarifs
+                    </span>
+
+                    <span class="px-4 py-2 rounded-md bg-gray-50 text-gray-400">
+                        Historique
+                    </span>
+
+                    <span class="px-4 py-2 rounded-md bg-gray-50 text-gray-400">
+                        Statistiques
+                    </span>
+
+                </div>
+
+            </nav>
+
+
+            <!-- Page -->
+            <main>
+
+                @yield('content')
+
+            </main>
+
+        </div>
+
+    </div>
+
+</body>
+</html>
+
+
+================================================================================
+FICHIER : config/mikrotik.php
+================================================================================
+
+<?php
+
+return [
+
+    /*
+    |--------------------------------------------------------------------------
+    | Configuration MikroTik
+    |--------------------------------------------------------------------------
+    |
+    | Toutes les valeurs sont externalisées dans .env.
+    | Aucune adresse IP, aucun identifiant ne doit être codé en dur
+    | dans le code applicatif (règle 3 du contexte maître).
+    |
+    */
+
+    'host'     => env('MIKROTIK_HOST', '128.0.1.1'),
+    'port'     => (int) env('MIKROTIK_PORT', 8728),
+    'user'     => env('MIKROTIK_USER', 'admin'),
+    'password' => env('MIKROTIK_PASSWORD', ''),
+    'ssl'      => filter_var(env('MIKROTIK_SSL', false), FILTER_VALIDATE_BOOLEAN),
+    'timeout'  => (float) env('MIKROTIK_TIMEOUT', 5.0),
+
+    // Profil HotSpot par défaut pour les utilisateurs créés par Cyber Manager.
+    // À adapter selon les profils réels du routeur (default, LIBRE, ...).
+    'hotspot_profile'     => env('MIKROTIK_HOTSPOT_PROFILE', 'default'),
+
+    // Préfixe des utilisateurs créés par Cyber Manager.
+    // Permet de les distinguer des users créés manuellement / Mikhmon.
+    'hotspot_user_prefix' => env('MIKROTIK_USER_PREFIX', 'cm-'),
+
+    // 'test' ou 'production' — purement informatif pour l'UI/l'audit.
+    // Ne JAMAIS s'en servir pour changer le comportement du code.
+    'environment' => env('MIKROTIK_ENV', 'test'),
+
+    /*
+    |--------------------------------------------------------------------------
+    | SSID Wi-Fi
+    |--------------------------------------------------------------------------
+    |
+    | Le champ "server" renvoyé par /ip/hotspot/active est le nom du serveur
+    | HotSpot, pas le SSID. On le traduit ici.
+    |
+    | MIKROTIK_SSID_MAP     = "hotspot1=NomDuSSID,hotspot2=AutreSSID"
+    | MIKROTIK_SSID_DEFAULT = SSID utilisé si le serveur est inconnu/absent
+    |
+    */
+    'ssid_default' => env('MIKROTIK_SSID_DEFAULT'),
+
+    'ssid_map' => collect(explode(',', (string) env('MIKROTIK_SSID_MAP', '')))
+        ->filter(fn ($paire) => str_contains($paire, '='))
+        ->mapWithKeys(function ($paire) {
+            [$serveur, $ssid] = explode('=', $paire, 2);
+            return [trim($serveur) => trim($ssid)];
+        })
+        ->all(),
+
+];
+
+
+================================================================================
+FICHIER : routes/web.php
+================================================================================
+
+<?php
+
+use App\Http\Controllers\VoucherController;
+use App\Http\Controllers\ProfileController;
+use Illuminate\Support\Facades\Route;
+use App\Http\Controllers\DashboardController;
+use App\Http\Controllers\PosteController;
+use App\Http\Controllers\SessionController;
+use App\Http\Controllers\TarifController;
+use App\Http\Controllers\WifiController;
+
+Route::get('/tarifs', [TarifController::class, 'index'])
+    ->middleware('auth')
+    ->name('tarifs.index');
+
+Route::post('/tarifs', [TarifController::class, 'store'])
+    ->middleware('auth')
+    ->name('tarifs.store');
+
+Route::post('/tarifs/{tarif}/activer', [TarifController::class, 'activer'])
+    ->middleware('auth')
+    ->name('tarifs.activer');
+
+Route::delete('/tarifs/{tarif}', [TarifController::class, 'destroy'])
+    ->middleware('auth')
+    ->name('tarifs.destroy');
+
+Route::get('/sessions', [SessionController::class, 'index'])
+    ->middleware('auth')
+    ->name('sessions.index');
+
+Route::post('/sessions', [SessionController::class, 'store'])
+    ->middleware('auth')
+    ->name('sessions.store');
+
+Route::get('/', function () {
+    return view('welcome');
+});
+
+Route::get('/dashboard', [DashboardController::class, 'index'])
+    ->middleware('auth')
+    ->name('dashboard');
+
+Route::get('/postes', [PosteController::class, 'index'])
+    ->middleware('auth')
+    ->name('postes.index');
+
+Route::post('/postes/{poste}/tester-agent', [PosteController::class, 'testerAgent'])
+    ->middleware('auth')
+    ->name('postes.tester-agent');
+
+Route::post('/postes/{poste}/verrouiller', [PosteController::class, 'verrouiller'])
+    ->middleware('auth')
+    ->name('postes.verrouiller');
+
+Route::post('/postes/{poste}/deverrouiller', [PosteController::class, 'deverrouiller'])
+    ->middleware('auth')
+    ->name('postes.deverrouiller');
+
+Route::middleware('auth')->group(function () {
+    Route::get('/profile', [ProfileController::class, 'edit'])->name('profile.edit');
+    Route::patch('/profile', [ProfileController::class, 'update'])->name('profile.update');
+    Route::delete('/profile', [ProfileController::class, 'destroy'])->name('profile.destroy');
+});
+
+Route::middleware('auth')->group(function () {
+    Route::get('/vouchers', [VoucherController::class, 'index'])
+        ->name('vouchers.index');
+
+    Route::get('/vouchers/create', [VoucherController::class, 'create'])
+        ->name('vouchers.create');
+
+    Route::post('/vouchers', [VoucherController::class, 'store'])
+        ->name('vouchers.store');
+
+    Route::post('/vouchers/synchroniser-tout', [VoucherController::class, 'synchroniserTout'])
+        ->name('vouchers.synchroniser-tout');
+
+    Route::post('/vouchers/{voucher}/synchroniser', [VoucherController::class, 'synchroniser'])
+        ->name('vouchers.synchroniser');
+
+    Route::delete('/vouchers/{voucher}', [VoucherController::class, 'annuler'])
+        ->name('vouchers.annuler');
+});
+
+Route::middleware('auth')->group(function () {
+    Route::get('/wifi', [WifiController::class, 'index'])
+        ->name('wifi.index');
+
+    Route::get('/wifi/comptes', [WifiController::class, 'comptes'])
+    ->name('wifi.comptes');
+
+    Route::post('/wifi/sync', [WifiController::class, 'syncNow'])
+    ->name('wifi.sync');
+
+    Route::post('/wifi/deconnecter', [WifiController::class, 'deconnecter'])
+        ->name('wifi.deconnecter');
+
+    Route::post('/wifi/comptes/{username}/toggle', [WifiController::class, 'toggleCompte'])
+        ->name('wifi.comptes.toggle');
+
+    Route::delete('/wifi/comptes/{username}', [WifiController::class, 'supprimerCompte'])
+        ->name('wifi.comptes.supprimer');
+});
+
+require __DIR__.'/auth.php';
+
+
+================================================================================
+FICHIER : routes/console.php
+================================================================================
+
+<?php
+
+use Illuminate\Foundation\Inspiring;
+use Illuminate\Support\Facades\Artisan;
+use Illuminate\Support\Facades\Schedule;
+
+Artisan::command('inspire', function () {
+    $this->comment(Inspiring::quote());
+})->purpose('Display an inspiring quote');
+
+// Ferme les sessions Ethernet arrivées à expiration
+Schedule::command('sessions:expire')->everyMinute();
+
+// Synchronise les sessions Wi-Fi depuis le MikroTik
+Schedule::command('wifi:sync-sessions')->everyMinute();
+
+
+================================================================================
+FICHIER : app/Console/Commands/WifiSyncSessionsCommand.php
+================================================================================
+
+<?php
+
+namespace App\Console\Commands;
+
+use App\Services\WifiSessionService;
+use Illuminate\Console\Command;
+
+class WifiSyncSessionsCommand extends Command
+{
+    protected $signature   = 'wifi:sync-sessions';
+    protected $description = 'Synchronise les sessions Wi-Fi depuis le HotSpot MikroTik';
+
+    public function handle(WifiSessionService $service): int
+    {
+        $result = $service->synchroniser();
+
+        if ($result['erreur']) {
+            $this->error('MikroTik injoignable : ' . $result['erreur']);
+            return self::FAILURE;
+        }
+
+        $this->info(sprintf(
+            'Sessions ouvertes : %d · mises à jour : %d · fermées : %d',
+            $result['ouvertes'],
+            $result['maj'],
+            $result['fermees']
+        ));
+
+        return self::SUCCESS;
+    }
+}
+
+
+================================================================================
+FICHIER : app/Console/Commands/MikrotikTestCommand.php
+================================================================================
+
+<?php
+
+namespace App\Console\Commands;
+
+use App\Services\MikroTikService;
+use Illuminate\Console\Command;
+
+class MikrotikTestCommand extends Command
+{
+    protected $signature = 'mikrotik:test
+                            {--users : Lister aussi les utilisateurs HotSpot}
+                            {--active : Lister aussi les sessions HotSpot actives}
+                            {--profiles : Lister aussi les profils HotSpot}';
+
+    protected $description = 'Teste la connexion à l\'API MikroTik RouterOS';
+
+    public function handle(MikroTikService $service): int
+    {
+        $config = config('mikrotik');
+
+        $this->info(sprintf(
+            'Cible : %s:%d (env: %s, user: %s, ssl: %s)',
+            $config['host'],
+            $config['port'],
+            $config['environment'],
+            $config['user'],
+            $config['ssl'] ? 'oui' : 'non'
+        ));
+
+        try {
+            $info = $service->testConnection();
+        } catch (\Throwable $e) {
+            $this->error('Échec : ' . $e->getMessage());
+            return self::FAILURE;
+        }
+
+        $this->info('✓ Connexion et login OK');
+        $this->newLine();
+
+        $this->table(
+            ['Champ', 'Valeur'],
+            [
+                ['Identity',     $info['identity']   ?? '-'],
+                ['Version',      $info['version']    ?? '-'],
+                ['Board',        $info['board_name'] ?? '-'],
+                ['Uptime',       $info['uptime']     ?? '-'],
+            ]
+        );
+
+        if ($this->option('users')) {
+            $this->dumpList('Utilisateurs HotSpot', $service->listHotspotUsers(), 'name');
+        }
+        if ($this->option('active')) {
+            $this->dumpList('Sessions HotSpot actives', $service->listHotspotActive(), 'user');
+        }
+        if ($this->option('profiles')) {
+            $this->dumpList('Profils HotSpot', $service->listHotspotProfiles(), 'name');
+        }
+
+        return self::SUCCESS;
+    }
+
+    private function dumpList(string $title, array $rows, string $key): void
+    {
+        $this->newLine();
+        $this->info("$title : " . count($rows));
+
+        if (empty($rows)) {
+            return;
+        }
+
+        foreach (array_slice($rows, 0, 15) as $row) {
+            $this->line(' - ' . ($row[$key] ?? '?'));
+        }
+
+        if (count($rows) > 15) {
+            $this->line(' ... (' . (count($rows) - 15) . ' de plus)');
+        }
+    }
+}
+
+
+================================================================================
+FICHIER : database/migrations/2026_09_25_093115_create_vouchers_table.php
+================================================================================
+
+<?php
+
+use Illuminate\Database\Migrations\Migration;
+use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Support\Facades\Schema;
+
+return new class extends Migration
+{
+    public function up(): void
+    {
+        Schema::create('vouchers', function (Blueprint $table) {
+            $table->id();
+
+            $table->foreignId('lot_voucher_id')
+                ->nullable()
+                ->constrained('lot_vouchers')
+                ->nullOnDelete();
+
+            /*
+             * Identifiants réellement utilisés par le HotSpot MikroTik.
+             */
+            $table->string('username')->unique();
+
+            $table->string('password');
+
+            /*
+             * Code affichable/imprimable pour le client.
+             * Dans notre fonctionnement, il peut correspondre
+             * au password/code HotSpot.
+             */
+            $table->string('code')->unique();
+
+            $table->unsignedInteger('montant');
+
+            $table->unsignedInteger('duree');
+
+            /*
+             * disponible
+             * utilise
+             * expire
+             * annule
+             */
+            $table->string('etat')->default('disponible');
+
+            /*
+             * cyber_manager = créé par Cyber Manager
+             * mikrotik = récupéré depuis MikroTik/Mikhmon
+             * manuel = créé manuellement
+             */
+            $table->string('source')->default('cyber_manager');
+
+            /*
+             * Identifiant du compte HotSpot sur MikroTik
+             * lorsqu'il est synchronisé.
+             */
+            $table->string('mikrotik_id')->nullable();
+
+            $table->dateTime('date_heure_creation');
+
+            $table->dateTime('date_heure_utilisation')->nullable();
+
+            $table->dateTime('date_heure_expiration')->nullable();
+
+            $table->dateTime('derniere_synchronisation')->nullable();
+
+            $table->text('description')->nullable();
+
+            $table->timestamps();
+
+            $table->index('etat');
+            $table->index('username');
+            $table->index('source');
+        });
+    }
+
+    public function down(): void
+    {
+        Schema::dropIfExists('vouchers');
+    }
+};
+
+
+================================================================================
+FICHIER : database/migrations/2026_09_25_093109_create_lot_vouchers_table.php
+================================================================================
+
+<?php
+
+use Illuminate\Database\Migrations\Migration;
+use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Support\Facades\Schema;
+
+return new class extends Migration
+{
+    public function up(): void
+    {
+        Schema::create('lot_vouchers', function (Blueprint $table) {
+            $table->id();
+
+            $table->string('nom');
+
+            $table->unsignedInteger('quantite_prevue');
+
+            $table->unsignedInteger('montant_unitaire');
+
+            $table->unsignedInteger('duree_unitaire');
+
+            $table->unsignedInteger('quantite_generee')->default(0);
+
+            $table->string('source')->default('cyber_manager');
+
+            $table->text('description')->nullable();
+
+            $table->timestamps();
+        });
+    }
+
+    public function down(): void
+    {
+        Schema::dropIfExists('lot_vouchers');
+    }
+};
+
+
+================================================================================
+FICHIER : database/migrations/2026_09_28_200000_add_wifi_fields_to_sessions_table.php
+================================================================================
+
+<?php
+
+use Illuminate\Database\Migrations\Migration;
+use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Support\Facades\Schema;
+
+return new class extends Migration
+{
+    public function up(): void
+    {
+        Schema::table('cyber_sessions', function (Blueprint $table) {
+            $table->string('mikrotik_active_id')->nullable()->after('voucher_id');
+            $table->string('hotspot_username')->nullable()->after('mikrotik_active_id');
+            $table->string('client_mac')->nullable()->after('hotspot_username');
+            $table->string('client_ip')->nullable()->after('client_mac');
+            $table->timestamp('derniere_sync_at')->nullable()->after('client_ip');
+
+            $table->index('mikrotik_active_id');
+            $table->index('hotspot_username');
+        });
+    }
+
+    public function down(): void
+    {
+        Schema::table('cyber_sessions', function (Blueprint $table) {
+            $table->dropIndex(['mikrotik_active_id']);
+            $table->dropIndex(['hotspot_username']);
+            $table->dropColumn([
+                'mikrotik_active_id',
+                'hotspot_username',
+                'client_mac',
+                'client_ip',
+                'derniere_sync_at',
+            ]);
+        });
+    }
+};
+
+

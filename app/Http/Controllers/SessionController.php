@@ -11,7 +11,7 @@ class SessionController extends Controller
 {
     public function index()
     {
-        $sessions = Session::with('poste')
+        $sessions = Session::with(['poste', 'voucher'])
             ->orderByDesc('created_at')
             ->get();
 
@@ -20,9 +20,18 @@ class SessionController extends Controller
             ->orderBy('nom_poste')
             ->get();
 
+        // Stats rapides pour l'en-tête
+        $stats = [
+            'total'      => $sessions->count(),
+            'en_cours'   => $sessions->where('etat', 'en_cours')->count(),
+            'wifi'       => $sessions->where('type_session', 'wifi')->count(),
+            'ethernet'   => $sessions->where('type_session', 'ethernet')->count(),
+        ];
+
         return view('sessions.index', compact(
             'sessions',
-            'postesDisponibles'
+            'postesDisponibles',
+            'stats'
         ));
     }
 
@@ -31,8 +40,8 @@ class SessionController extends Controller
         SessionService $sessionService
     ) {
         $validated = $request->validate([
-            'poste_id' => ['required', 'integer', 'exists:postes,id'],
-            'montant' => ['required', 'integer', 'min:300'],
+            'poste_id'    => ['required', 'integer', 'exists:postes,id'],
+            'montant'     => ['required', 'integer', 'min:300'],
             'description' => ['nullable', 'string', 'max:1000'],
         ]);
 
@@ -47,9 +56,7 @@ class SessionController extends Controller
         } catch (\InvalidArgumentException $e) {
             return back()
                 ->withInput()
-                ->withErrors([
-                    'session' => $e->getMessage(),
-                ]);
+                ->withErrors(['session' => $e->getMessage()]);
         }
 
         return redirect()

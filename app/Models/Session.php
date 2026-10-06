@@ -39,15 +39,23 @@ class Session extends Model
         'volume_entree',
         'volume_sortie',
         'volume_total',
+        'mikrotik_active_id',
+        'hotspot_username',
+        'client_mac',
+        'client_ip',
+        'ssid',
+        'appareil_wifi_id',
+        'derniere_sync_at',
     ];
 
     protected $casts = [
         'date_heure_debut' => 'datetime',
         'date_heure_fin_prevue' => 'datetime',
         'date_heure_fin_reelle' => 'datetime',
-	'date_heure_suspension' => 'datetime',
-	'date_heure_reprise' => 'datetime',
-	'duree_suspension' => 'integer',
+        'date_heure_suspension' => 'datetime',
+        'date_heure_reprise' => 'datetime',
+        'duree_suspension' => 'integer',
+        'derniere_sync_at' => 'datetime',
     ];
 
     public function poste(): BelongsTo
@@ -73,5 +81,10 @@ class Session extends Model
     public function voucher(): BelongsTo
     {
         return $this->belongsTo(Voucher::class);
+    }
+
+    public function appareilWifi(): BelongsTo
+    {
+        return $this->belongsTo(AppareilWifi::class, 'appareil_wifi_id');
     }
 }
