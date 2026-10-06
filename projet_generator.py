@@ -1,159 +1,188 @@
 # -*- coding: utf-8 -*-
-"""
-projet_generator.py
-Génère un fichier GENERATOR.txt contenant le contenu de tous les fichiers
-listés ci-dessous, prêt à être envoyé à Claude.
-
-Usage : py projet_generator.py
-"""
+"""projet_generator.py — Cyber Manager : génère GENERATOR.txt"""
 
 import os
+import sys
+from datetime import datetime
 from pathlib import Path
 
-# =============================================================
-# CONFIGURATION — Modifie cette liste à chaque étape
-# =============================================================
+RACINE = Path(__file__).resolve().parent
+FICHIER_SORTIE = RACINE / "GENERATOR.txt"
+TAILLE_MAX_KO = 500
 
-FILES = [
-    # Services Wi-Fi
-    "app/Services/MikroTikService.php",
-    "app/Services/MikroTik/MikrotikConnection.php",
-    "app/Services/WifiSessionService.php",
-    "app/Services/VoucherService.php",
-    "app/Services/VoucherReplenishmentService.php",
-    "app/Services/SessionService.php",
-    "app/Services/AgentWindowsService.php",
+SECTIONS = {
 
-    # Modèles
-    "app/Models/Voucher.php",
-    "app/Models/Session.php",
-    "app/Models/LotVoucher.php",
-    "app/Models/AppareilWifi.php",
-    "app/Models/Poste.php",
+    # ═══════════════════════════════════════════════════════════════
+    # 1. WI-FI — le cœur du travail actuel
+    # ═══════════════════════════════════════════════════════════════
+    "WIFI - Controller et vues": [
+        "app/Http/Controllers/WifiController.php",
+        "resources/views/wifi/index.blade.php",
+        "resources/views/wifi/comptes.blade.php",
+    ],
 
-    # Controllers
-    "app/Http/Controllers/VoucherController.php",
-    "app/Http/Controllers/WifiController.php",
-    "app/Http/Controllers/SessionController.php",
-    "app/Http/Controllers/DashboardController.php",
+    # ═══════════════════════════════════════════════════════════════
+    # 2. WI-FI — Services et modèles liés
+    # ═══════════════════════════════════════════════════════════════
+    "WIFI - Services et modèles": [
+        "app/Services/WifiSessionService.php",
+        "app/Services/MikroTikService.php",
+        "app/Services/SessionService.php",
+        "app/Models/Session.php",
+        "app/Models/AppareilWifi.php",
+        "app/Models/Voucher.php",
+        "app/Models/LotVoucher.php",
+    ],
 
-    # Vues — Vouchers
-    "resources/views/vouchers/index.blade.php",
-    "resources/views/vouchers/create.blade.php",
+    # ═══════════════════════════════════════════════════════════════
+    # 3. COMMANDES ARTISAN (pour comprendre la sync)
+    # ═══════════════════════════════════════════════════════════════
+    "COMMANDES": [
+        "app/Console/Commands/WifiSyncSessionsCommand.php",
+        "app/Console/Commands/ExpireSessions.php",
+    ],
 
-    # Vues — Layout et composants
-    "resources/views/layouts/cyber-manager.blade.php",
+    # ═══════════════════════════════════════════════════════════════
+    # 4. TARIFS (pour le calcul du montant dû Wi-Fi)
+    # ═══════════════════════════════════════════════════════════════
+    "TARIFS": [
+        "app/Models/Tarif.php",
+        "app/Models/TarifRaccourci.php",
+        "app/Services/TarifService.php",
+        "app/Http/Controllers/TarifController.php",
+    ],
 
-    # Config
-    "config/mikrotik.php",
+    # ═══════════════════════════════════════════════════════════════
+    # 5. LAYOUT + COMPOSANTS
+    # ═══════════════════════════════════════════════════════════════
+    "LAYOUT et COMPOSANTS": [
+        "resources/views/layouts/cyber-manager.blade.php",
+        "resources/views/components/kpi-card.blade.php",
+        "resources/views/components/badge.blade.php",
+        "resources/views/components/icone.blade.php",
+        "resources/views/components/flash.blade.php",
+    ],
 
-    # Routes
-    "routes/web.php",
-    "routes/console.php",
+    # ═══════════════════════════════════════════════════════════════
+    # 6. ROUTES ET CONFIG
+    # ═══════════════════════════════════════════════════════════════
+    "ROUTES et CONFIG": [
+        "routes/web.php",
+        "routes/console.php",
+        "config/mikrotik.php",
+    ],
 
-    # Commands
-    "app/Console/Commands/WifiSyncSessionsCommand.php",
-    "app/Console/Commands/MikrotikTestCommand.php",
+    # ═══════════════════════════════════════════════════════════════
+    # 7. DASHBOARD (pour cohérence des stats)
+    # ═══════════════════════════════════════════════════════════════
+    "DASHBOARD": [
+        "app/Http/Controllers/DashboardController.php",
+        "app/Services/DashboardService.php",
+    ],
+}
 
-    # Migrations
-    "database/migrations/2026_09_25_093115_create_vouchers_table.php",
-    "database/migrations/2026_09_25_093109_create_lot_vouchers_table.php",
-    "database/migrations/2026_09_28_200000_add_wifi_fields_to_sessions_table.php",
-]
+def taille_lisible(o):
+    if o < 1024: return f"{o} o"
+    if o < 1048576: return f"{o/1024:.1f} Ko"
+    return f"{o/1048576:.2f} Mo"
 
-OUTPUT_FILE = "GENERATOR.txt"
-SEPARATOR = "=" * 80
+def lire(p):
+    try:
+        t = p.stat().st_size
+        if t > TAILLE_MAX_KO * 1024:
+            return False, f"[TROP VOLUMINEUX — {taille_lisible(t)}]", t
+        return True, p.read_text(encoding="utf-8"), t
+    except UnicodeDecodeError:
+        return False, "[ENCODAGE NON UTF-8]", 0
+    except Exception as e:
+        return False, f"[ERREUR : {e}]", 0
 
-# =============================================================
-# NE PAS MODIFIER EN DESSOUS SAUF SI NÉCESSAIRE
-# =============================================================
+def generer():
+    debut = datetime.now()
+    print("=" * 60)
+    print("  GÉNÉRATION GENERATOR.txt — Cyber Manager")
+    print("=" * 60)
 
-def main():
-    base_dir = Path(__file__).resolve().parent
-    output_path = base_dir / OUTPUT_FILE
+    stats = {"total": 0, "trouves": 0, "manquants": 0, "erreurs": 0, "octets": 0}
+    manquants, erreurs, lignes = [], [], []
 
-    total_found = 0
-    total_missing = 0
-    total_lines = 0
+    lignes.append("╔" + "═" * 76 + "╗")
+    lignes.append("║" + " CYBER MANAGER — GENERATOR.txt ".center(76) + "║")
+    lignes.append("║" + f" Généré le {debut.strftime('%d/%m/%Y à %H:%M:%S')} ".center(76) + "║")
+    lignes.append("╚" + "═" * 76 + "╝")
 
-    with open(output_path, "w", encoding="utf-8") as out:
-        # En-tête
-        out.write(SEPARATOR + "\n")
-        out.write("GENERATOR — Contenu des fichiers du projet Cyber Manager\n")
-        out.write(SEPARATOR + "\n\n")
-        out.write(f"Projet : {base_dir}\n")
-        out.write(f"Nombre de fichiers demandés : {len(FILES)}\n\n")
-        out.write("Ce document contient le code source actuel des fichiers\n")
-        out.write("concernés par l'étape en cours. Il doit être envoyé à Claude\n")
-        out.write("en complément du prompt d'étape.\n\n")
+    for titre, fichiers in SECTIONS.items():
+        lignes.append("\n\n" + "═" * 78)
+        lignes.append(f"  {titre}")
+        lignes.append("═" * 78 + "\n")
 
-        # Sommaire
-        out.write(SEPARATOR + "\n")
-        out.write("SOMMAIRE\n")
-        out.write(SEPARATOR + "\n\n")
-        for i, rel in enumerate(FILES, 1):
-            marker = ""
-            full = base_dir / rel
-            if not full.exists():
-                marker = "  [MANQUANT]"
-            out.write(f"  {i:3d}. {rel}{marker}\n")
-        out.write("\n")
+        for rel in fichiers:
+            abs_p = RACINE / rel
+            stats["total"] += 1
+            lignes.append("\n" + "─" * 78)
+            lignes.append(f"📄  {rel}")
+            lignes.append("─" * 78 + "\n")
 
-        # Contenu
-        for rel in FILES:
-            full_path = base_dir / rel
-            out.write(SEPARATOR + "\n")
-            out.write(f"FICHIER : {rel}\n")
-            out.write(SEPARATOR + "\n\n")
-
-            if not full_path.exists():
-                out.write("[FICHIER INTROUVABLE — ignoré]\n\n")
-                total_missing += 1
+            if not abs_p.exists():
+                stats["manquants"] += 1
+                manquants.append(rel)
+                lignes.append(f"[FICHIER MANQUANT — {abs_p}]\n")
                 continue
 
-            try:
-                with open(full_path, "r", encoding="utf-8") as f:
-                    content = f.read()
-                out.write(content)
-                if not content.endswith("\n"):
-                    out.write("\n")
-                total_found += 1
-                total_lines += content.count("\n") + 1
-            except UnicodeDecodeError:
-                # Fallback : lire en latin-1 (rare sur du code, mais au cas où)
-                try:
-                    with open(full_path, "r", encoding="latin-1") as f:
-                        content = f.read()
-                    out.write(content)
-                    if not content.endswith("\n"):
-                        out.write("\n")
-                    total_found += 1
-                    total_lines += content.count("\n") + 1
-                except Exception as e:
-                    out.write(f"[ERREUR DE LECTURE : {e}]\n\n")
-                    total_missing += 1
-            except Exception as e:
-                out.write(f"[ERREUR DE LECTURE : {e}]\n\n")
-                total_missing += 1
+            ok, contenu, taille = lire(abs_p)
+            lignes.append(f"# Taille : {taille_lisible(taille)}  |  Statut : {'OK' if ok else 'ERREUR'}\n")
+            lignes.append(contenu + "\n")
 
-            out.write("\n\n")
+            if ok:
+                stats["trouves"] += 1
+                stats["octets"] += taille
+            else:
+                stats["erreurs"] += 1
+                erreurs.append((rel, contenu))
 
-    # Résumé terminal
-    print()
-    print("=" * 60)
-    print(f"  GENERATOR.txt généré : {output_path}")
-    print(f"  Fichiers trouvés    : {total_found}")
-    print(f"  Fichiers manquants  : {total_missing}")
-    print(f"  Lignes totales      : {total_lines}")
-    print(f"  Taille              : {output_path.stat().st_size / 1024:.1f} Ko")
-    print("=" * 60)
-    print()
+    fin = datetime.now()
+    duree = (fin - debut).total_seconds()
 
-    if total_missing > 0:
-        print(f"  ATTENTION : {total_missing} fichier(s) manquant(s).")
-        print("  Vérifie les chemins dans la liste FILES.")
+    lignes.append("\n\n" + "═" * 78)
+    lignes.append("  RÉCAPITULATIF")
+    lignes.append("═" * 78)
+    lignes.append(f"  Total demandés   : {stats['total']}")
+    lignes.append(f"  Trouvés et inclus: {stats['trouves']}")
+    lignes.append(f"  Manquants        : {stats['manquants']}")
+    lignes.append(f"  En erreur        : {stats['erreurs']}")
+    lignes.append(f"  Poids code       : {taille_lisible(stats['octets'])}")
+    lignes.append(f"  Durée génération : {duree:.2f} s")
+    lignes.append("═" * 78)
+
+    if manquants:
+        lignes.append("\n  ⚠ FICHIERS MANQUANTS :")
+        for m in manquants:
+            lignes.append(f"    - {m}")
+    if erreurs:
+        lignes.append("\n  ⚠ FICHIERS EN ERREUR :")
+        for c, e in erreurs:
+            lignes.append(f"    - {c} : {e}")
+
+    lignes.append("\n  Fin du GENERATOR.txt.\n")
+
+    try:
+        FICHIER_SORTIE.write_text("\n".join(lignes), encoding="utf-8")
+    except Exception as e:
+        print(f"\n❌ Impossible d'écrire {FICHIER_SORTIE} : {e}")
+        sys.exit(1)
+
+    print(f"\n✅ GENERATOR.txt généré.")
+    print(f"   {FICHIER_SORTIE}")
+    print(f"   Poids     : {taille_lisible(FICHIER_SORTIE.stat().st_size)}")
+    print(f"   Contenu   : {stats['trouves']} inclus, "
+          f"{stats['manquants']} manquants, {stats['erreurs']} erreurs")
+    print(f"   Durée     : {duree:.2f} s\n")
+
+    if manquants:
+        print("   Fichiers manquants :")
+        for m in manquants:
+            print(f"     - {m}")
         print()
 
-
 if __name__ == "__main__":
-    main()
+    generer()

@@ -69,8 +69,9 @@
         ['route' => 'sessions.index', 'motif' => 'sessions.*',  'label' => 'Sessions',  'icone' => 'clock'],
         ['route' => 'wifi.index',     'motif' => 'wifi.*',      'label' => 'Wi-Fi',     'icone' => 'wifi'],
         ['route' => 'hotspot.index',  'motif' => 'hotspot.*',   'label' => 'HotSpot',   'icone' => 'key'],
+        ['route' => 'tarifs.index',   'motif' => 'tarifs.*',    'label' => 'Tarifs',    'icone' => 'tag'],
     ];
-    $bientot = [['Tarifs', 'tag'], ['Historique', 'archive'], ['Statistiques', 'chart']];
+    $bientot = [['Historique', 'archive'], ['Statistiques', 'chart']];
 @endphp
 
 <body x-data="cmSidebar()" class="min-h-screen bg-slate-50 text-slate-900 antialiased">
