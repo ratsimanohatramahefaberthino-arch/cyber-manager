@@ -30,7 +30,7 @@ class Session extends Model
         'pause_at', 'duree_pause_secondes',
         'alarme_active', 'alarme_type', 'alarme_duree_minutes', 'alarme_montant',
         'alarme_fin_prevue', 'alarme_declenchee_at', 'alarme_message',
-        'alarme_historique',
+        'alarme_historique', 'alarme_secondes_restantes',
     ];
 
     protected $casts = [
@@ -51,6 +51,7 @@ class Session extends Model
         'alarme_duree_minutes' => 'integer',
         'alarme_montant' => 'integer',
         'alarme_historique' => 'array',
+        'alarme_secondes_restantes' => 'integer',
     ];
 
     // -----------------------------------------------------------------

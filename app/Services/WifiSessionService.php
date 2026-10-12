@@ -140,6 +140,12 @@ class WifiSessionService
             $session->etat_wifi     = Session::WIFI_CONNECTE;
             $session->reconnecte_at = now();
             $session->deconnecte_at = null;
+
+            // NOUVEAU : Reprendre l'alarme si elle était en pause
+            if ($session->alarme_active && $session->alarme_secondes_restantes > 0) {
+                $session->alarme_fin_prevue = now()->addSeconds($session->alarme_secondes_restantes);
+                $session->alarme_secondes_restantes = null;
+            }
         }
 
         $session->client_ip        = $active['address']     ?? $session->client_ip;
@@ -165,7 +171,7 @@ class WifiSessionService
         $session->save();
     }
 
-    private function marquerSessionsDisparues(array $actives): int
+        private function marquerSessionsDisparues(array $actives): int
     {
         $idsActifs = array_filter(array_map(fn($a) => $a['.id'] ?? null, $actives));
 
@@ -181,6 +187,16 @@ class WifiSessionService
             $s->deconnecte_at = now();
             $s->derniere_sync_at = now();
             $s->duree_consommee = (int) floor($s->secondesConsommees() / 60);
+
+            // NOUVEAU : Mettre l'alarme en pause
+            if ($s->alarme_active && $s->alarme_fin_prevue) {
+                $restant = $s->alarme_fin_prevue->getTimestamp() - now()->getTimestamp();
+                if ($restant > 0) {
+                    $s->alarme_secondes_restantes = $restant;
+                    $s->alarme_fin_prevue = null; // Empêche le déclenchement hors ligne
+                }
+            }
+
             $s->save();
             $n++;
         }

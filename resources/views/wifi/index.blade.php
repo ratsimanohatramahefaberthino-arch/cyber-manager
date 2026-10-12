@@ -280,7 +280,17 @@
                                 </template>
                                 <template x-if="l.alarme.active && !l.alarme.declenchee">
                                     <div class="space-y-1">
-                                        <div class="font-mono text-sm font-bold text-amber-700" x-text="chronoRestantTexte(l)"></div>
+                                        <!-- Si connecté, on affiche le chrono -->
+                                        <template x-if="l.etat_appareil === 'connecte'">
+                                            <div class="font-mono text-sm font-bold text-amber-700" x-text="chronoRestantTexte(l)"></div>
+                                        </template>
+                                        <!-- Si déconnecté, on affiche que l'alarme est en pause -->
+                                        <template x-if="l.etat_appareil !== 'connecte'">
+                                            <div class="text-xs font-bold text-slate-500 flex items-center justify-center gap-1">
+                                                <x-icone nom="pause" class="h-3 w-3" /> Alarme en pause
+                                            </div>
+                                        </template>
+                                        
                                         <div class="h-1 w-full overflow-hidden rounded-full bg-slate-200">
                                             <div class="h-full bg-amber-500 transition-all"
                                                  :style="'width: ' + progressionAlarme(l) + '%'"></div>
@@ -975,7 +985,7 @@ function wifiPage(cfg) {
                 const fin = new Date(l.alarme.fin).getTime();
                 const dejaDansListe = this.fenetresAlarme.find(f => f.id === l.id);
 
-                if (this.now >= fin && !dejaDansListe && !this._alarmesFermees.has(l.id)) {
+                if (this.now >= fin && !dejaDansListe && !this._alarmesFermees.has(l.id) && l.etat_appareil === 'connecte') {
                     this.ouvrirFenetreAlarme(l);
                 }
                 if (this.now < fin && dejaDansListe) {
@@ -1789,7 +1799,7 @@ function wifiPage(cfg) {
         },
 
         chronoRestantTexte(l) {
-            if (!l.alarme.fin) return '00:00';
+            if (!l.alarme.fin) return 'En pause'; // Si pas de date de fin, c'est en pause
             const fin = new Date(l.alarme.fin).getTime();
             const sec = Math.max(0, Math.floor((fin - this.now) / 1000));
             return this.formatDureeSec(sec);

@@ -1,6 +1,6 @@
 ╔════════════════════════════════════════════════════════════════════════════╗
 ║                CYBER MANAGER — GENERATOR.txt (module Wi-Fi)                ║
-║                      Généré le 12/10/2026 à 12:04:14                       ║
+║                      Généré le 12/10/2026 à 14:54:43                       ║
 ╚════════════════════════════════════════════════════════════════════════════╝
 
 
@@ -13,7 +13,7 @@
 📄  app/Http/Controllers/WifiController.php
 ──────────────────────────────────────────────────────────────────────────────
 
-# Taille : 24.2 Ko  |  Statut : OK
+# Taille : 23.6 Ko  |  Statut : OK
 
 <?php
 
@@ -852,7 +852,7 @@ class WifiAlarmController extends Controller
 📄  app/Services/WifiSessionService.php
 ──────────────────────────────────────────────────────────────────────────────
 
-# Taille : 10.4 Ko  |  Statut : OK
+# Taille : 10.1 Ko  |  Statut : OK
 
 <?php
 
@@ -1903,7 +1903,7 @@ class MikrotikConnection
 📄  resources/views/wifi/index.blade.php
 ──────────────────────────────────────────────────────────────────────────────
 
-# Taille : 106.3 Ko  |  Statut : OK
+# Taille : 104.5 Ko  |  Statut : OK
 
 @extends('layouts.cyber-manager', ['title' => 'Wi-Fi — Cyber Manager'])
 
@@ -7245,8 +7245,8 @@ return new class extends Migration
   Trouvés et inclus: 37
   Manquants        : 0
   En erreur        : 0
-  Poids code       : 292.2 Ko
-  Durée génération : 24.32 s
+  Poids code       : 289.4 Ko
+  Durée génération : 2.11 s
 ══════════════════════════════════════════════════════════════════════════════
 
   Fin du GENERATOR.txt.
