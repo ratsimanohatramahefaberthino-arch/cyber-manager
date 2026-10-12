@@ -1,5 +1,17 @@
 # -*- coding: utf-8 -*-
-"""projet_generator.py — Cyber Manager : génère GENERATOR.txt"""
+"""
+projet_generator.py — Cyber Manager
+-----------------------------------
+Génère un GENERATOR.txt contenant le code complet des fichiers
+nécessaires pour travailler sur le module Wi-Fi (et ses dépendances
+directes : HotSpot, Tarifs, Session, AppareilWifi, MikroTik).
+
+Utilisation (depuis E:\\xampp\\htdocs\\cyber-manager) :
+    py projet_generator.py
+
+Produit :
+    GENERATOR.txt  (à la racine du projet)
+"""
 
 import os
 import sys
@@ -8,55 +20,81 @@ from pathlib import Path
 
 RACINE = Path(__file__).resolve().parent
 FICHIER_SORTIE = RACINE / "GENERATOR.txt"
-TAILLE_MAX_KO = 500
+TAILLE_MAX_KO = 500  # ignore les fichiers plus gros (protection)
 
 SECTIONS = {
 
     # ═══════════════════════════════════════════════════════════════
-    # 1. WI-FI — le cœur du travail actuel
+    # 1. WI-FI — Contrôleurs (le cœur)
     # ═══════════════════════════════════════════════════════════════
-    "WIFI - Controller et vues": [
+    "WI-FI — Contrôleurs": [
         "app/Http/Controllers/WifiController.php",
+        "app/Http/Controllers/WifiAlarmController.php",
+    ],
+
+    # ═══════════════════════════════════════════════════════════════
+    # 2. WI-FI — Services
+    # ═══════════════════════════════════════════════════════════════
+    "WI-FI — Services": [
+        "app/Services/WifiSessionService.php",
+        "app/Services/WifiMontantService.php",
+        "app/Services/MikroTikService.php",
+        "app/Services/MikroTik/MikrotikConnection.php",
+    ],
+
+    # ═══════════════════════════════════════════════════════════════
+    # 3. WI-FI — Vues
+    # ═══════════════════════════════════════════════════════════════
+    "WI-FI — Vues": [
         "resources/views/wifi/index.blade.php",
         "resources/views/wifi/comptes.blade.php",
     ],
 
     # ═══════════════════════════════════════════════════════════════
-    # 2. WI-FI — Services et modèles liés
+    # 4. MODÈLES
     # ═══════════════════════════════════════════════════════════════
-    "WIFI - Services et modèles": [
-        "app/Services/WifiSessionService.php",
-        "app/Services/MikroTikService.php",
-        "app/Services/SessionService.php",
+    "MODÈLES": [
         "app/Models/Session.php",
         "app/Models/AppareilWifi.php",
         "app/Models/Voucher.php",
+        "app/Models/Tarif.php",
+        "app/Models/TarifRaccourci.php",
+        "app/Models/Parametre.php",
         "app/Models/LotVoucher.php",
     ],
 
     # ═══════════════════════════════════════════════════════════════
-    # 3. COMMANDES ARTISAN (pour comprendre la sync)
+    # 5. HOTSPOT (lié au Wi-Fi via les vouchers)
     # ═══════════════════════════════════════════════════════════════
-    "COMMANDES": [
-        "app/Console/Commands/WifiSyncSessionsCommand.php",
-        "app/Console/Commands/ExpireSessions.php",
+    "HOTSPOT — Contrôleur et service": [
+        "app/Http/Controllers/HotspotController.php",
+        "app/Services/VoucherService.php",
+        "app/Services/VoucherReplenishmentService.php",
     ],
 
     # ═══════════════════════════════════════════════════════════════
-    # 4. TARIFS (pour le calcul du montant dû Wi-Fi)
+    # 6. TARIFS (utilisés par le Wi-Fi)
     # ═══════════════════════════════════════════════════════════════
-    "TARIFS": [
-        "app/Models/Tarif.php",
-        "app/Models/TarifRaccourci.php",
+    "TARIFS — Service et contrôleur": [
         "app/Services/TarifService.php",
         "app/Http/Controllers/TarifController.php",
     ],
 
     # ═══════════════════════════════════════════════════════════════
-    # 5. LAYOUT + COMPOSANTS
+    # 7. COMMANDES (pour la sync Wi-Fi)
     # ═══════════════════════════════════════════════════════════════
-    "LAYOUT et COMPOSANTS": [
+    "COMMANDES ARTISAN": [
+        "app/Console/Commands/WifiSyncSessionsCommand.php",
+        "app/Console/Commands/VouchersReapprovisionnerCommand.php",
+        "app/Console/Commands/ExpireSessions.php",
+    ],
+
+    # ═══════════════════════════════════════════════════════════════
+    # 8. LAYOUT + COMPOSANTS BLADE
+    # ═══════════════════════════════════════════════════════════════
+    "LAYOUT et COMPOSANTS BLADE": [
         "resources/views/layouts/cyber-manager.blade.php",
+        "resources/views/components/confirmation.blade.php",
         "resources/views/components/kpi-card.blade.php",
         "resources/views/components/badge.blade.php",
         "resources/views/components/icone.blade.php",
@@ -64,7 +102,7 @@ SECTIONS = {
     ],
 
     # ═══════════════════════════════════════════════════════════════
-    # 6. ROUTES ET CONFIG
+    # 9. ROUTES ET CONFIG
     # ═══════════════════════════════════════════════════════════════
     "ROUTES et CONFIG": [
         "routes/web.php",
@@ -73,18 +111,23 @@ SECTIONS = {
     ],
 
     # ═══════════════════════════════════════════════════════════════
-    # 7. DASHBOARD (pour cohérence des stats)
+    # 10. MIGRATIONS RÉCENTES (Wi-Fi, Tarifs, Pauses, Alarme)
     # ═══════════════════════════════════════════════════════════════
-    "DASHBOARD": [
-        "app/Http/Controllers/DashboardController.php",
-        "app/Services/DashboardService.php",
+    "MIGRATIONS RÉCENTES": [
+        "database/migrations/2026_10_07_100000_extend_tarifs_for_rules.php",
+        "database/migrations/2026_10_07_100100_create_tarif_raccourcis_table.php",
+        "database/migrations/2026_10_08_100000_add_wifi_tracking_to_cyber_sessions.php",
+        "database/migrations/2026_10_09_100000_add_pause_state_to_cyber_sessions.php",
+        "database/migrations/2026_10_09_110000_add_alarme_historique_to_cyber_sessions.php",
     ],
 }
+
 
 def taille_lisible(o):
     if o < 1024: return f"{o} o"
     if o < 1048576: return f"{o/1024:.1f} Ko"
     return f"{o/1048576:.2f} Mo"
+
 
 def lire(p):
     try:
@@ -97,17 +140,18 @@ def lire(p):
     except Exception as e:
         return False, f"[ERREUR : {e}]", 0
 
+
 def generer():
     debut = datetime.now()
     print("=" * 60)
-    print("  GÉNÉRATION GENERATOR.txt — Cyber Manager")
+    print("  GÉNÉRATION GENERATOR.txt — Cyber Manager (Wi-Fi)")
     print("=" * 60)
 
     stats = {"total": 0, "trouves": 0, "manquants": 0, "erreurs": 0, "octets": 0}
     manquants, erreurs, lignes = [], [], []
 
     lignes.append("╔" + "═" * 76 + "╗")
-    lignes.append("║" + " CYBER MANAGER — GENERATOR.txt ".center(76) + "║")
+    lignes.append("║" + " CYBER MANAGER — GENERATOR.txt (module Wi-Fi) ".center(76) + "║")
     lignes.append("║" + f" Généré le {debut.strftime('%d/%m/%Y à %H:%M:%S')} ".center(76) + "║")
     lignes.append("╚" + "═" * 76 + "╝")
 
@@ -179,10 +223,11 @@ def generer():
     print(f"   Durée     : {duree:.2f} s\n")
 
     if manquants:
-        print("   Fichiers manquants :")
+        print("   Fichiers manquants (à ignorer ou créer plus tard) :")
         for m in manquants:
             print(f"     - {m}")
         print()
+
 
 if __name__ == "__main__":
     generer()

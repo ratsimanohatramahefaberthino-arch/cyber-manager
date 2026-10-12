@@ -7,47 +7,26 @@ use App\Models\Session;
 use App\Models\Voucher;
 use Illuminate\Support\Facades\Log;
 
-/**
- * Synchronise les sessions HotSpot actives du MikroTik avec la base.
- *
- * Ne modifie JAMAIS le MikroTik. Lecture seule côté réseau.
- * Le MikroTik reste l'autorité pour savoir "qui est connecté".
- *
- * Cycle de vie d'un voucher piloté ici :
- *  - session ouverte  : disponible/utilise → en_cours
- *  - session fermée   : temporaire → utilise (ou expire si temps épuisé)
- *                       permanent  → disponible (réutilisable)
- */
 class WifiSessionService
 {
-    /** @var array<string, array<string,string>>|null  MAC => bail DHCP (cache par sync) */
     private ?array $baux = null;
-
-    /** @var array<string, array<string,string>>|null  MAC => host HotSpot (cache par sync) */
     private ?array $hotes = null;
+    private ?array $regTable = null;
+    private ?array $wireless = null;
 
-    public function __construct(
-        private MikroTikService $mikroTik,
-    ) {
-    }
+    public function __construct(private MikroTikService $mikroTik) {}
 
-    /**
-     * Point d'entrée principal.
-     *
-     * @return array{ouvertes:int, maj:int, fermees:int, erreur:?string}
-     */
     public function synchroniser(): array
     {
-        // Les caches ne vivent que le temps d'une synchronisation
-        $this->baux  = null;
-        $this->hotes = null;
+        $this->baux     = null;
+        $this->hotes    = null;
+        $this->regTable = null;
+        $this->wireless = null;
 
         try {
             $actives = $this->mikroTik->listHotspotActive();
         } catch (\Throwable $e) {
-            Log::warning('Sync sessions Wi-Fi : MikroTik injoignable', [
-                'error' => $e->getMessage(),
-            ]);
+            Log::warning('Sync Wi-Fi : MikroTik injoignable', ['error' => $e->getMessage()]);
             return ['ouvertes' => 0, 'maj' => 0, 'fermees' => 0, 'erreur' => $e->getMessage()];
         }
 
@@ -56,54 +35,36 @@ class WifiSessionService
 
         foreach ($actives as $active) {
             try {
-                $result = $this->traiterActive($active);
+                $r = $this->traiterActive($active);
+                if ($r === 'ouverte') $ouvertes++;
+                elseif ($r === 'maj') $maj++;
             } catch (\Throwable $e) {
-                // Une entrée défectueuse ne doit pas bloquer les autres
-                Log::warning('Sync sessions Wi-Fi : entrée ignorée', [
+                Log::warning('Sync Wi-Fi : entrée ignorée', [
                     'active_id' => $active['.id'] ?? null,
-                    'user'      => $active['user'] ?? null,
                     'error'     => $e->getMessage(),
                 ]);
-                continue;
-            }
-
-            if ($result === 'ouverte') {
-                $ouvertes++;
-            } elseif ($result === 'maj') {
-                $maj++;
             }
         }
 
-        // Fermer les sessions Wi-Fi qui ne sont plus actives côté MikroTik
-        $fermees = $this->fermerSessionsDisparues($actives);
+        $fermees = $this->marquerSessionsDisparues($actives);
 
-        return [
-            'ouvertes' => $ouvertes,
-            'maj'      => $maj,
-            'fermees'  => $fermees,
-            'erreur'   => null,
-        ];
+        return ['ouvertes' => $ouvertes, 'maj' => $maj, 'fermees' => $fermees, 'erreur' => null];
     }
 
-    /**
-     * Traite une session active MikroTik :
-     *  - déjà en base (par mikrotik_active_id) → mise à jour
-     *  - sinon → création
-     *
-     * @return 'ouverte'|'maj'|null
-     */
     private function traiterActive(array $active): ?string
     {
         $activeId = $active['.id'] ?? null;
-        if ($activeId === null) {
-            return null;
-        }
+        if (!$activeId) return null;
 
         $session = Session::where('mikrotik_active_id', $activeId)
-            ->where('etat', 'en_cours')
+            ->whereIn('etat_wifi', [
+                Session::WIFI_CONNECTE,
+                Session::WIFI_DECONNECTE,
+                Session::WIFI_EN_PAUSE,
+            ])
             ->first();
 
-        if ($session !== null) {
+        if ($session) {
             $this->mettreAJour($session, $active);
             return 'maj';
         }
@@ -115,35 +76,25 @@ class WifiSessionService
     private function creer(array $active): Session
     {
         $username = $active['user'] ?? null;
-        $voucher  = $username
-            ? Voucher::where('username', $username)->first()
-            : null;
+        $voucher  = $username ? Voucher::where('username', $username)->first() : null;
 
         $appareil = $this->resoudreAppareil($active);
         $ssid     = $this->resoudreSsid($active);
 
         $uptimeSecondes = $this->parseUptime($active['uptime'] ?? '0s');
-        $uptimeMinutes  = (int) floor($uptimeSecondes / 60);
-
-        // Si on a un voucher, on prend ses valeurs ; sinon, valeurs neutres
-        // (durée 0 = illimité, cas des vouchers permanents)
-        $dureeTotale  = $voucher?->duree    ?? 0;
-        $montantTotal = $voucher?->montant  ?? 0;
-
         $debut = now()->subSeconds($uptimeSecondes);
-        $finPrevue = $dureeTotale > 0
-            ? $debut->copy()->addMinutes($dureeTotale)
-            : null;
+
+        $montantTotal = $voucher?->montant ?? 0;
 
         $session = Session::create(array_merge([
             'poste_id'              => null,
             'voucher_id'            => $voucher?->id,
             'type_session'          => 'wifi',
             'date_heure_debut'      => $debut,
-            'date_heure_fin_prevue' => $finPrevue,
-            'duree_prevue'          => $dureeTotale,
-            'duree_consommee'       => $uptimeMinutes,
-            'temps_restant'         => max(0, $dureeTotale - $uptimeMinutes),
+            'date_heure_fin_prevue' => null,
+            'duree_prevue'          => 0,
+            'duree_consommee'       => 0,
+            'temps_restant'         => 0,
             'duree_suspension'      => 0,
             'montant_initial'       => $montantTotal,
             'montant_recharge'      => 0,
@@ -152,6 +103,7 @@ class WifiSessionService
             'montant_restant'       => $montantTotal,
             'montant_a_reverser'    => 0,
             'etat'                  => 'en_cours',
+            'etat_wifi'             => Session::WIFI_CONNECTE,
             'mikrotik_active_id'    => $active['.id'] ?? null,
             'hotspot_username'      => $username,
             'client_mac'            => $active['mac-address'] ?? null,
@@ -161,150 +113,141 @@ class WifiSessionService
             'derniere_sync_at'      => now(),
         ], $this->calculerVolumes($active)));
 
-        $this->marquerVoucherEnCours($voucher, $appareil);
+        // ⚡ FIX CLÉ : marquer le voucher comme "en cours" pour qu'il
+        // disparaisse IMMÉDIATEMENT de la liste des identifiants disponibles.
+        if ($voucher) {
+            try {
+                $voucher->marquerEnCours($appareil);
+            } catch (\Throwable $e) {
+                Log::warning('Impossible de marquer le voucher en cours', [
+                    'voucher_id' => $voucher->id,
+                    'error'      => $e->getMessage(),
+                ]);
+            }
+        }
 
         return $session;
     }
 
     private function mettreAJour(Session $session, array $active): void
     {
-        $uptimeSecondes = $this->parseUptime($active['uptime'] ?? '0s');
-        $uptimeMinutes  = (int) floor($uptimeSecondes / 60);
+        if ($session->etat_wifi === Session::WIFI_DECONNECTE) {
+            $dureeHorsLigne = $session->deconnecte_at
+                ? $session->deconnecte_at->diffInSeconds(now())
+                : 0;
 
-        $dureePrevue  = (int) $session->duree_prevue;
-        $tempsRestant = max(0, $dureePrevue - $uptimeMinutes);
-
-        $appareil = $this->resoudreAppareil($active);
-
-        $donnees = [
-            'duree_consommee'  => $uptimeMinutes,
-            'temps_restant'    => $tempsRestant,
-            'client_ip'        => $active['address']     ?? $session->client_ip,
-            'client_mac'       => $active['mac-address'] ?? $session->client_mac,
-            'derniere_sync_at' => now(),
-        ];
-
-        if ($appareil !== null) {
-            $donnees['appareil_wifi_id'] = $appareil->id;
+            $session->duree_hors_ligne_secondes = (int) $session->duree_hors_ligne_secondes + $dureeHorsLigne;
+            $session->etat_wifi     = Session::WIFI_CONNECTE;
+            $session->reconnecte_at = now();
+            $session->deconnecte_at = null;
         }
 
-        // Le SSID n'est résolu qu'une fois (évite des appels inutiles)
+        $session->client_ip        = $active['address']     ?? $session->client_ip;
+        $session->client_mac       = $active['mac-address'] ?? $session->client_mac;
+        $session->derniere_sync_at = now();
+
+        if ($app = $this->resoudreAppareil($active)) {
+            $session->appareil_wifi_id = $app->id;
+        }
+
         if (empty($session->ssid)) {
-            $ssid = $this->resoudreSsid($active);
-            if ($ssid !== null) {
-                $donnees['ssid'] = $ssid;
-            }
+            $session->ssid = $this->resoudreSsid($active);
         }
 
-        $session->update(array_merge($donnees, $this->calculerVolumes($active)));
+        if ($session->etat_wifi === Session::WIFI_CONNECTE) {
+            $vol = $this->calculerVolumes($active);
+            $session->volume_entree = $vol['volume_entree'];
+            $session->volume_sortie = $vol['volume_sortie'];
+            $session->volume_total  = $vol['volume_total'];
+            $session->duree_consommee = (int) floor($session->secondesConsommees() / 60);
+        }
 
-        // Auto-réparation : voucher d'une session déjà ouverte avant cette étape
-        $this->marquerVoucherEnCours($session->voucher, $appareil);
+        $session->save();
     }
 
-    /**
-     * Ferme les sessions Wi-Fi en_cours dont le .id n'apparaît plus
-     * dans la liste active du MikroTik (déconnexion ou expiration).
-     */
-    private function fermerSessionsDisparues(array $actives): int
+    private function marquerSessionsDisparues(array $actives): int
     {
-        $idsActifs = array_filter(array_map(
-            fn($a) => $a['.id'] ?? null,
-            $actives
-        ));
+        $idsActifs = array_filter(array_map(fn($a) => $a['.id'] ?? null, $actives));
 
         $sessions = Session::where('type_session', 'wifi')
-            ->where('etat', 'en_cours')
+            ->where('etat_wifi', Session::WIFI_CONNECTE)
             ->whereNotNull('mikrotik_active_id')
             ->whereNotIn('mikrotik_active_id', $idsActifs)
             ->get();
 
-        $compteur = 0;
-
-        foreach ($sessions as $session) {
-            // Durée 0 = illimité (permanent, ou compte sans voucher) : jamais "expirée"
-            $illimitee = (int) $session->duree_prevue <= 0;
-            $expiree   = !$illimitee && (int) $session->temps_restant <= 0;
-
-            $session->update([
-                'date_heure_fin_reelle' => now(),
-                'etat'                  => $expiree ? 'expiree' : 'terminee',
-                'motif_fin'             => $expiree ? 'expiration' : 'deconnexion_client',
-                'derniere_sync_at'      => now(),
-            ]);
-
-            $this->relacherVoucher($session, $expiree);
-
-            $compteur++;
+        $n = 0;
+        foreach ($sessions as $s) {
+            $s->etat_wifi     = Session::WIFI_DECONNECTE;
+            $s->deconnecte_at = now();
+            $s->derniere_sync_at = now();
+            $s->duree_consommee = (int) floor($s->secondesConsommees() / 60);
+            $s->save();
+            $n++;
         }
 
-        return $compteur;
+        return $n;
     }
 
-    // -----------------------------------------------------------------
-    // Vouchers
-    // -----------------------------------------------------------------
-
-       // -----------------------------------------------------------------
-    // Vouchers — la machine à états vit dans App\Models\Voucher
-    // -----------------------------------------------------------------
-
-    /**
-     * Ouverture / poursuite d'une session : le voucher passe à "en_cours"
-     * et l'appareil lui est rattaché (règles détaillées dans Voucher).
-     * Sans effet si le voucher est désactivé, expiré ou annulé.
-     */
-    private function marquerVoucherEnCours(?Voucher $voucher, ?AppareilWifi $appareil): void
-    {
-        $voucher?->marquerEnCours($appareil);
-    }
-
-    /**
-     * Fermeture d'une session :
-     *  - réutilisable  → disponible
-     *  - usage unique → utilise
-     * Un identifiant désormais supprimé ou déjà changé d'état n'est pas touché.
-     */
-    private function relacherVoucher(Session $session, bool $expiree): void
-    {
-        if (!$session->voucher_id) {
-            return;
-        }
-
-        $voucher = Voucher::find($session->voucher_id);
-
-        if ($voucher === null || $voucher->etat !== 'en_cours') {
-            return;
-        }
-
-        // Un autre appareil utilise encore ce même identifiant réutilisable
-        $autreSession = Session::where('voucher_id', $voucher->id)
-            ->where('etat', 'en_cours')
-            ->where('id', '!=', $session->id)
-            ->exists();
-
-        if ($autreSession) {
-            return;
-        }
-
-        $voucher->estReutilisable() ? $voucher->marquerDisponible() : $voucher->marquerUtilise();
-    }
-
-    // -----------------------------------------------------------------
-    // Appareil, SSID, volumes
-    // -----------------------------------------------------------------
-
-    /**
-     * Cherche ou crée l'appareil Wi-Fi à partir de la MAC du client
-     * et met à jour sa dernière connexion.
-     */
-    private function resoudreAppareil(array $active): ?AppareilWifi
+    private function resoudreSsid(array $active): ?string
     {
         $mac = AppareilWifi::normaliserMac($active['mac-address'] ?? null);
 
-        if ($mac === null) {
-            return null;
+        if ($mac) {
+            $reg = $this->registrationPourMac($mac);
+            $iface = $reg['interface'] ?? null;
+
+            if ($iface) {
+                $wifi = $this->wirelessPourInterface($iface);
+                if (!empty($wifi['ssid'])) {
+                    return mb_substr($wifi['ssid'], 0, 64);
+                }
+            }
         }
+
+        $serveur = $active['server'] ?? null;
+        if ($serveur) {
+            $table = config('mikrotik.ssid_map', []);
+            if (isset($table[$serveur])) {
+                return mb_substr($table[$serveur], 0, 64);
+            }
+        }
+
+        $defaut = config('mikrotik.ssid_default');
+        return $defaut ? mb_substr($defaut, 0, 64) : null;
+    }
+
+    private function registrationPourMac(string $mac): array
+    {
+        if ($this->regTable === null) {
+            $this->regTable = [];
+            try {
+                foreach ($this->mikroTik->listWirelessRegistrationTable() as $r) {
+                    $m = AppareilWifi::normaliserMac($r['mac-address'] ?? null);
+                    if ($m) $this->regTable[$m] = $r;
+                }
+            } catch (\Throwable $e) {}
+        }
+        return $this->regTable[$mac] ?? [];
+    }
+
+    private function wirelessPourInterface(string $iface): array
+    {
+        if ($this->wireless === null) {
+            $this->wireless = [];
+            try {
+                foreach ($this->mikroTik->listWirelessInterfaces() as $w) {
+                    $name = $w['name'] ?? null;
+                    if ($name) $this->wireless[$name] = $w;
+                }
+            } catch (\Throwable $e) {}
+        }
+        return $this->wireless[$iface] ?? [];
+    }
+
+    private function resoudreAppareil(array $active): ?AppareilWifi
+    {
+        $mac = AppareilWifi::normaliserMac($active['mac-address'] ?? null);
+        if (!$mac) return null;
 
         $bail = $this->bailPourMac($mac);
 
@@ -313,7 +256,6 @@ class WifiSessionService
             'host_name'  => $bail['host-name'] ?? null,
         ]);
 
-        // À la création, les dates sont déjà posées
         if (!$appareil->wasRecentlyCreated) {
             $appareil->toucherDerniereConnexion();
         }
@@ -321,38 +263,6 @@ class WifiSessionService
         return $appareil;
     }
 
-    /**
-     * SSID = table de correspondance (config) appliquée au serveur HotSpot.
-     * Le serveur vient de active['server'] ou, à défaut, de /ip/hotspot/host.
-     */
-    private function resoudreSsid(array $active): ?string
-    {
-        $serveur = $active['server'] ?? null;
-
-        if ($serveur === null || $serveur === '') {
-            $mac     = AppareilWifi::normaliserMac($active['mac-address'] ?? null);
-            $serveur = $mac !== null ? ($this->hotePourMac($mac)['server'] ?? null) : null;
-        }
-
-        if ($serveur === null || $serveur === '') {
-            $defaut = config('mikrotik.ssid_default');
-            return ($defaut !== null && $defaut !== '') ? mb_substr($defaut, 0, 64) : null;
-        }
-
-        $table = config('mikrotik.ssid_map', []);
-
-        return mb_substr($table[$serveur] ?? $serveur, 0, 64);
-    }
-
-    /**
-     * Volumes vus DEPUIS LE CLIENT :
-     *  - volume_entree = données reçues par le client (download)
-     *                  = "bytes-out" RouterOS (le routeur les envoie au client)
-     *  - volume_sortie = données envoyées par le client (upload)
-     *                  = "bytes-in" RouterOS (le routeur les reçoit du client)
-     *
-     * @return array{volume_entree:int, volume_sortie:int, volume_total:int}
-     */
     private function calculerVolumes(array $active): array
     {
         $bytesIn  = (int) ($active['bytes-in']  ?? 0);
@@ -365,70 +275,28 @@ class WifiSessionService
         ];
     }
 
-    /**
-     * @return array<string,string>
-     */
     private function bailPourMac(string $mac): array
     {
         if ($this->baux === null) {
             $this->baux = [];
-
             try {
                 foreach ($this->mikroTik->listDhcpLeases() as $bail) {
                     $m = AppareilWifi::normaliserMac($bail['mac-address'] ?? null);
-                    if ($m !== null) {
-                        $this->baux[$m] = $bail;
-                    }
+                    if ($m) $this->baux[$m] = $bail;
                 }
-            } catch (\Throwable $e) {
-                Log::warning('Sync Wi-Fi : lecture des baux DHCP impossible', [
-                    'error' => $e->getMessage(),
-                ]);
-            }
+            } catch (\Throwable $e) {}
         }
-
         return $this->baux[$mac] ?? [];
     }
 
-    /**
-     * @return array<string,string>
-     */
-    private function hotePourMac(string $mac): array
-    {
-        if ($this->hotes === null) {
-            $this->hotes = [];
-
-            try {
-                foreach ($this->mikroTik->listHotspotHosts() as $hote) {
-                    $m = AppareilWifi::normaliserMac($hote['mac-address'] ?? null);
-                    if ($m !== null) {
-                        $this->hotes[$m] = $hote;
-                    }
-                }
-            } catch (\Throwable $e) {
-                Log::warning('Sync Wi-Fi : lecture des hosts HotSpot impossible', [
-                    'error' => $e->getMessage(),
-                ]);
-            }
-        }
-
-        return $this->hotes[$mac] ?? [];
-    }
-
-    /**
-     * Convertit un uptime RouterOS ("1w2d3h4m5s", "1h20m15s", "12s")
-     * en secondes. Les semaines ("w") existent en RouterOS 6 et 7.
-     */
     private function parseUptime(string $uptime): int
     {
-        $total = 0;
-
-        if (preg_match('/(\d+)w/', $uptime, $m)) { $total += (int)$m[1] * 604800; }
-        if (preg_match('/(\d+)d/', $uptime, $m)) { $total += (int)$m[1] * 86400; }
-        if (preg_match('/(\d+)h/', $uptime, $m)) { $total += (int)$m[1] * 3600; }
-        if (preg_match('/(\d+)m(?!s)/', $uptime, $m)) { $total += (int)$m[1] * 60; }
-        if (preg_match('/(\d+)s/', $uptime, $m)) { $total += (int)$m[1]; }
-
-        return $total;
+        $t = 0;
+        if (preg_match('/(\d+)w/', $uptime, $m)) $t += (int)$m[1] * 604800;
+        if (preg_match('/(\d+)d/', $uptime, $m)) $t += (int)$m[1] * 86400;
+        if (preg_match('/(\d+)h/', $uptime, $m)) $t += (int)$m[1] * 3600;
+        if (preg_match('/(\d+)m(?!s)/', $uptime, $m)) $t += (int)$m[1] * 60;
+        if (preg_match('/(\d+)s/', $uptime, $m)) $t += (int)$m[1];
+        return $t;
     }
 }

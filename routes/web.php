@@ -9,6 +9,7 @@ use App\Http\Controllers\SessionController;
 use App\Http\Controllers\TarifController;
 use App\Http\Controllers\WifiController;
 use App\Http\Controllers\MikroTikStatusController;
+use App\Http\Controllers\WifiAlarmController;
 
 /*
 |--------------------------------------------------------------------------
@@ -139,25 +140,36 @@ Route::middleware('auth')->group(function () {
         ->name('hotspot.pool-mode');
 
     // -----------------------------------------------------------------
-    // Wi-Fi (comptes HotSpot côté MikroTik)
+    // Wi-Fi
     // -----------------------------------------------------------------
-    Route::get('/wifi', [WifiController::class, 'index'])
-        ->name('wifi.index');
+    Route::get('/wifi', [WifiController::class, 'index'])->name('wifi.index');
+    Route::get('/wifi/etat', [WifiController::class, 'etat'])->name('wifi.etat');
 
-    Route::get('/wifi/comptes', [WifiController::class, 'comptes'])
-        ->name('wifi.comptes');
+    Route::get('/wifi/comptes', [WifiController::class, 'comptes'])->name('wifi.comptes');
+    Route::post('/wifi/sync', [WifiController::class, 'syncNow'])->name('wifi.sync');
+    Route::post('/wifi/deconnecter', [WifiController::class, 'deconnecter'])->name('wifi.deconnecter');
+    Route::post('/wifi/comptes/{username}/toggle', [WifiController::class, 'toggleCompte'])->name('wifi.comptes.toggle');
+    Route::delete('/wifi/comptes/{username}', [WifiController::class, 'supprimerCompte'])->name('wifi.comptes.supprimer');
 
-    Route::post('/wifi/sync', [WifiController::class, 'syncNow'])
-        ->name('wifi.sync');
+    // Actions Wi-Fi session
+    Route::post('/wifi/session/{session}/arreter',  [WifiController::class, 'arreter'])->name('wifi.session.arreter');
+    Route::post('/wifi/session/{session}/demarrer', [WifiController::class, 'demarrer'])->name('wifi.session.demarrer');
+    Route::delete('/wifi/session/{session}',         [WifiController::class, 'supprimer'])->name('wifi.session.supprimer');
+    Route::post('/wifi/session/supprimer-masse',     [WifiController::class, 'supprimerMasse'])->name('wifi.session.supprimer-masse');
 
-    Route::post('/wifi/deconnecter', [WifiController::class, 'deconnecter'])
-        ->name('wifi.deconnecter');
+    // Alarmes par appareil
+    Route::post('/wifi/session/{session}/alarme',            [WifiController::class, 'definirAlarme'])->name('wifi.session.alarme');
+    Route::post('/wifi/session/{session}/alarme/prolonger',  [WifiController::class, 'prolongerAlarme'])->name('wifi.session.alarme.prolonger');
+    Route::post('/wifi/session/{session}/alarme/annuler',    [WifiController::class, 'annulerAlarme'])->name('wifi.session.alarme.annuler');
+    Route::post('/wifi/session/{session}/alarme/acquitter',  [WifiController::class, 'acquitterAlarme'])->name('wifi.session.alarme.acquitter');
 
-    Route::post('/wifi/comptes/{username}/toggle', [WifiController::class, 'toggleCompte'])
-        ->name('wifi.comptes.toggle');
-
-    Route::delete('/wifi/comptes/{username}', [WifiController::class, 'supprimerCompte'])
-        ->name('wifi.comptes.supprimer');
+    // Réglages alarme
+    Route::get('/wifi/alarme',              [WifiAlarmController::class, 'index'])->name('wifi.alarme.index');
+    Route::post('/wifi/alarme/reglages',    [WifiAlarmController::class, 'reglages'])->name('wifi.alarme.reglages');
+    Route::post('/wifi/alarme/son',         [WifiAlarmController::class, 'uploader'])->name('wifi.alarme.son');
+    Route::post('/wifi/alarme/son/choisir', [WifiAlarmController::class, 'choisirSon'])->name('wifi.alarme.son.choisir');
+    Route::delete('/wifi/alarme/son',       [WifiAlarmController::class, 'supprimerSon'])->name('wifi.alarme.son.supprimer');
+    Route::post('/wifi/alarme/reinitialiser', [WifiAlarmController::class, 'reinitialiser'])->name('wifi.alarme.reinitialiser');
 });
 
 /*

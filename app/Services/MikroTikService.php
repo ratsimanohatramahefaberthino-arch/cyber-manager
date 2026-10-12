@@ -181,6 +181,23 @@ class MikroTikService
     }
 
     /**
+     * Table d'enregistrement Wi-Fi : associe une MAC à l'interface wireless
+     * (wlan1, wlan2…) qui la sert. Permet de retrouver le vrai SSID.
+     */
+    public function listWirelessRegistrationTable(): array
+    {
+        return $this->query('/interface/wireless/registration-table/print');
+    }
+
+    /**
+     * Interfaces wireless configurées (nom → SSID).
+     */
+    public function listWirelessInterfaces(): array
+    {
+        return $this->query('/interface/wireless/print');
+    }
+
+    /**
      * Crée un utilisateur HotSpot.
      *
      * @throws \RuntimeException si la commande échoue côté RouterOS
