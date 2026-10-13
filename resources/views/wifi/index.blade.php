@@ -919,7 +919,7 @@ function wifiPage(cfg) {
                 this.$refs.audio.src = this.alarme.son_url;
             }
             setInterval(() => { this.now = Date.now(); this.verifierAlarmes(); }, 1000);
-            setInterval(() => this.rafraichir(), 3000);
+            setInterval(() => this.rafraichir(), 2000);
             document.addEventListener('click', () => this.debloquerAudio(), { once: true });
             this.chargerReglages();
         },

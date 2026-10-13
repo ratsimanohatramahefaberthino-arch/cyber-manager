@@ -20,10 +20,27 @@ class WifiSessionService
     private const PREFIXE_APPAREIL    = 'wifi_appareil_rafraichi_';
     private const PREFIXE_VOLUME_BASE = 'wifi_volume_base_session_';
 
-    /** Une absence n'est confirmée qu'après ce nombre de synchros sans le client... */
-    private const ABSENCE_SYNCS_MIN = 2;
-    /** ...ET après au moins ce délai (secondes) depuis la première absence. */
-    private const ABSENCE_SECONDES_MIN = 3;
+    /**
+     * Seuils de confirmation d'une absence : 1 synchro, 0 seconde.
+     *
+     * Pourquoi si bas : la fiabilité ne vient plus de l'attente mais de la
+     * RELECTURE DE CONFIRMATION faite dans la même synchro (voir
+     * marquerSessionsDisparues() / relireEtatActuel()) : avant de déclarer un
+     * client absent, on relit /ip/hotspot/active ET la table d'enregistrement
+     * Wi-Fi ~300 ms plus tard. Il faut que les DEUX lectures concordent.
+     * Si la relecture échoue ou si la table Wi-Fi est indisponible, on ne
+     * déconnecte rien. Le délai de détection devient celui de la cadence des
+     * synchros (≈ 2 s) au lieu de 2 synchros + 3 s.
+     *
+     * (Les constantes restent là pour pouvoir durcir la règle sans toucher
+     * au code : ex. ABSENCE_SYNCS_MIN = 2 si un réseau Wi-Fi instable pose
+     * problème.)
+     */
+    private const ABSENCE_SYNCS_MIN = 1;
+    private const ABSENCE_SECONDES_MIN = 0;
+
+    /** Pause avant la relecture de confirmation (microsecondes) : 300 ms. */
+    private const RELECTURE_PAUSE_US = 300000;
 
     /** États d'une session "vivante" (par opposition à terminée). */
     private const ETATS_OUVERTS = [
@@ -567,10 +584,18 @@ class WifiSessionService
         $session->save();
     }
 
+    // -----------------------------------------------------------------
+    // Détection des départs (avec relecture de confirmation)
+    // -----------------------------------------------------------------
+
     /**
      * Sessions "connecté" dont le client n'est plus présent.
-     * Une absence doit être confirmée (plusieurs synchros + délai minimal).
-     * L'heure de déconnexion retenue est celle de la PREMIÈRE absence constatée.
+     *
+     * Pour chaque candidat, une RELECTURE de confirmation (une seule pour tous,
+     * faite seulement s'il y a au moins un candidat) vérifie que le client est
+     * toujours absent. Si la relecture est impossible (MikroTik muet), on ne
+     * déconnecte personne. L'heure de déconnexion retenue est celle de la
+     * première absence constatée.
      */
     private function marquerSessionsDisparues(array $idsPresents): int
     {
@@ -582,11 +607,31 @@ class WifiSessionService
             $query->whereNotIn('mikrotik_active_id', $idsPresents);
         }
 
+        $candidats = $query->get();
+
+        if ($candidats->isEmpty()) {
+            return 0;
+        }
+
+        // Relecture unique, partagée par tous les candidats.
+        $relecture = $this->relireEtatActuel();
+
+        if ($relecture === null) {
+            return 0; // doute : aucune fausse déconnexion
+        }
+
         $n = 0;
         $maintenant = now()->getTimestamp();
 
-        foreach ($query->get() as $s) {
+        foreach ($candidats as $s) {
             $cle = self::PREFIXE_ABSENCE . $s->id;
+
+            // La seconde lecture le revoit : fausse alerte, on oublie.
+            if ($this->sessionEncorePresente($s, $relecture)) {
+                Cache::forget($cle);
+                continue;
+            }
+
             $abs = Cache::get($cle);
 
             if (!is_array($abs)) {
@@ -623,6 +668,70 @@ class WifiSessionService
         }
 
         return $n;
+    }
+
+    /**
+     * Seconde lecture : liste active + table Wi-Fi, après une courte pause.
+     * Retourne null si la liste active est illisible (on ne conclut rien).
+     * Une table Wi-Fi illisible donne 'reg' = null : estPresent() répondra
+     * alors "présent" (comportement prudent, inchangé).
+     *
+     * @return array{actives: array, reg: ?array}|null
+     */
+    private function relireEtatActuel(): ?array
+    {
+        usleep(self::RELECTURE_PAUSE_US);
+
+        try {
+            $actives = $this->mikroTik->listHotspotActive();
+        } catch (\Throwable $e) {
+            Log::warning('Sync Wi-Fi : relecture de confirmation impossible', ['error' => $e->getMessage()]);
+            return null;
+        }
+
+        try {
+            $reg = [];
+            foreach ($this->mikroTik->listWirelessRegistrationTable() as $r) {
+                $m = AppareilWifi::normaliserMac($r['mac-address'] ?? null);
+                if ($m) {
+                    $reg[$m] = $r;
+                }
+            }
+        } catch (\Throwable $e) {
+            $reg = null;
+        }
+
+        return ['actives' => $actives, 'reg' => $reg];
+    }
+
+    /**
+     * La session est-elle toujours représentée, à la relecture, par une entrée
+     * active ET présente sur l'antenne ? Même critère que l'anti-doublons (P2).
+     */
+    private function sessionEncorePresente(Session $s, array $relecture): bool
+    {
+        $ancienneTable  = $this->regTable;
+        $this->regTable = $relecture['reg'];
+
+        try {
+            foreach ($relecture['actives'] as $a) {
+                $id = (string) ($a['.id'] ?? '');
+                if ($id === '') {
+                    continue;
+                }
+
+                $mac      = AppareilWifi::normaliserMac($a['mac-address'] ?? null);
+                $username = (($a['user'] ?? '') !== '') ? $a['user'] : null;
+
+                if ($this->correspond($s, $id, $mac, $username) && $this->estPresent($a)) {
+                    return true;
+                }
+            }
+        } finally {
+            $this->regTable = $ancienneTable;
+        }
+
+        return false;
     }
 
     // -----------------------------------------------------------------
