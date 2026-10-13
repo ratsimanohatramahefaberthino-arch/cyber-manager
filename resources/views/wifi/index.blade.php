@@ -253,6 +253,13 @@
                                     <span class="h-1.5 w-1.5 rounded-full" :class="pointEtat(l)"></span>
                                     <span x-text="libelleEtat(l)"></span>
                                 </span>
+                                <template x-if="l.etat_appareil === 'termine' && l.client_encore_actif">
+                                    <div class="mt-1 inline-flex items-center gap-1 rounded-md bg-amber-100 px-1.5 py-0.5 text-[10px] font-semibold leading-tight text-amber-800 ring-1 ring-inset ring-amber-600/30"
+                                         title="La session est figée, mais l'appareil est toujours connecté au Wi-Fi. Utilisez Supprimer pour le déconnecter.">
+                                        <span class="h-1.5 w-1.5 shrink-0 animate-pulse rounded-full bg-amber-500"></span>
+                                        Client encore connecté
+                                    </div>
+                                </template>
                             </td>
                             <td class="px-2 py-2.5">
                                 <div class="font-mono text-base font-bold leading-tight"

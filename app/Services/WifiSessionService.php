@@ -15,6 +15,9 @@ class WifiSessionService
     private const CLE_VERROU          = 'wifi_sync_verrou';
     private const CLE_DERNIERE_SYNC   = 'wifi_sync_derniere_tentative';
     private const CLE_ETAT_ROUTEUR    = 'wifi_sync_etat_routeur';
+    private const CLE_MACS_ACTIVES    = 'wifi_sync_macs_actives';
+    /** Au-delà de cet âge (s), la liste des MAC présentes est jugée périmée. */
+    private const MACS_ACTIVES_AGE_MAX = 20;
     private const PREFIXE_ABSENCE     = 'wifi_absence_session_';
     private const PREFIXE_MAC_SANS_FIL = 'wifi_mac_sans_fil_';
     private const PREFIXE_APPAREIL    = 'wifi_appareil_rafraichi_';
@@ -116,6 +119,32 @@ class WifiSessionService
         ];
     }
 
+    /**
+     * MAC (normalisées) actuellement présentes d'après la dernière synchro réussie.
+     * Retourne null si l'information est inconnue ou périmée (routeur muet,
+     * synchro trop ancienne) : l'appelant ne doit alors afficher AUCUN badge.
+     *
+     * @return string[]|null
+     */
+    public function macsEncoreActives(): ?array
+    {
+        $etat = Cache::get(self::CLE_ETAT_ROUTEUR);
+        if (is_array($etat) && empty($etat['ok'])) {
+            return null;
+        }
+
+        $d = Cache::get(self::CLE_MACS_ACTIVES);
+        if (!is_array($d) || !isset($d['at'], $d['macs'])) {
+            return null;
+        }
+
+        if ((now()->getTimestamp() - (int) $d['at']) > self::MACS_ACTIVES_AGE_MAX) {
+            return null;
+        }
+
+        return (array) $d['macs'];
+    }
+
     // -----------------------------------------------------------------
     // Cœur de la synchro
     // -----------------------------------------------------------------
@@ -153,6 +182,7 @@ class WifiSessionService
         $ouvertes     = 0;
         $maj          = 0;
         $idsPresents  = [];
+        $macsPresentes = [];   // MAC réellement présentes (pour le badge "Client encore connecté")
 
         foreach ($actives as $active) {
             $activeId = $active['.id'] ?? null;
@@ -163,6 +193,11 @@ class WifiSessionService
             $present = $this->estPresent($active);
             if ($present) {
                 $idsPresents[] = $activeId;
+
+                $macPresente = AppareilWifi::normaliserMac($active['mac-address'] ?? null);
+                if ($macPresente) {
+                    $macsPresentes[] = $macPresente;
+                }
             }
 
             try {
@@ -178,6 +213,11 @@ class WifiSessionService
         }
 
         $fermees = $this->marquerSessionsDisparues($idsPresents);
+
+        Cache::put(self::CLE_MACS_ACTIVES, [
+            'at'   => now()->getTimestamp(),
+            'macs' => array_values(array_unique($macsPresentes)),
+        ], 120);
 
         return ['ouvertes' => $ouvertes, 'maj' => $maj, 'fermees' => $fermees, 'erreur' => null];
     }

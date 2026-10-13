@@ -2,6 +2,7 @@
 
 namespace App\Http\Controllers;
 
+use App\Models\AppareilWifi;
 use App\Models\Parametre;
 use App\Models\Session;
 use App\Models\Voucher;
@@ -475,10 +476,43 @@ class WifiController extends Controller
             ->orderByDesc('date_heure_debut')
             ->get();
 
-        return $sessions->map(fn ($s) => $this->serialiser($s))->values()->all();
+        // Badge "Client encore connecté" : info publiée par la synchro (aucun appel
+        // MikroTik ici). null = inconnu/périmé → aucun badge.
+        $macsActives = $this->wifiSessions->macsEncoreActives();
+
+        // Une MAC qui a déjà une session ouverte ne doit pas marquer d'anciennes lignes "Terminé".
+        $macsOuvertes = $sessions
+            ->filter(fn ($s) => $s->etat_wifi !== Session::WIFI_TERMINE)
+            ->map(fn ($s) => AppareilWifi::normaliserMac($s->client_mac))
+            ->filter()
+            ->unique()
+            ->all();
+
+        $dejaMarquees = [];   // un seul badge par MAC : le "Terminé" le plus récent
+        $lignes = [];
+
+        foreach ($sessions as $s) {
+            $badge = false;
+
+            if ($macsActives !== null && $s->etat_wifi === Session::WIFI_TERMINE) {
+                $mac = AppareilWifi::normaliserMac($s->client_mac);
+
+                if ($mac
+                    && in_array($mac, $macsActives, true)
+                    && !in_array($mac, $macsOuvertes, true)
+                    && !isset($dejaMarquees[$mac])) {
+                    $badge = true;
+                    $dejaMarquees[$mac] = true;
+                }
+            }
+
+            $lignes[] = $this->serialiser($s, $badge);
+        }
+
+        return $lignes;
     }
 
-    private function serialiser(Session $s): array
+    private function serialiser(Session $s, bool $clientEncoreActif = false): array
     {
         $tarif = $s->tarif ?: $this->tarifService->tarifWifi();
         $protege = (bool) ($s->voucher?->protege ?? false);
@@ -511,6 +545,7 @@ class WifiController extends Controller
             'montant_final'    => ($s->etat_wifi === Session::WIFI_TERMINE && $s->motif_fin === 'arret_manuel')
                 ? (int) $s->montant_total
                 : null,
+            'client_encore_actif' => $clientEncoreActif,
             'deconnecte_at'    => $s->deconnecte_at?->toIso8601String(),
             'pause_at'         => $s->pause_at?->toIso8601String(),
             'secondes_hors_ligne' => (int) $s->duree_hors_ligne_secondes,
