@@ -45,14 +45,13 @@ class WifiController extends Controller
     }
 
     // -----------------------------------------------------------------
-    // Arrêter / Démarrer
+    // Arrêter / Supprimer
     // -----------------------------------------------------------------
 
     /**
-     * "Arrêter" : fige le compteur, calcule le montant final (arrondi),
-     * déconnecte le client du MikroTik, met la session en "terminé".
-     * Le client ne peut plus utiliser ce voucher tant que le responsable
-     * n'a pas cliqué sur "Démarrer" (rare) ou "Supprimer".
+     * "Arrêter" : FIGE la durée et le montant (arrondi appliqué).
+     * Le client RESTE connecté au Wi-Fi : aucune déconnexion MikroTik ici.
+     * La déconnexion réelle se fait uniquement via "Supprimer".
      */
     public function arreter(Session $session): JsonResponse
     {
@@ -64,61 +63,41 @@ class WifiController extends Controller
             return response()->json(['ok' => false, 'message' => 'Déjà terminée.'], 422);
         }
 
-        $final = $this->montant->montantFinal($session);
+        // Calculé AVANT la mise à jour : la session n'est pas encore figée.
+        $final      = $this->montant->montantFinal($session);
+        $maintenant = now();
 
-        $session->update([
-            'etat'                  => 'terminee',
-            'etat_wifi'             => Session::WIFI_TERMINE,
-            'date_heure_fin_reelle' => now(),
-            'montant_consomme'      => $final['final'],
-            'montant_total'         => $final['final'],
-            'montant_restant'       => 0,
-            'alarme_active'         => false,
-            'motif_fin'             => 'arret_manuel',
-            'duree_consommee'       => $final['minutes_reelles'],
-        ]);
+        $maj = [
+            'etat'                      => 'terminee',
+            'etat_wifi'                 => Session::WIFI_TERMINE,
+            'date_heure_fin_reelle'     => $maintenant,
+            'montant_consomme'          => $final['final'],
+            'montant_total'             => $final['final'],
+            'montant_restant'           => 0,
+            'alarme_active'             => false,
+            'alarme_fin_prevue'         => null,
+            'alarme_secondes_restantes' => null,
+            'motif_fin'                 => 'arret_manuel',
+            'duree_consommee'           => $final['minutes_reelles'],
+        ];
 
-        // Déconnecter côté MikroTik
-        if ($session->client_mac) {
-            try {
-                $this->mikroTik->disconnectHotspotActiveByMac($session->client_mac);
-            } catch (\Throwable $e) {}
+        // Intègre l'éventuelle période hors ligne / pause en cours, pour que
+        // (fin_reelle - début - hors_ligne - pause) donne exactement la durée figée.
+        if ($session->estDeconnecte() && $session->deconnecte_at) {
+            $maj['duree_hors_ligne_secondes'] = (int) $session->duree_hors_ligne_secondes
+                + max(0, $maintenant->getTimestamp() - $session->deconnecte_at->getTimestamp());
+        } elseif ($session->estEnPause() && $session->pause_at) {
+            $maj['duree_pause_secondes'] = (int) $session->duree_pause_secondes
+                + max(0, $maintenant->getTimestamp() - $session->pause_at->getTimestamp());
         }
+
+        $session->update($maj);
 
         return response()->json([
             'ok'      => true,
             'message' => "Session arrêtée. Montant à encaisser : "
-                . number_format($final['final'], 0, ',', ' ') . " Ar.",
+                . number_format($final['final'], 0, ',', ' ') . " Ar. Le client reste connecté.",
             'final'   => $final,
-            'lignes'  => $this->lignesSerialisees(),
-            'stats'   => $this->stats(),
-        ]);
-    }
-
-    /**
-     * "Démarrer" : reprend une session arrêtée. Le client se reconnecte,
-     * on remet l'état à "connecté", le compteur reprend à la seconde près.
-     */
-    public function demarrer(Session $session): JsonResponse
-    {
-        if ($session->type_session !== 'wifi') {
-            return response()->json(['ok' => false, 'message' => 'Session non Wi-Fi.'], 422);
-        }
-
-        if (!$session->estTermine()) {
-            return response()->json(['ok' => false, 'message' => 'La session n\'est pas terminée.'], 422);
-        }
-
-        $session->update([
-            'etat'                  => 'en_cours',
-            'etat_wifi'             => Session::WIFI_CONNECTE,
-            'date_heure_fin_reelle' => null,
-            'motif_fin'             => null,
-        ]);
-
-        return response()->json([
-            'ok'      => true,
-            'message' => 'Session reprise.',
             'lignes'  => $this->lignesSerialisees(),
             'stats'   => $this->stats(),
         ]);
@@ -528,6 +507,10 @@ class WifiController extends Controller
                 'montant'  => (int) $s->voucher->montant,
             ] : null,
             'date_debut'       => $s->date_heure_debut?->toIso8601String(),
+            'date_fin_reelle'  => $s->date_heure_fin_reelle?->toIso8601String(),
+            'montant_final'    => ($s->etat_wifi === Session::WIFI_TERMINE && $s->motif_fin === 'arret_manuel')
+                ? (int) $s->montant_total
+                : null,
             'deconnecte_at'    => $s->deconnecte_at?->toIso8601String(),
             'pause_at'         => $s->pause_at?->toIso8601String(),
             'secondes_hors_ligne' => (int) $s->duree_hors_ligne_secondes,

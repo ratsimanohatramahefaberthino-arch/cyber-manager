@@ -151,9 +151,8 @@ Route::middleware('auth')->group(function () {
     Route::post('/wifi/comptes/{username}/toggle', [WifiController::class, 'toggleCompte'])->name('wifi.comptes.toggle');
     Route::delete('/wifi/comptes/{username}', [WifiController::class, 'supprimerCompte'])->name('wifi.comptes.supprimer');
 
-    // Actions Wi-Fi session
+    // Actions Wi-Fi session (jamais de "démarrer" : c'est MikroTik qui détecte les connexions)
     Route::post('/wifi/session/{session}/arreter',  [WifiController::class, 'arreter'])->name('wifi.session.arreter');
-    Route::post('/wifi/session/{session}/demarrer', [WifiController::class, 'demarrer'])->name('wifi.session.demarrer');
     Route::delete('/wifi/session/{session}',         [WifiController::class, 'supprimer'])->name('wifi.session.supprimer');
     Route::post('/wifi/session/supprimer-masse',     [WifiController::class, 'supprimerMasse'])->name('wifi.session.supprimer-masse');
 

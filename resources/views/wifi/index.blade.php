@@ -312,22 +312,13 @@
                             </td>
                             <td class="px-2 py-2.5">
                                 <div class="flex items-center justify-end gap-1.5">
-                                    {{-- ARRÊTER (si connecté ou déconnecté) --}}
+                                    {{-- ARRÊTER : fige durée + montant (le client reste connecté) --}}
                                     <template x-if="l.etat_appareil === 'connecte' || l.etat_appareil === 'deconnecte'">
                                         <button type="button" @click="confirmerArret(l)"
                                                 class="inline-flex items-center gap-1 rounded-md border border-amber-300 bg-white px-2 py-1 text-xs font-semibold text-amber-700 hover:bg-amber-50"
-                                                title="Arrêter la session (calcul du montant dû)">
+                                                title="Figer la durée et le montant (le client reste connecté)">
                                             <x-icone nom="ban" class="h-3.5 w-3.5" />
                                             Arrêter
-                                        </button>
-                                    </template>
-                                    {{-- DÉMARRER (si terminé) --}}
-                                    <template x-if="l.etat_appareil === 'termine'">
-                                        <button type="button" @click="confirmerDemarrage(l)"
-                                                class="inline-flex items-center gap-1 rounded-md border border-emerald-300 bg-white px-2 py-1 text-xs font-semibold text-emerald-700 hover:bg-emerald-50"
-                                                title="Démarrer la session">
-                                            <x-icone nom="play" class="h-3.5 w-3.5" />
-                                            Démarrer
                                         </button>
                                     </template>
                                     {{-- SUPPRIMER --}}
@@ -1303,30 +1294,11 @@ function wifiPage(cfg) {
         confirmerArret(l) {
             this.ouvrirConfirmation({
                 titre: 'Arrêter la session ?',
-                message: `La session de <strong>${this.escapeHtml(l.appareil)}</strong> sera figée : la durée et le montant s'arrêteront immédiatement. Le client sera déconnecté du MikroTik.<br><br>Le montant final sera calculé avec l'arrondi.`,
+                message: `La durée et le montant de <strong>${this.escapeHtml(l.appareil)}</strong> seront figés immédiatement.<br><br>Le client reste connecté au Wi-Fi ; la déconnexion se fera via l'action Supprimer.`,
                 bouton: 'Arrêter la session',
-                danger: true,
-                action: async () => {
-                    const r = await window.cmFetch(`${cfg.urlSession}/${l.id}/arreter`, { method: 'POST' });
-                    const d = await r.json();
-                    if (!r.ok || !d.ok) {
-                        window.dispatchEvent(new CustomEvent('toast', { detail: d.message || 'Erreur.' }));
-                        return;
-                    }
-                    window.dispatchEvent(new CustomEvent('toast', { detail: d.message }));
-                    await this.rafraichir();
-                }
-            });
-        },
-
-        confirmerDemarrage(l) {
-            this.ouvrirConfirmation({
-                titre: 'Démarrer la session ?',
-                message: `La session de <strong>${this.escapeHtml(l.appareil)}</strong> reprendra où elle s'est arrêtée.<br><br>Le compteur et le montant continueront leur progression.`,
-                bouton: 'Démarrer',
                 danger: false,
                 action: async () => {
-                    const r = await window.cmFetch(`${cfg.urlSession}/${l.id}/demarrer`, { method: 'POST' });
+                    const r = await window.cmFetch(`${cfg.urlSession}/${l.id}/arreter`, { method: 'POST' });
                     const d = await r.json();
                     if (!r.ok || !d.ok) {
                         window.dispatchEvent(new CustomEvent('toast', { detail: d.message || 'Erreur.' }));
@@ -1769,7 +1741,10 @@ function wifiPage(cfg) {
             } else if (l.etat_appareil === 'deconnecte' && l.deconnecte_at) {
                 fin = new Date(l.deconnecte_at).getTime();
             } else if (l.etat_appareil === 'termine') {
-                fin = l.date_fin_reelle ? new Date(l.date_fin_reelle).getTime() : this.now;
+                // Session figée : on ne regarde JAMAIS l'heure courante.
+                fin = l.date_fin_reelle
+                    ? new Date(l.date_fin_reelle).getTime()
+                    : (l.deconnecte_at ? new Date(l.deconnecte_at).getTime() : debut);
             } else {
                 fin = this.now;
             }
@@ -1786,6 +1761,7 @@ function wifiPage(cfg) {
         },
 
         montantFinalCalcule(l) {
+            if (l.etat_appareil === 'termine' && l.montant_final != null) return l.montant_final;
             if (!l.tarif) return 0;
             const sec = this.secondesConsommees(l);
             const minutes = Math.ceil(sec / 60);
