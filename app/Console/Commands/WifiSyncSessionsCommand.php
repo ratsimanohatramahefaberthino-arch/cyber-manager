@@ -19,6 +19,11 @@ class WifiSyncSessionsCommand extends Command
             return self::FAILURE;
         }
 
+        if (!empty($result['ignoree'])) {
+            $this->line('Une synchronisation est déjà en cours, rien à faire.');
+            return self::SUCCESS;
+        }
+
         $this->info(sprintf(
             'Sessions ouvertes : %d · mises à jour : %d · fermées : %d',
             $result['ouvertes'],

@@ -11,7 +11,6 @@ use App\Services\WifiMontantService;
 use App\Services\WifiSessionService;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
-use Illuminate\Support\Facades\Cache;
 
 class WifiController extends Controller
 {
@@ -41,6 +40,7 @@ class WifiController extends Controller
             'stats'  => $this->stats(),
             'vouchers_disponibles' => $this->vouchersDisponibles(),
             'vouchers_warning'     => $this->vouchersWarning(),
+            'sync'                 => $this->wifiSessions->etatSynchro(),
         ]);
     }
 
@@ -391,7 +391,15 @@ class WifiController extends Controller
     public function syncNow()
     {
         $r = $this->wifiSessions->synchroniser();
-        if ($r['erreur']) return back()->withErrors(['global' => 'MikroTik injoignable : ' . $r['erreur']]);
+
+        if ($r['erreur']) {
+            return back()->withErrors(['global' => 'MikroTik injoignable : ' . $r['erreur']]);
+        }
+
+        if (!empty($r['ignoree'])) {
+            return back()->with('success', 'Une synchronisation est déjà en cours.');
+        }
+
         return back()->with('success', "Sync : {$r['ouvertes']} ouverte(s), {$r['maj']} mise(s) à jour, {$r['fermees']} déconnectée(s).");
     }
 
@@ -440,12 +448,14 @@ class WifiController extends Controller
     // Helpers
     // -----------------------------------------------------------------
 
+    /**
+     * Synchro opportuniste : seulement si la dernière a plus de 2 s.
+     * Le verrou et la protection anti-chevauchement sont dans le service.
+     */
     private function syncSilencieuse(): void
     {
         try {
-            if (Cache::add('wifi_sync_lock', true, 3)) {
-                $this->wifiSessions->synchroniser();
-            }
+            $this->wifiSessions->synchroniserSiNecessaire(2);
         } catch (\Throwable $e) {}
     }
 

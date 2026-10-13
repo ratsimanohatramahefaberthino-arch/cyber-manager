@@ -8,6 +8,7 @@ use App\Models\Parametre;
 use App\Models\Voucher;
 use App\Services\MikroTikService;
 use App\Services\VoucherService;
+use App\Services\WifiSessionService;
 use Illuminate\Http\Request;
 use Illuminate\Validation\Rule;
 
@@ -35,16 +36,13 @@ class HotspotController extends Controller
         ]);
     }
 
-    /** Endpoint JSON scruté toutes les 6s par le tableau (état quasi temps réel). */
-        /** Endpoint JSON scruté toutes les 6s par le tableau (état quasi temps réel). */
+    /** Endpoint JSON scruté régulièrement par le tableau (état quasi temps réel). */
     public function etat(Request $request)
     {
-        // Synchronise l'état des sessions (disponible → en_cours → utilise)
-        // sans bloquer l'affichage en cas d'erreur MikroTik.
+        // Même synchro (et même verrou) que la page Wi-Fi, sans bloquer l'affichage
+        // en cas d'erreur MikroTik.
         try {
-            if (\Illuminate\Support\Facades\Cache::add('hotspot_sync_lock', true, 15)) {
-                app(\App\Services\WifiSessionService::class)->synchroniser();
-            }
+            app(WifiSessionService::class)->synchroniserSiNecessaire(2);
         } catch (\Throwable $e) {
             \Illuminate\Support\Facades\Log::debug('Sync HotSpot silencieuse échouée', ['error' => $e->getMessage()]);
         }
@@ -146,7 +144,7 @@ class HotspotController extends Controller
         return redirect()->route('hotspot.index')->with('success', $message);
     }
 
-        public function imprimerLot(LotVoucher $lot)
+    public function imprimerLot(LotVoucher $lot)
     {
         $vouchers = Voucher::where('lot_voucher_id', $lot->id)->orderBy('id')->get();
 

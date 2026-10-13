@@ -1,6 +1,6 @@
 ╔════════════════════════════════════════════════════════════════════════════╗
 ║                CYBER MANAGER — GENERATOR.txt (module Wi-Fi)                ║
-║                      Généré le 12/10/2026 à 14:54:43                       ║
+║                      Généré le 13/10/2026 à 17:55:14                       ║
 ╚════════════════════════════════════════════════════════════════════════════╝
 
 
@@ -852,7 +852,7 @@ class WifiAlarmController extends Controller
 📄  app/Services/WifiSessionService.php
 ──────────────────────────────────────────────────────────────────────────────
 
-# Taille : 10.1 Ko  |  Statut : OK
+# Taille : 10.8 Ko  |  Statut : OK
 
 <?php
 
@@ -996,6 +996,12 @@ class WifiSessionService
             $session->etat_wifi     = Session::WIFI_CONNECTE;
             $session->reconnecte_at = now();
             $session->deconnecte_at = null;
+
+            // NOUVEAU : Reprendre l'alarme si elle était en pause
+            if ($session->alarme_active && $session->alarme_secondes_restantes > 0) {
+                $session->alarme_fin_prevue = now()->addSeconds($session->alarme_secondes_restantes);
+                $session->alarme_secondes_restantes = null;
+            }
         }
 
         $session->client_ip        = $active['address']     ?? $session->client_ip;
@@ -1021,7 +1027,7 @@ class WifiSessionService
         $session->save();
     }
 
-    private function marquerSessionsDisparues(array $actives): int
+        private function marquerSessionsDisparues(array $actives): int
     {
         $idsActifs = array_filter(array_map(fn($a) => $a['.id'] ?? null, $actives));
 
@@ -1037,6 +1043,16 @@ class WifiSessionService
             $s->deconnecte_at = now();
             $s->derniere_sync_at = now();
             $s->duree_consommee = (int) floor($s->secondesConsommees() / 60);
+
+            // NOUVEAU : Mettre l'alarme en pause
+            if ($s->alarme_active && $s->alarme_fin_prevue) {
+                $restant = $s->alarme_fin_prevue->getTimestamp() - now()->getTimestamp();
+                if ($restant > 0) {
+                    $s->alarme_secondes_restantes = $restant;
+                    $s->alarme_fin_prevue = null; // Empêche le déclenchement hors ligne
+                }
+            }
+
             $s->save();
             $n++;
         }
@@ -1162,7 +1178,7 @@ class WifiSessionService
 📄  app/Services/WifiMontantService.php
 ──────────────────────────────────────────────────────────────────────────────
 
-# Taille : 1.7 Ko  |  Statut : OK
+# Taille : 1.6 Ko  |  Statut : OK
 
 <?php
 
@@ -1903,7 +1919,7 @@ class MikrotikConnection
 📄  resources/views/wifi/index.blade.php
 ──────────────────────────────────────────────────────────────────────────────
 
-# Taille : 104.5 Ko  |  Statut : OK
+# Taille : 105.3 Ko  |  Statut : OK
 
 @extends('layouts.cyber-manager', ['title' => 'Wi-Fi — Cyber Manager'])
 
@@ -2187,7 +2203,17 @@ class MikrotikConnection
                                 </template>
                                 <template x-if="l.alarme.active && !l.alarme.declenchee">
                                     <div class="space-y-1">
-                                        <div class="font-mono text-sm font-bold text-amber-700" x-text="chronoRestantTexte(l)"></div>
+                                        <!-- Si connecté, on affiche le chrono -->
+                                        <template x-if="l.etat_appareil === 'connecte'">
+                                            <div class="font-mono text-sm font-bold text-amber-700" x-text="chronoRestantTexte(l)"></div>
+                                        </template>
+                                        <!-- Si déconnecté, on affiche que l'alarme est en pause -->
+                                        <template x-if="l.etat_appareil !== 'connecte'">
+                                            <div class="text-xs font-bold text-slate-500 flex items-center justify-center gap-1">
+                                                <x-icone nom="pause" class="h-3 w-3" /> Alarme en pause
+                                            </div>
+                                        </template>
+                                        
                                         <div class="h-1 w-full overflow-hidden rounded-full bg-slate-200">
                                             <div class="h-full bg-amber-500 transition-all"
                                                  :style="'width: ' + progressionAlarme(l) + '%'"></div>
@@ -2882,7 +2908,7 @@ function wifiPage(cfg) {
                 const fin = new Date(l.alarme.fin).getTime();
                 const dejaDansListe = this.fenetresAlarme.find(f => f.id === l.id);
 
-                if (this.now >= fin && !dejaDansListe && !this._alarmesFermees.has(l.id)) {
+                if (this.now >= fin && !dejaDansListe && !this._alarmesFermees.has(l.id) && l.etat_appareil === 'connecte') {
                     this.ouvrirFenetreAlarme(l);
                 }
                 if (this.now < fin && dejaDansListe) {
@@ -3696,7 +3722,7 @@ function wifiPage(cfg) {
         },
 
         chronoRestantTexte(l) {
-            if (!l.alarme.fin) return '00:00';
+            if (!l.alarme.fin) return 'En pause'; // Si pas de date de fin, c'est en pause
             const fin = new Date(l.alarme.fin).getTime();
             const sec = Math.max(0, Math.floor((fin - this.now) / 1000));
             return this.formatDureeSec(sec);
@@ -3945,7 +3971,7 @@ function wifiPage(cfg) {
 📄  app/Models/Session.php
 ──────────────────────────────────────────────────────────────────────────────
 
-# Taille : 4.6 Ko  |  Statut : OK
+# Taille : 4.7 Ko  |  Statut : OK
 
 <?php
 
@@ -3979,7 +4005,7 @@ class Session extends Model
         'pause_at', 'duree_pause_secondes',
         'alarme_active', 'alarme_type', 'alarme_duree_minutes', 'alarme_montant',
         'alarme_fin_prevue', 'alarme_declenchee_at', 'alarme_message',
-        'alarme_historique',
+        'alarme_historique', 'alarme_secondes_restantes',
     ];
 
     protected $casts = [
@@ -4000,6 +4026,7 @@ class Session extends Model
         'alarme_duree_minutes' => 'integer',
         'alarme_montant' => 'integer',
         'alarme_historique' => 'array',
+        'alarme_secondes_restantes' => 'integer',
     ];
 
     // -----------------------------------------------------------------
@@ -7245,8 +7272,8 @@ return new class extends Migration
   Trouvés et inclus: 37
   Manquants        : 0
   En erreur        : 0
-  Poids code       : 289.4 Ko
-  Durée génération : 2.11 s
+  Poids code       : 291.1 Ko
+  Durée génération : 2.19 s
 ══════════════════════════════════════════════════════════════════════════════
 
   Fin du GENERATOR.txt.
