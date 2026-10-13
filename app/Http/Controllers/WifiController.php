@@ -106,9 +106,11 @@ class WifiController extends Controller
 
     /**
      * Suppression définitive : déconnecte, efface le voucher du MikroTik,
-     * supprime la session. Autorisé même si connecté (déconnexion auto).
+     * supprime la session. Si le voucher est encore utilisé par une AUTRE
+     * connexion active, on demande confirmation (force=1) avant de tout
+     * couper. Sinon, suppression immédiate.
      */
-    public function supprimer(Session $session): JsonResponse
+    public function supprimer(Request $request, Session $session): JsonResponse
     {
         if ($session->type_session !== 'wifi') {
             return response()->json(['ok' => false, 'message' => 'Session non Wi-Fi.'], 422);
@@ -123,7 +125,27 @@ class WifiController extends Controller
             ], 403);
         }
 
-        // Déconnecter le client du MikroTik si encore actif
+        // Détection des AUTRES connexions actives qui partagent ce voucher.
+        $autres = $session->voucher ? $this->sessionsActivesDuMemeVoucher($session) : [];
+        $force  = $request->boolean('force');
+
+        if (!empty($autres) && !$force) {
+            return response()->json([
+                'ok'           => false,
+                'besoin_force' => true,
+                'autres'       => $autres,
+                'message'      => 'Ce voucher est encore utilisé par d\'autres connexions actives.',
+            ], 409);
+        }
+
+        // Déconnecter TOUTES les autres sessions qui partagent le voucher
+        foreach ($autres as $info) {
+            if (!empty($info['mac'])) {
+                try { $this->mikroTik->disconnectHotspotActiveByMac($info['mac']); } catch (\Throwable $e) {}
+            }
+        }
+
+        // Déconnecter la session courante si sa MAC est encore active
         if ($session->client_mac) {
             try {
                 $this->mikroTik->disconnectHotspotActiveByMac($session->client_mac);
@@ -146,6 +168,50 @@ class WifiController extends Controller
             'lignes'  => $this->lignesSerialisees(),
             'stats'   => $this->stats(),
         ]);
+    }
+
+    /**
+     * Autres sessions Wi-Fi actives qui utilisent le même voucher que
+     * $session (hors elle-même). On interroge MikroTik en direct pour
+     * être sûr de l'état réel, avec repli sur la base locale si l'API
+     * est muette.
+     *
+     * @return array<int, array{mac:?string, appareil:?string}>
+     */
+    private function sessionsActivesDuMemeVoucher(Session $session): array
+    {
+        if (!$session->voucher) return [];
+
+        $username = $session->voucher->username;
+        $macSelf  = AppareilWifi::normaliserMac($session->client_mac);
+        $resultat = [];
+
+        // 1) Interroge MikroTik (état réel)
+        try {
+            foreach ($this->mikroTik->listHotspotActive() as $a) {
+                if (($a['user'] ?? null) !== $username) continue;
+
+                $mac = AppareilWifi::normaliserMac($a['mac-address'] ?? null);
+                if ($mac && $macSelf && $mac === $macSelf) continue; // soi-même
+
+                $resultat[] = ['mac' => $mac, 'appareil' => $a['mac-address'] ?? null];
+            }
+            return array_values($resultat);
+        } catch (\Throwable $e) {
+            // 2) Repli : sessions DB ouvertes partageant le voucher
+            $locales = Session::where('type_session', 'wifi')
+                ->where('voucher_id', $session->voucher_id)
+                ->where('id', '!=', $session->id)
+                ->whereIn('etat_wifi', [Session::WIFI_CONNECTE, Session::WIFI_EN_PAUSE])
+                ->get(['client_mac', 'appareil_wifi_id']);
+
+            foreach ($locales as $s) {
+                $mac = AppareilWifi::normaliserMac($s->client_mac);
+                if ($mac && $macSelf && $mac === $macSelf) continue;
+                $resultat[] = ['mac' => $mac, 'appareil' => null];
+            }
+            return array_values($resultat);
+        }
     }
 
     /** Suppression en masse. */

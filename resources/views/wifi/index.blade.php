@@ -1336,17 +1336,45 @@ function wifiPage(cfg) {
                 bouton: 'Supprimer définitivement',
                 danger: true,
                 action: async () => {
-                    const r = await window.cmFetch(`${cfg.urlSession}/${l.id}`, { method: 'DELETE' });
-                    const d = await r.json();
-                    if (!r.ok || !d.ok) {
-                        window.dispatchEvent(new CustomEvent('toast', { detail: d.message || 'Erreur.' }));
-                        if (d.redirect) window.location.href = d.redirect;
-                        return;
-                    }
-                    window.dispatchEvent(new CustomEvent('toast', { detail: d.message }));
-                    await this.rafraichir();
+                    await this.executerSuppression(l, false);
                 }
             });
+        },
+
+        async executerSuppression(l, force) {
+            const url = `${cfg.urlSession}/${l.id}` + (force ? '?force=1' : '');
+            const r = await window.cmFetch(url, { method: 'DELETE' });
+            const d = await r.json();
+
+            // 409 : le voucher est encore utilisé ailleurs → 2e modale d'avertissement
+            if (r.status === 409 && d.besoin_force) {
+                const liste = (d.autres || [])
+                    .map(x => `<li class="font-mono">${this.escapeHtml(x.mac || '—')}</li>`)
+                    .join('');
+                this.ouvrirConfirmation({
+                    titre: '⚠ Cet identifiant est encore utilisé',
+                    message:
+                        `Le voucher <strong>${this.escapeHtml(l.voucher?.username || '')}</strong> ` +
+                        `est actuellement associé à <strong>${d.autres.length}</strong> autre(s) connexion(s) active(s) :` +
+                        `<ul class="list-disc pl-6 mt-2 text-sm">${liste}</ul><br>` +
+                        `Sa suppression va interrompre ces connexions et couper leur accès Internet.<br><br>` +
+                        `<strong>Voulez-vous vraiment continuer ?</strong>`,
+                    bouton: 'Supprimer et déconnecter',
+                    danger: true,
+                    action: async () => {
+                        await this.executerSuppression(l, true);
+                    }
+                });
+                return;
+            }
+
+            if (!r.ok || !d.ok) {
+                window.dispatchEvent(new CustomEvent('toast', { detail: d.message || 'Erreur.' }));
+                if (d.redirect) window.location.href = d.redirect;
+                return;
+            }
+            window.dispatchEvent(new CustomEvent('toast', { detail: d.message }));
+            await this.rafraichir();
         },
 
         demanderSuppressionMasse() {
