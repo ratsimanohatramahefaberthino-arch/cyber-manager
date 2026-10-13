@@ -6,6 +6,7 @@ use App\Models\AppareilWifi;
 use App\Models\Session;
 use App\Models\Voucher;
 use Illuminate\Support\Carbon;
+use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Log;
 
@@ -17,11 +18,26 @@ class WifiSessionService
     private const PREFIXE_ABSENCE     = 'wifi_absence_session_';
     private const PREFIXE_MAC_SANS_FIL = 'wifi_mac_sans_fil_';
     private const PREFIXE_APPAREIL    = 'wifi_appareil_rafraichi_';
+    private const PREFIXE_VOLUME_BASE = 'wifi_volume_base_session_';
 
     /** Une absence n'est confirmée qu'après ce nombre de synchros sans le client... */
     private const ABSENCE_SYNCS_MIN = 2;
     /** ...ET après au moins ce délai (secondes) depuis la première absence. */
     private const ABSENCE_SECONDES_MIN = 3;
+
+    /** États d'une session "vivante" (par opposition à terminée). */
+    private const ETATS_OUVERTS = [
+        Session::WIFI_CONNECTE,
+        Session::WIFI_DECONNECTE,
+        Session::WIFI_EN_PAUSE,
+    ];
+
+    /**
+     * Une connexion MikroTik qui a commencé au plus tard N secondes après
+     * l'arrêt d'une session terminée est considérée comme LA MÊME connexion
+     * (le client n'a jamais été déconnecté). Au-delà : nouvelle connexion.
+     */
+    private const TOLERANCE_FIN_SECONDES = 5;
 
     private ?array $baux = null;
     private ?array $regTable = null;   // null = table Wi-Fi indisponible
@@ -113,6 +129,10 @@ class WifiSessionService
 
         $this->chargerPresenceSansFil();
 
+        // Un appareil physique = une seule connexion réelle : si MikroTik garde
+        // plusieurs entrées pour la même MAC, on ne retient que la plus récente.
+        $actives = $this->actifsCanoniques($actives);
+
         $ouvertes     = 0;
         $maj          = 0;
         $idsPresents  = [];
@@ -143,6 +163,43 @@ class WifiSessionService
         $fermees = $this->marquerSessionsDisparues($idsPresents);
 
         return ['ouvertes' => $ouvertes, 'maj' => $maj, 'fermees' => $fermees, 'erreur' => null];
+    }
+
+    /**
+     * Ramène les entrées actives à UNE par appareil (MAC).
+     * Si plusieurs entrées partagent la même MAC, la plus récente (plus petit
+     * uptime) est la connexion réelle ; les autres sont des restes ignorés.
+     * Les entrées sans MAC valide sont conservées telles quelles.
+     */
+    private function actifsCanoniques(array $actives): array
+    {
+        $resultat = [];
+        $groupes  = [];
+
+        foreach ($actives as $a) {
+            $mac = AppareilWifi::normaliserMac($a['mac-address'] ?? null);
+            if ($mac === null) {
+                $resultat[] = $a;
+                continue;
+            }
+            $groupes[$mac][] = $a;
+        }
+
+        foreach ($groupes as $mac => $liste) {
+            if (count($liste) > 1) {
+                usort($liste, fn ($x, $y) =>
+                    $this->parseUptime($x['uptime'] ?? '0s') <=> $this->parseUptime($y['uptime'] ?? '0s'));
+
+                Log::info('Sync Wi-Fi : plusieurs entrées MikroTik pour une même MAC, la plus récente est retenue', [
+                    'mac'     => $mac,
+                    'retenue' => $liste[0]['.id'] ?? null,
+                    'ignores' => array_map(fn ($x) => $x['.id'] ?? null, array_slice($liste, 1)),
+                ]);
+            }
+            $resultat[] = $liste[0];
+        }
+
+        return $resultat;
     }
 
     /**
@@ -195,19 +252,28 @@ class WifiSessionService
         return !Cache::has(self::PREFIXE_MAC_SANS_FIL . str_replace(':', '', $mac));
     }
 
+    // -----------------------------------------------------------------
+    // Rattachement d'une entrée active à une session (anti-doublons)
+    // -----------------------------------------------------------------
+
     private function traiterActive(array $active, bool $present): ?string
     {
         $activeId = $active['.id'];
+        $mac      = AppareilWifi::normaliserMac($active['mac-address'] ?? null);
+        $username = (($active['user'] ?? '') !== '') ? $active['user'] : null;
 
-        $session = Session::where('mikrotik_active_id', $activeId)
-            ->whereIn('etat_wifi', [
-                Session::WIFI_CONNECTE,
-                Session::WIFI_DECONNECTE,
-                Session::WIFI_EN_PAUSE,
-            ])
-            ->first();
+        // 1) Session OUVERTE qui correspond à cette connexion
+        //    (même .id, ou même appareil + même voucher après un nouvel .id).
+        $candidats = $this->sessionsOuvertesCorrespondantes($active, $activeId, $mac, $username);
 
-        if ($session) {
+        if ($candidats->isNotEmpty()) {
+            $session  = $candidats->first();      // la plus ancienne = celle qu'on garde
+            $doublons = $candidats->slice(1);
+
+            if ($doublons->isNotEmpty()) {
+                $this->fusionner($session, $doublons);
+            }
+
             if (!$present) {
                 // Entrée "fantôme" gardée par MikroTik : on n'y touche pas,
                 // marquerSessionsDisparues() s'occupe de l'absence.
@@ -222,9 +288,162 @@ class WifiSessionService
             return null; // ne pas créer de session pour un fantôme
         }
 
+        // 2) Aucune session ouverte. Cette connexion est-elle celle d'une session
+        //    déjà TERMINÉE (figée) ? Alors le client n'a jamais été déconnecté :
+        //    on ne crée rien, la ligne "Terminé" reste telle quelle.
+        if ($this->connexionDejaTerminee($active, $activeId, $mac, $username)) {
+            return null;
+        }
+
+        // 3) Vraie nouvelle connexion → nouvelle session.
         $this->creer($active);
         return 'ouverte';
     }
+
+    /**
+     * Sessions ouvertes qui représentent cette même connexion réelle,
+     * de la plus ancienne à la plus récente.
+     *
+     * @return Collection<int, Session>
+     */
+    private function sessionsOuvertesCorrespondantes(array $active, string $activeId, ?string $mac, ?string $username): Collection
+    {
+        $limite = now()->subMinutes($this->fenetreRepriseMinutes());
+
+        return $this->requeteParIdOuMac($activeId, $active, self::ETATS_OUVERTS)
+            ->orderBy('date_heure_debut')
+            ->orderBy('id')
+            ->get()
+            ->filter(function (Session $s) use ($activeId, $mac, $username, $limite) {
+                if (!$this->correspond($s, $activeId, $mac, $username)) {
+                    return false;
+                }
+
+                // Reprise par MAC (nouvel .id) : seulement si la déconnexion est récente.
+                // Un retour plusieurs heures plus tard = nouvelle session.
+                $memeId = (string) $s->mikrotik_active_id === (string) $activeId;
+                if (!$memeId
+                    && $s->etat_wifi === Session::WIFI_DECONNECTE
+                    && $s->deconnecte_at
+                    && $s->deconnecte_at->lt($limite)) {
+                    return false;
+                }
+
+                return true;
+            })
+            ->values();
+    }
+
+    /**
+     * Une session TERMINÉE correspond-elle à la connexion en cours, c'est-à-dire
+     * la connexion MikroTik a-t-elle commencé AVANT l'arrêt de cette session ?
+     */
+    private function connexionDejaTerminee(array $active, string $activeId, ?string $mac, ?string $username): bool
+    {
+        $debutConnexion = now()->getTimestamp() - $this->parseUptime($active['uptime'] ?? '0s');
+
+        $terminees = $this->requeteParIdOuMac($activeId, $active, [Session::WIFI_TERMINE])
+            ->whereNotNull('date_heure_fin_reelle')
+            ->orderByDesc('date_heure_fin_reelle')
+            ->limit(10)
+            ->get();
+
+        foreach ($terminees as $t) {
+            if (!$this->correspond($t, $activeId, $mac, $username)) {
+                continue;
+            }
+
+            if ($debutConnexion <= $t->date_heure_fin_reelle->getTimestamp() + self::TOLERANCE_FIN_SECONDES) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /** Pré-filtre SQL : même .id actif OU même MAC (brute ou normalisée). */
+    private function requeteParIdOuMac(string $activeId, array $active, array $etats)
+    {
+        $macBrute = $active['mac-address'] ?? null;
+        $macNorm  = AppareilWifi::normaliserMac($macBrute);
+        $macs     = array_values(array_unique(array_filter([$macBrute, $macNorm])));
+
+        return Session::where('type_session', 'wifi')
+            ->whereIn('etat_wifi', $etats)
+            ->where(function ($q) use ($activeId, $macs) {
+                $q->where('mikrotik_active_id', $activeId);
+                if (!empty($macs)) {
+                    $q->orWhereIn('client_mac', $macs);
+                }
+            });
+    }
+
+    /**
+     * Critères combinés (aucun ne suffit seul) :
+     *  - même .id actif : accepté seulement si la MAC est cohérente
+     *    (protège contre la réutilisation d'un .id après redémarrage du routeur) ;
+     *  - sinon : même MAC ET même voucher (username).
+     */
+    private function correspond(Session $s, string $activeId, ?string $mac, ?string $username): bool
+    {
+        $macSession = AppareilWifi::normaliserMac($s->client_mac);
+
+        if ((string) $s->mikrotik_active_id === (string) $activeId) {
+            return $mac === null || $macSession === null || $macSession === $mac;
+        }
+
+        if ($mac === null || $macSession !== $mac) {
+            return false;
+        }
+
+        return (($s->hotspot_username ?: null) === $username);
+    }
+
+    private function fenetreRepriseMinutes(): int
+    {
+        return max(1, (int) config('mikrotik.wifi_reprise_minutes', 60));
+    }
+
+    /**
+     * Fusionne des doublons opérationnels dans la session conservée.
+     * On garde la plus ancienne (date de début d'origine) ; si elle n'a pas
+     * d'alarme et qu'un doublon en a une, l'alarme est reprise.
+     *
+     * @param Collection<int, Session> $doublons
+     */
+    private function fusionner(Session $garde, Collection $doublons): void
+    {
+        foreach ($doublons as $d) {
+            if (!$garde->alarme_active && $d->alarme_active) {
+                foreach ([
+                    'alarme_active', 'alarme_type', 'alarme_duree_minutes', 'alarme_montant',
+                    'alarme_fin_prevue', 'alarme_declenchee_at', 'alarme_message',
+                    'alarme_historique', 'alarme_secondes_restantes',
+                ] as $champ) {
+                    $garde->{$champ} = $d->{$champ};
+                }
+            }
+
+            Log::info('Sync Wi-Fi : doublon de session fusionné', [
+                'garde'    => $garde->id,
+                'supprime' => $d->id,
+                'mac'      => $d->client_mac,
+                'voucher'  => $d->hotspot_username,
+            ]);
+
+            Cache::forget(self::PREFIXE_ABSENCE . $d->id);
+            Cache::forget(self::PREFIXE_VOLUME_BASE . $d->id);
+            $d->delete();
+        }
+
+        if ($garde->isDirty()) {
+            $garde->save();
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // Création / mise à jour
+    // -----------------------------------------------------------------
 
     private function creer(array $active): Session
     {
@@ -286,6 +505,19 @@ class WifiSessionService
         // Le client est bien là : on efface tout compteur d'absence en cours.
         Cache::forget(self::PREFIXE_ABSENCE . $session->id);
 
+        // Reconnexion avec un nouvel .id MikroTik : la session adopte la nouvelle
+        // entrée et on mémorise le volume déjà cumulé (les compteurs MikroTik
+        // repartent de zéro).
+        $nouvelId = $active['.id'] ?? null;
+        if ($nouvelId && (string) $session->mikrotik_active_id !== (string) $nouvelId) {
+            Cache::put(self::PREFIXE_VOLUME_BASE . $session->id, [
+                'entree' => (int) $session->volume_entree,
+                'sortie' => (int) $session->volume_sortie,
+            ], 604800);
+
+            $session->mikrotik_active_id = $nouvelId;
+        }
+
         if ($session->etat_wifi === Session::WIFI_DECONNECTE) {
             $dureeHorsLigne = $session->deconnecte_at
                 ? max(0, now()->getTimestamp() - $session->deconnecte_at->getTimestamp())
@@ -321,10 +553,14 @@ class WifiSessionService
         }
 
         if ($session->etat_wifi === Session::WIFI_CONNECTE) {
-            $vol = $this->calculerVolumes($active);
-            $session->volume_entree = $vol['volume_entree'];
-            $session->volume_sortie = $vol['volume_sortie'];
-            $session->volume_total  = $vol['volume_total'];
+            $vol  = $this->calculerVolumes($active);
+            $base = Cache::get(self::PREFIXE_VOLUME_BASE . $session->id);
+            $baseEntree = is_array($base) ? (int) ($base['entree'] ?? 0) : 0;
+            $baseSortie = is_array($base) ? (int) ($base['sortie'] ?? 0) : 0;
+
+            $session->volume_entree = $vol['volume_entree'] + $baseEntree;
+            $session->volume_sortie = $vol['volume_sortie'] + $baseSortie;
+            $session->volume_total  = $session->volume_entree + $session->volume_sortie;
             $session->duree_consommee = (int) floor($session->secondesConsommees() / 60);
         }
 
