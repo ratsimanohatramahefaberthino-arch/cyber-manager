@@ -1767,7 +1767,9 @@ function wifiPage(cfg) {
         montantTempsReel(l) {
             if (!l.tarif) return 0;
             const sec = this.secondesConsommees(l);
-            return Math.floor((sec / 60) * l.tarif.montant_par_minute);
+            const brut = Math.floor((sec / 60) * l.tarif.montant_par_minute);
+            const mini = l.tarif.montant_minimum || 0;
+            return Math.max(brut, mini);
         },
 
         montantFinalCalcule(l) {

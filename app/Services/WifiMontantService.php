@@ -7,14 +7,18 @@ use App\Models\Tarif;
 
 /**
  * Montants Wi-Fi :
- *   - montantTempsReel() : brut (sans arrondi), augmente en continu.
+ *   - montantTempsReel() : brut + minimum, sans arrondi, augmente en continu.
  *   - montantFinal()     : minimum + arrondi appliqués, à l'arrêt.
  */
 class WifiMontantService
 {
     public function __construct(private TarifService $tarifService) {}
 
-    /** Montant brut affiché pendant la session (pas d'arrondi). */
+    /**
+     * Montant affiché pendant la session (pas d'arrondi).
+     * Le minimum configurable est appliqué dès t=0 : la 1re seconde
+     * affiche déjà montant_minimum (ex : 300 Ar).
+     */
     public function montantTempsReel(Session $s): int
     {
         $tarif = $this->tarifPour($s);
@@ -23,7 +27,10 @@ class WifiMontantService
         $secondes = $s->secondesConsommees();
         $minutes  = $secondes / 60;
 
-        return (int) floor($minutes * $tarif->montant_par_minute);
+        $brut = (int) floor($minutes * $tarif->montant_par_minute);
+        $brut = $this->tarifService->appliquerMinimum($brut, $tarif);
+
+        return $brut;
     }
 
     /** Montant à payer : minimum + arrondi appliqués. */
