@@ -280,12 +280,12 @@
                                 </div>
                             </td>
                             <td class="px-2 py-2.5 text-center">
-                                <template x-if="l.alarme.declenchee && !l.alarme.acquittee">
+                                <template x-if="l.alarme.declenchee && !l.alarme.acquittee && l.etat_appareil !== 'termine'">
                                     <span class="inline-flex items-center gap-1 rounded-full bg-rose-100 px-2 py-0.5 text-xs font-bold text-rose-700 animate-pulse">
                                         <x-icone nom="bell" class="h-3.5 w-3.5" /> Sonne
                                     </span>
                                 </template>
-                                <template x-if="l.alarme.active && !l.alarme.declenchee">
+                                <template x-if="l.alarme.active && !l.alarme.declenchee && l.etat_appareil !== 'termine'">
                                     <div class="space-y-1">
                                         <!-- Si connecté, on affiche le chrono -->
                                         <template x-if="l.etat_appareil === 'connecte'">
@@ -310,7 +310,10 @@
                                         </div>
                                     </div>
                                 </template>
-                                <template x-if="!l.alarme.active">
+                                <template x-if="l.etat_appareil === 'termine'">
+                                    <span class="text-xs text-slate-400">Session terminée</span>
+                                </template>
+                                <template x-if="!l.alarme.active && l.etat_appareil !== 'termine'">
                                     <button type="button" @click="ouvrirAlarme(l)"
                                             class="inline-flex items-center gap-1 rounded-md border border-slate-200 bg-white px-2 py-0.5 text-xs text-slate-600 hover:bg-slate-50">
                                         <x-icone nom="bell" class="h-3.5 w-3.5" /> Poser
@@ -1834,7 +1837,7 @@ function wifiPage(cfg) {
             };
         },
         classeLigne(l) {
-            if (l.alarme.declenchee && !l.alarme.acquittee) return 'bg-rose-50 border-l-4 border-rose-500';
+            if (l.alarme.declenchee && !l.alarme.acquittee && l.etat_appareil !== 'termine') return 'bg-rose-50 border-l-4 border-rose-500';
             return {
                 'bg-emerald-50/60 border-l-4 border-emerald-500': l.etat_appareil === 'connecte',
                 'bg-amber-100/70 border-l-4 border-amber-500': l.etat_appareil === 'deconnecte',
