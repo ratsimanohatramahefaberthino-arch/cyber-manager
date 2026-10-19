@@ -46,7 +46,7 @@ class WifiController extends Controller
     }
 
     // -----------------------------------------------------------------
-    // Arrêter / Supprimer
+    // Arrêter / Continuer / Supprimer
     // -----------------------------------------------------------------
 
     /**
@@ -64,7 +64,6 @@ class WifiController extends Controller
             return response()->json(['ok' => false, 'message' => 'Déjà terminée.'], 422);
         }
 
-        // Calculé AVANT la mise à jour : la session n'est pas encore figée.
         $final      = $this->montant->montantFinal($session);
         $maintenant = now();
 
@@ -82,8 +81,6 @@ class WifiController extends Controller
             'duree_consommee'           => $final['minutes_reelles'],
         ];
 
-        // Intègre l'éventuelle période hors ligne / pause en cours, pour que
-        // (fin_reelle - début - hors_ligne - pause) donne exactement la durée figée.
         if ($session->estDeconnecte() && $session->deconnecte_at) {
             $maj['duree_hors_ligne_secondes'] = (int) $session->duree_hors_ligne_secondes
                 + max(0, $maintenant->getTimestamp() - $session->deconnecte_at->getTimestamp());
@@ -105,6 +102,49 @@ class WifiController extends Controller
     }
 
     /**
+     * "Continuer" : reprend une session TERMINÉE, QUE le client soit encore
+     * connecté ou non. La même ligne est réutilisée (pas de nouvelle ligne,
+     * pas de doublon). Le temps passé entre l'arrêt et maintenant est
+     * comptabilisé comme "hors ligne" : il ne sera PAS facturé.
+     */
+    public function continuer(Session $session): JsonResponse
+    {
+        if ($session->type_session !== 'wifi') {
+            return response()->json(['ok' => false, 'message' => 'Session non Wi-Fi.'], 422);
+        }
+
+        if (!$session->estTermine()) {
+            return response()->json(['ok' => false, 'message' => 'La session n\'est pas terminée.'], 422);
+        }
+
+        $maintenant = now();
+
+        $ajoutHorsLigne = 0;
+        if ($session->date_heure_fin_reelle) {
+            $ajoutHorsLigne = max(0, $maintenant->getTimestamp() - $session->date_heure_fin_reelle->getTimestamp());
+        }
+
+        $session->update([
+            'etat'                      => 'en_cours',
+            'etat_wifi'                 => Session::WIFI_CONNECTE,
+            'date_heure_fin_reelle'     => null,
+            'motif_fin'                 => null,
+            'duree_hors_ligne_secondes' => (int) $session->duree_hors_ligne_secondes + $ajoutHorsLigne,
+            'alarme_active'             => false,
+            'alarme_fin_prevue'         => null,
+            'alarme_secondes_restantes' => null,
+            'montant_restant'           => (int) $session->montant_total,
+        ]);
+
+        return response()->json([
+            'ok'      => true,
+            'message' => 'Session reprise : la durée et le montant reprennent.',
+            'lignes'  => $this->lignesSerialisees(),
+            'stats'   => $this->stats(),
+        ]);
+    }
+
+    /**
      * Suppression définitive : déconnecte, efface le voucher du MikroTik,
      * supprime la session. Si le voucher est encore utilisé par une AUTRE
      * connexion active, on demande confirmation (force=1) avant de tout
@@ -116,7 +156,6 @@ class WifiController extends Controller
             return response()->json(['ok' => false, 'message' => 'Session non Wi-Fi.'], 422);
         }
 
-        // Voucher protégé → redirection HotSpot (sécurité)
         if ($session->voucher && $session->voucher->protege) {
             return response()->json([
                 'ok'       => false,
@@ -125,7 +164,6 @@ class WifiController extends Controller
             ], 403);
         }
 
-        // Détection des AUTRES connexions actives qui partagent ce voucher.
         $autres = $session->voucher ? $this->sessionsActivesDuMemeVoucher($session) : [];
         $force  = $request->boolean('force');
 
@@ -138,21 +176,18 @@ class WifiController extends Controller
             ], 409);
         }
 
-        // Déconnecter TOUTES les autres sessions qui partagent le voucher
         foreach ($autres as $info) {
             if (!empty($info['mac'])) {
                 try { $this->mikroTik->disconnectHotspotActiveByMac($info['mac']); } catch (\Throwable $e) {}
             }
         }
 
-        // Déconnecter la session courante si sa MAC est encore active
         if ($session->client_mac) {
             try {
                 $this->mikroTik->disconnectHotspotActiveByMac($session->client_mac);
             } catch (\Throwable $e) {}
         }
 
-        // Supprimer le voucher temporaire associé
         if ($session->voucher && !$session->voucher->estReutilisable()) {
             try {
                 $this->mikroTik->deleteHotspotUser($session->voucher->username);
@@ -171,10 +206,7 @@ class WifiController extends Controller
     }
 
     /**
-     * Autres sessions Wi-Fi actives qui utilisent le même voucher que
-     * $session (hors elle-même). On interroge MikroTik en direct pour
-     * être sûr de l'état réel, avec repli sur la base locale si l'API
-     * est muette.
+     * Autres sessions Wi-Fi actives qui utilisent le même voucher que $session.
      *
      * @return array<int, array{mac:?string, appareil:?string}>
      */
@@ -186,19 +218,17 @@ class WifiController extends Controller
         $macSelf  = AppareilWifi::normaliserMac($session->client_mac);
         $resultat = [];
 
-        // 1) Interroge MikroTik (état réel)
         try {
             foreach ($this->mikroTik->listHotspotActive() as $a) {
                 if (($a['user'] ?? null) !== $username) continue;
 
                 $mac = AppareilWifi::normaliserMac($a['mac-address'] ?? null);
-                if ($mac && $macSelf && $mac === $macSelf) continue; // soi-même
+                if ($mac && $macSelf && $mac === $macSelf) continue;
 
                 $resultat[] = ['mac' => $mac, 'appareil' => $a['mac-address'] ?? null];
             }
             return array_values($resultat);
         } catch (\Throwable $e) {
-            // 2) Repli : sessions DB ouvertes partageant le voucher
             $locales = Session::where('type_session', 'wifi')
                 ->where('voucher_id', $session->voucher_id)
                 ->where('id', '!=', $session->id)
@@ -255,7 +285,31 @@ class WifiController extends Controller
     }
 
     // -----------------------------------------------------------------
-    // Alarme — poser, prolonger, annuler, acquitter
+    // Remarque libre
+    // -----------------------------------------------------------------
+
+    public function enregistrerRemarque(Request $request, Session $session): JsonResponse
+    {
+        if ($session->type_session !== 'wifi') {
+            return response()->json(['ok' => false, 'message' => 'Session non Wi-Fi.'], 422);
+        }
+
+        $data = $request->validate([
+            'remarque' => ['nullable', 'string', 'max:1000'],
+        ]);
+
+        $texte = isset($data['remarque']) ? trim((string) $data['remarque']) : null;
+        $session->update(['remarque' => $texte !== '' ? $texte : null]);
+
+        return response()->json([
+            'ok'       => true,
+            'remarque' => $session->remarque,
+            'message'  => 'Remarque enregistrée.',
+        ]);
+    }
+
+    // -----------------------------------------------------------------
+    // Alarme
     // -----------------------------------------------------------------
 
     public function definirAlarme(Request $request, Session $session): JsonResponse
@@ -407,26 +461,6 @@ class WifiController extends Controller
         return response()->json(['ok' => true]);
     }
 
-    public function enregistrerRemarque(Request $request, Session $session): JsonResponse
-    {
-        if ($session->type_session !== 'wifi') {
-            return response()->json(['ok' => false, 'message' => 'Session non Wi-Fi.'], 422);
-        }
-
-        $data = $request->validate([
-            'remarque' => ['nullable', 'string', 'max:1000'],
-        ]);
-
-        $texte = isset($data['remarque']) ? trim((string) $data['remarque']) : null;
-        $session->update(['remarque' => $texte !== '' ? $texte : null]);
-
-        return response()->json([
-            'ok'       => true,
-            'remarque' => $session->remarque,
-            'message'  => 'Remarque enregistrée.',
-        ]);
-    }
-
     // -----------------------------------------------------------------
     // Comptes HotSpot
     // -----------------------------------------------------------------
@@ -514,10 +548,6 @@ class WifiController extends Controller
     // Helpers
     // -----------------------------------------------------------------
 
-    /**
-     * Synchro opportuniste : seulement si la dernière a plus de 2 s.
-     * Le verrou et la protection anti-chevauchement sont dans le service.
-     */
     private function syncSilencieuse(): void
     {
         try {
@@ -537,14 +567,15 @@ class WifiController extends Controller
             'urlEtat'             => route('wifi.etat'),
             'urlSession'          => url('/wifi/session'),
             'urlSupprimerMasse'   => route('wifi.session.supprimer-masse'),
-            'urlReglagesGet'      => route('wifi.alarme.index'),      // ← GET
-            'urlReglagesSave'     => route('wifi.alarme.reglages'),   // ← POST
+            'urlReglagesGet'      => route('wifi.alarme.index'),
+            'urlReglagesSave'     => route('wifi.alarme.reglages'),
             'urlUploaderSon'      => route('wifi.alarme.son'),
             'urlChoisirSon'       => route('wifi.alarme.son.choisir'),
             'urlSupprimerSon'     => route('wifi.alarme.son.supprimer'),
             'urlReinitialiser'    => route('wifi.alarme.reinitialiser'),
             'urlHotspot'          => route('hotspot.index'),
             'urlRemarque'         => url('/wifi/session'),
+            'urlContinuer'        => url('/wifi/session'),
             'csrf'                => csrf_token(),
         ];
     }
@@ -563,11 +594,8 @@ class WifiController extends Controller
             ->orderByDesc('date_heure_debut')
             ->get();
 
-        // Badge "Client encore connecté" : info publiée par la synchro (aucun appel
-        // MikroTik ici). null = inconnu/périmé → aucun badge.
         $macsActives = $this->wifiSessions->macsEncoreActives();
 
-        // Une MAC qui a déjà une session ouverte ne doit pas marquer d'anciennes lignes "Terminé".
         $macsOuvertes = $sessions
             ->filter(fn ($s) => $s->etat_wifi !== Session::WIFI_TERMINE)
             ->map(fn ($s) => AppareilWifi::normaliserMac($s->client_mac))
@@ -575,7 +603,7 @@ class WifiController extends Controller
             ->unique()
             ->all();
 
-        $dejaMarquees = [];   // un seul badge par MAC : le "Terminé" le plus récent
+        $dejaMarquees = [];
         $lignes = [];
 
         foreach ($sessions as $s) {
@@ -678,11 +706,6 @@ class WifiController extends Controller
         ];
     }
 
-    /**
-     * Vouchers disponibles = temporaires, état "disponible", sans session
-     * active en cours. On EXCLUT explicitement tout voucher dont une session
-     * Wi-Fi est actuellement "en_cours".
-     */
     private function vouchersDisponibles(): array
     {
         $usernamesActifs = Session::where('type_session', 'wifi')

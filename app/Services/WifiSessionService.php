@@ -16,63 +16,28 @@ class WifiSessionService
     private const CLE_DERNIERE_SYNC   = 'wifi_sync_derniere_tentative';
     private const CLE_ETAT_ROUTEUR    = 'wifi_sync_etat_routeur';
     private const CLE_MACS_ACTIVES    = 'wifi_sync_macs_actives';
-    /** Au-delà de cet âge (s), la liste des MAC présentes est jugée périmée. */
     private const MACS_ACTIVES_AGE_MAX = 20;
     private const PREFIXE_ABSENCE     = 'wifi_absence_session_';
     private const PREFIXE_MAC_SANS_FIL = 'wifi_mac_sans_fil_';
     private const PREFIXE_APPAREIL    = 'wifi_appareil_rafraichi_';
     private const PREFIXE_VOLUME_BASE = 'wifi_volume_base_session_';
 
-    /**
-     * Seuils de confirmation d'une absence : 1 synchro, 0 seconde.
-     *
-     * Pourquoi si bas : la fiabilité ne vient plus de l'attente mais de la
-     * RELECTURE DE CONFIRMATION faite dans la même synchro (voir
-     * marquerSessionsDisparues() / relireEtatActuel()) : avant de déclarer un
-     * client absent, on relit /ip/hotspot/active ET la table d'enregistrement
-     * Wi-Fi ~300 ms plus tard. Il faut que les DEUX lectures concordent.
-     * Si la relecture échoue ou si la table Wi-Fi est indisponible, on ne
-     * déconnecte rien. Le délai de détection devient celui de la cadence des
-     * synchros (≈ 2 s) au lieu de 2 synchros + 3 s.
-     *
-     * (Les constantes restent là pour pouvoir durcir la règle sans toucher
-     * au code : ex. ABSENCE_SYNCS_MIN = 2 si un réseau Wi-Fi instable pose
-     * problème.)
-     */
     private const ABSENCE_SYNCS_MIN = 1;
     private const ABSENCE_SECONDES_MIN = 0;
-
-    /** Pause avant la relecture de confirmation (microsecondes) : 300 ms. */
     private const RELECTURE_PAUSE_US = 300000;
 
-    /** États d'une session "vivante" (par opposition à terminée). */
     private const ETATS_OUVERTS = [
         Session::WIFI_CONNECTE,
         Session::WIFI_DECONNECTE,
         Session::WIFI_EN_PAUSE,
     ];
 
-    /**
-     * Une connexion MikroTik qui a commencé au plus tard N secondes après
-     * l'arrêt d'une session terminée est considérée comme LA MÊME connexion
-     * (le client n'a jamais été déconnecté). Au-delà : nouvelle connexion.
-     */
-    private const TOLERANCE_FIN_SECONDES = 5;
-
     private ?array $baux = null;
-    private ?array $regTable = null;   // null = table Wi-Fi indisponible
+    private ?array $regTable = null;
     private ?array $wireless = null;
 
     public function __construct(private MikroTikService $mikroTik) {}
 
-    // -----------------------------------------------------------------
-    // Points d'entrée
-    // -----------------------------------------------------------------
-
-    /**
-     * Synchronise seulement si la dernière tentative est assez ancienne.
-     * Si le routeur est en panne, on réessaie moins souvent (évite de bloquer la page).
-     */
     public function synchroniserSiNecessaire(int $ageMaxSecondes = 2): ?array
     {
         $etat = Cache::get(self::CLE_ETAT_ROUTEUR);
@@ -88,10 +53,6 @@ class WifiSessionService
         return $this->synchroniser();
     }
 
-    /**
-     * Synchronisation protégée par un verrou unique (page Wi-Fi, page HotSpot,
-     * cron et bouton manuel passent tous par ici).
-     */
     public function synchroniser(): array
     {
         $verrou = Cache::lock(self::CLE_VERROU, 30);
@@ -107,7 +68,6 @@ class WifiSessionService
         }
     }
 
-    /** État de la dernière synchro (pour afficher un avertissement si MikroTik ne répond plus). */
     public function etatSynchro(): array
     {
         $e = Cache::get(self::CLE_ETAT_ROUTEUR);
@@ -119,35 +79,18 @@ class WifiSessionService
         ];
     }
 
-    /**
-     * MAC (normalisées) actuellement présentes d'après la dernière synchro réussie.
-     * Retourne null si l'information est inconnue ou périmée (routeur muet,
-     * synchro trop ancienne) : l'appelant ne doit alors afficher AUCUN badge.
-     *
-     * @return string[]|null
-     */
     public function macsEncoreActives(): ?array
     {
         $etat = Cache::get(self::CLE_ETAT_ROUTEUR);
-        if (is_array($etat) && empty($etat['ok'])) {
-            return null;
-        }
+        if (is_array($etat) && empty($etat['ok'])) return null;
 
         $d = Cache::get(self::CLE_MACS_ACTIVES);
-        if (!is_array($d) || !isset($d['at'], $d['macs'])) {
-            return null;
-        }
+        if (!is_array($d) || !isset($d['at'], $d['macs'])) return null;
 
-        if ((now()->getTimestamp() - (int) $d['at']) > self::MACS_ACTIVES_AGE_MAX) {
-            return null;
-        }
+        if ((now()->getTimestamp() - (int) $d['at']) > self::MACS_ACTIVES_AGE_MAX) return null;
 
         return (array) $d['macs'];
     }
-
-    // -----------------------------------------------------------------
-    // Cœur de la synchro
-    // -----------------------------------------------------------------
 
     private function executerSynchro(): array
     {
@@ -160,7 +103,6 @@ class WifiSessionService
         try {
             $actives = $this->mikroTik->listHotspotActive();
         } catch (\Throwable $e) {
-            // Routeur injoignable : on ne touche à AUCUNE session (pas de fausse déconnexion).
             Log::warning('Sync Wi-Fi : MikroTik injoignable', ['error' => $e->getMessage()]);
             Cache::put(self::CLE_ETAT_ROUTEUR, [
                 'ok' => false, 'at' => now()->getTimestamp(), 'erreur' => $e->getMessage(),
@@ -175,29 +117,23 @@ class WifiSessionService
 
         $this->chargerPresenceSansFil();
 
-        // Un appareil physique = une seule connexion réelle : si MikroTik garde
-        // plusieurs entrées pour la même MAC, on ne retient que la plus récente.
         $actives = $this->actifsCanoniques($actives);
 
-        $ouvertes     = 0;
-        $maj          = 0;
-        $idsPresents  = [];
-        $macsPresentes = [];   // MAC réellement présentes (pour le badge "Client encore connecté")
+        $ouvertes      = 0;
+        $maj           = 0;
+        $idsPresents   = [];
+        $macsPresentes = [];
 
         foreach ($actives as $active) {
             $activeId = $active['.id'] ?? null;
-            if (!$activeId) {
-                continue;
-            }
+            if (!$activeId) continue;
 
             $present = $this->estPresent($active);
             if ($present) {
                 $idsPresents[] = $activeId;
 
                 $macPresente = AppareilWifi::normaliserMac($active['mac-address'] ?? null);
-                if ($macPresente) {
-                    $macsPresentes[] = $macPresente;
-                }
+                if ($macPresente) $macsPresentes[] = $macPresente;
             }
 
             try {
@@ -222,12 +158,6 @@ class WifiSessionService
         return ['ouvertes' => $ouvertes, 'maj' => $maj, 'fermees' => $fermees, 'erreur' => null];
     }
 
-    /**
-     * Ramène les entrées actives à UNE par appareil (MAC).
-     * Si plusieurs entrées partagent la même MAC, la plus récente (plus petit
-     * uptime) est la connexion réelle ; les autres sont des restes ignorés.
-     * Les entrées sans MAC valide sont conservées telles quelles.
-     */
     private function actifsCanoniques(array $actives): array
     {
         $resultat = [];
@@ -250,7 +180,6 @@ class WifiSessionService
                 Log::info('Sync Wi-Fi : plusieurs entrées MikroTik pour une même MAC, la plus récente est retenue', [
                     'mac'     => $mac,
                     'retenue' => $liste[0]['.id'] ?? null,
-                    'ignores' => array_map(fn ($x) => $x['.id'] ?? null, array_slice($liste, 1)),
                 ]);
             }
             $resultat[] = $liste[0];
@@ -259,11 +188,6 @@ class WifiSessionService
         return $resultat;
     }
 
-    /**
-     * Charge la liste des téléphones réellement accrochés à l'antenne.
-     * Mémorise aussi quelles MAC sont "sans fil" : seules celles-là pourront
-     * être jugées absentes via cette table (les postes en câble ne sont jamais touchés).
-     */
     private function chargerPresenceSansFil(): void
     {
         $this->regTable = null;
@@ -272,46 +196,27 @@ class WifiSessionService
             $table = [];
             foreach ($this->mikroTik->listWirelessRegistrationTable() as $r) {
                 $m = AppareilWifi::normaliserMac($r['mac-address'] ?? null);
-                if (!$m) {
-                    continue;
-                }
+                if (!$m) continue;
                 $table[$m] = $r;
                 Cache::add(self::PREFIXE_MAC_SANS_FIL . str_replace(':', '', $m), 1, 604800);
             }
             $this->regTable = $table;
         } catch (\Throwable $e) {
-            // Table indisponible (autre type de Wi-Fi, erreur...) : on ne conclut rien.
             $this->regTable = null;
         }
     }
 
-    /**
-     * Le client est-il vraiment là ?
-     * Absent seulement si : table Wi-Fi lue avec succès + MAC déjà connue comme
-     * "sans fil" + MAC absente de la table maintenant.
-     * Dans tous les autres cas (doute) : on le considère présent.
-     */
     private function estPresent(array $active): bool
     {
-        if ($this->regTable === null) {
-            return true;
-        }
+        if ($this->regTable === null) return true;
 
         $mac = AppareilWifi::normaliserMac($active['mac-address'] ?? null);
-        if (!$mac) {
-            return true;
-        }
+        if (!$mac) return true;
 
-        if (isset($this->regTable[$mac])) {
-            return true;
-        }
+        if (isset($this->regTable[$mac])) return true;
 
         return !Cache::has(self::PREFIXE_MAC_SANS_FIL . str_replace(':', '', $mac));
     }
-
-    // -----------------------------------------------------------------
-    // Rattachement d'une entrée active à une session (anti-doublons)
-    // -----------------------------------------------------------------
 
     private function traiterActive(array $active, bool $present): ?string
     {
@@ -319,36 +224,36 @@ class WifiSessionService
         $mac      = AppareilWifi::normaliserMac($active['mac-address'] ?? null);
         $username = (($active['user'] ?? '') !== '') ? $active['user'] : null;
 
-        // 1) Session OUVERTE qui correspond à cette connexion
-        //    (même .id, ou même appareil + même voucher après un nouvel .id).
+        // 1) Session OUVERTE correspondante
         $candidats = $this->sessionsOuvertesCorrespondantes($active, $activeId, $mac, $username);
 
         if ($candidats->isNotEmpty()) {
-            $session  = $candidats->first();      // la plus ancienne = celle qu'on garde
+            $session  = $candidats->first();
             $doublons = $candidats->slice(1);
 
             if ($doublons->isNotEmpty()) {
                 $this->fusionner($session, $doublons);
             }
 
-            if (!$present) {
-                // Entrée "fantôme" gardée par MikroTik : on n'y touche pas,
-                // marquerSessionsDisparues() s'occupe de l'absence.
-                return null;
-            }
+            if (!$present) return null;
 
             $this->mettreAJour($session, $active);
             return 'maj';
         }
 
-        if (!$present) {
-            return null; // ne pas créer de session pour un fantôme
-        }
+        if (!$present) return null;
 
-        // 2) Aucune session ouverte. Cette connexion est-elle celle d'une session
-        //    déjà TERMINÉE (figée) ? Alors le client n'a jamais été déconnecté :
-        //    on ne crée rien, la ligne "Terminé" reste telle quelle.
-        if ($this->connexionDejaTerminee($active, $activeId, $mac, $username)) {
+        // 2) Aucune session ouverte. Si une session TERMINÉE existe pour le
+        //    même appareil + voucher, on rattache le nouvel .id SANS créer
+        //    de nouvelle ligne. L'état reste "terminé" : le responsable
+        //    décidera de cliquer "Continuer" ou de supprimer.
+        $terminee = $this->sessionTermineeARattacher($active, $activeId, $mac, $username);
+        if ($terminee) {
+            $terminee->mikrotik_active_id = $activeId;
+            $terminee->client_ip = $active['address'] ?? $terminee->client_ip;
+            $terminee->client_mac = $active['mac-address'] ?? $terminee->client_mac;
+            $terminee->derniere_sync_at = now();
+            $terminee->save();
             return null;
         }
 
@@ -357,12 +262,6 @@ class WifiSessionService
         return 'ouverte';
     }
 
-    /**
-     * Sessions ouvertes qui représentent cette même connexion réelle,
-     * de la plus ancienne à la plus récente.
-     *
-     * @return Collection<int, Session>
-     */
     private function sessionsOuvertesCorrespondantes(array $active, string $activeId, ?string $mac, ?string $username): Collection
     {
         $limite = now()->subMinutes($this->fenetreRepriseMinutes());
@@ -372,12 +271,8 @@ class WifiSessionService
             ->orderBy('id')
             ->get()
             ->filter(function (Session $s) use ($activeId, $mac, $username, $limite) {
-                if (!$this->correspond($s, $activeId, $mac, $username)) {
-                    return false;
-                }
+                if (!$this->correspond($s, $activeId, $mac, $username)) return false;
 
-                // Reprise par MAC (nouvel .id) : seulement si la déconnexion est récente.
-                // Un retour plusieurs heures plus tard = nouvelle session.
                 $memeId = (string) $s->mikrotik_active_id === (string) $activeId;
                 if (!$memeId
                     && $s->etat_wifi === Session::WIFI_DECONNECTE
@@ -385,40 +280,29 @@ class WifiSessionService
                     && $s->deconnecte_at->lt($limite)) {
                     return false;
                 }
-
                 return true;
             })
             ->values();
     }
 
-    /**
-     * Une session TERMINÉE correspond-elle à la connexion en cours, c'est-à-dire
-     * la connexion MikroTik a-t-elle commencé AVANT l'arrêt de cette session ?
-     */
-    private function connexionDejaTerminee(array $active, string $activeId, ?string $mac, ?string $username): bool
+    private function sessionTermineeARattacher(array $active, string $activeId, ?string $mac, ?string $username): ?Session
     {
-        $debutConnexion = now()->getTimestamp() - $this->parseUptime($active['uptime'] ?? '0s');
+        if ($mac === null) return null;
 
         $terminees = $this->requeteParIdOuMac($activeId, $active, [Session::WIFI_TERMINE])
-            ->whereNotNull('date_heure_fin_reelle')
             ->orderByDesc('date_heure_fin_reelle')
-            ->limit(10)
+            ->orderByDesc('id')
+            ->limit(5)
             ->get();
 
         foreach ($terminees as $t) {
-            if (!$this->correspond($t, $activeId, $mac, $username)) {
-                continue;
-            }
-
-            if ($debutConnexion <= $t->date_heure_fin_reelle->getTimestamp() + self::TOLERANCE_FIN_SECONDES) {
-                return true;
+            if ($this->correspond($t, $activeId, $mac, $username)) {
+                return $t;
             }
         }
-
-        return false;
+        return null;
     }
 
-    /** Pré-filtre SQL : même .id actif OU même MAC (brute ou normalisée). */
     private function requeteParIdOuMac(string $activeId, array $active, array $etats)
     {
         $macBrute = $active['mac-address'] ?? null;
@@ -435,12 +319,6 @@ class WifiSessionService
             });
     }
 
-    /**
-     * Critères combinés (aucun ne suffit seul) :
-     *  - même .id actif : accepté seulement si la MAC est cohérente
-     *    (protège contre la réutilisation d'un .id après redémarrage du routeur) ;
-     *  - sinon : même MAC ET même voucher (username).
-     */
     private function correspond(Session $s, string $activeId, ?string $mac, ?string $username): bool
     {
         $macSession = AppareilWifi::normaliserMac($s->client_mac);
@@ -449,9 +327,7 @@ class WifiSessionService
             return $mac === null || $macSession === null || $macSession === $mac;
         }
 
-        if ($mac === null || $macSession !== $mac) {
-            return false;
-        }
+        if ($mac === null || $macSession !== $mac) return false;
 
         return (($s->hotspot_username ?: null) === $username);
     }
@@ -461,13 +337,6 @@ class WifiSessionService
         return max(1, (int) config('mikrotik.wifi_reprise_minutes', 60));
     }
 
-    /**
-     * Fusionne des doublons opérationnels dans la session conservée.
-     * On garde la plus ancienne (date de début d'origine) ; si elle n'a pas
-     * d'alarme et qu'un doublon en a une, l'alarme est reprise.
-     *
-     * @param Collection<int, Session> $doublons
-     */
     private function fusionner(Session $garde, Collection $doublons): void
     {
         foreach ($doublons as $d) {
@@ -480,12 +349,13 @@ class WifiSessionService
                     $garde->{$champ} = $d->{$champ};
                 }
             }
+            if (empty($garde->remarque) && !empty($d->remarque)) {
+                $garde->remarque = $d->remarque;
+            }
 
             Log::info('Sync Wi-Fi : doublon de session fusionné', [
                 'garde'    => $garde->id,
                 'supprime' => $d->id,
-                'mac'      => $d->client_mac,
-                'voucher'  => $d->hotspot_username,
             ]);
 
             Cache::forget(self::PREFIXE_ABSENCE . $d->id);
@@ -493,14 +363,8 @@ class WifiSessionService
             $d->delete();
         }
 
-        if ($garde->isDirty()) {
-            $garde->save();
-        }
+        if ($garde->isDirty()) $garde->save();
     }
-
-    // -----------------------------------------------------------------
-    // Création / mise à jour
-    // -----------------------------------------------------------------
 
     private function creer(array $active): Session
     {
@@ -542,7 +406,6 @@ class WifiSessionService
             'derniere_sync_at'      => now(),
         ], $this->calculerVolumes($active)));
 
-        // Le voucher passe "en cours" tout de suite : il disparaît de la liste "disponibles".
         if ($voucher) {
             try {
                 $voucher->marquerEnCours($appareil);
@@ -559,12 +422,8 @@ class WifiSessionService
 
     private function mettreAJour(Session $session, array $active): void
     {
-        // Le client est bien là : on efface tout compteur d'absence en cours.
         Cache::forget(self::PREFIXE_ABSENCE . $session->id);
 
-        // Reconnexion avec un nouvel .id MikroTik : la session adopte la nouvelle
-        // entrée et on mémorise le volume déjà cumulé (les compteurs MikroTik
-        // repartent de zéro).
         $nouvelId = $active['.id'] ?? null;
         if ($nouvelId && (string) $session->mikrotik_active_id !== (string) $nouvelId) {
             Cache::put(self::PREFIXE_VOLUME_BASE . $session->id, [
@@ -585,7 +444,6 @@ class WifiSessionService
             $session->reconnecte_at = now();
             $session->deconnecte_at = null;
 
-            // Reprendre l'alarme si elle était en pause
             if ($session->alarme_active && $session->alarme_secondes_restantes > 0) {
                 $session->alarme_fin_prevue = now()->addSeconds($session->alarme_secondes_restantes);
                 $session->alarme_secondes_restantes = null;
@@ -596,7 +454,6 @@ class WifiSessionService
         $session->client_mac       = $active['mac-address'] ?? $session->client_mac;
         $session->derniere_sync_at = now();
 
-        // Infos de l'appareil : rafraîchies au plus une fois par minute (évite DHCP + écriture à chaque synchro)
         $mac = AppareilWifi::normaliserMac($active['mac-address'] ?? null);
         $rafraichir = !$session->appareil_wifi_id
             || ($mac && Cache::add(self::PREFIXE_APPAREIL . str_replace(':', '', $mac), 1, 60));
@@ -624,19 +481,6 @@ class WifiSessionService
         $session->save();
     }
 
-    // -----------------------------------------------------------------
-    // Détection des départs (avec relecture de confirmation)
-    // -----------------------------------------------------------------
-
-    /**
-     * Sessions "connecté" dont le client n'est plus présent.
-     *
-     * Pour chaque candidat, une RELECTURE de confirmation (une seule pour tous,
-     * faite seulement s'il y a au moins un candidat) vérifie que le client est
-     * toujours absent. Si la relecture est impossible (MikroTik muet), on ne
-     * déconnecte personne. L'heure de déconnexion retenue est celle de la
-     * première absence constatée.
-     */
     private function marquerSessionsDisparues(array $idsPresents): int
     {
         $query = Session::where('type_session', 'wifi')
@@ -648,17 +492,10 @@ class WifiSessionService
         }
 
         $candidats = $query->get();
+        if ($candidats->isEmpty()) return 0;
 
-        if ($candidats->isEmpty()) {
-            return 0;
-        }
-
-        // Relecture unique, partagée par tous les candidats.
         $relecture = $this->relireEtatActuel();
-
-        if ($relecture === null) {
-            return 0; // doute : aucune fausse déconnexion
-        }
+        if ($relecture === null) return 0;
 
         $n = 0;
         $maintenant = now()->getTimestamp();
@@ -666,24 +503,20 @@ class WifiSessionService
         foreach ($candidats as $s) {
             $cle = self::PREFIXE_ABSENCE . $s->id;
 
-            // La seconde lecture le revoit : fausse alerte, on oublie.
             if ($this->sessionEncorePresente($s, $relecture)) {
                 Cache::forget($cle);
                 continue;
             }
 
             $abs = Cache::get($cle);
-
-            if (!is_array($abs)) {
-                $abs = ['depuis' => $maintenant, 'n' => 0];
-            }
+            if (!is_array($abs)) $abs = ['depuis' => $maintenant, 'n' => 0];
 
             $abs['n'] = (int) $abs['n'] + 1;
             Cache::put($cle, $abs, 120);
 
             if ($abs['n'] < self::ABSENCE_SYNCS_MIN
                 || ($maintenant - (int) $abs['depuis']) < self::ABSENCE_SECONDES_MIN) {
-                continue; // pas encore confirmé
+                continue;
             }
 
             $moment = Carbon::createFromTimestamp((int) $abs['depuis']);
@@ -693,7 +526,6 @@ class WifiSessionService
             $s->derniere_sync_at = now();
             $s->duree_consommee  = (int) floor($s->secondesConsommees() / 60);
 
-            // Alarme en pause : le temps restant est figé à l'instant du départ
             if ($s->alarme_active && $s->alarme_fin_prevue) {
                 $restant = $s->alarme_fin_prevue->getTimestamp() - $moment->getTimestamp();
                 if ($restant > 0) {
@@ -710,14 +542,6 @@ class WifiSessionService
         return $n;
     }
 
-    /**
-     * Seconde lecture : liste active + table Wi-Fi, après une courte pause.
-     * Retourne null si la liste active est illisible (on ne conclut rien).
-     * Une table Wi-Fi illisible donne 'reg' = null : estPresent() répondra
-     * alors "présent" (comportement prudent, inchangé).
-     *
-     * @return array{actives: array, reg: ?array}|null
-     */
     private function relireEtatActuel(): ?array
     {
         usleep(self::RELECTURE_PAUSE_US);
@@ -733,9 +557,7 @@ class WifiSessionService
             $reg = [];
             foreach ($this->mikroTik->listWirelessRegistrationTable() as $r) {
                 $m = AppareilWifi::normaliserMac($r['mac-address'] ?? null);
-                if ($m) {
-                    $reg[$m] = $r;
-                }
+                if ($m) $reg[$m] = $r;
             }
         } catch (\Throwable $e) {
             $reg = null;
@@ -744,10 +566,6 @@ class WifiSessionService
         return ['actives' => $actives, 'reg' => $reg];
     }
 
-    /**
-     * La session est-elle toujours représentée, à la relecture, par une entrée
-     * active ET présente sur l'antenne ? Même critère que l'anti-doublons (P2).
-     */
     private function sessionEncorePresente(Session $s, array $relecture): bool
     {
         $ancienneTable  = $this->regTable;
@@ -756,9 +574,7 @@ class WifiSessionService
         try {
             foreach ($relecture['actives'] as $a) {
                 $id = (string) ($a['.id'] ?? '');
-                if ($id === '') {
-                    continue;
-                }
+                if ($id === '') continue;
 
                 $mac      = AppareilWifi::normaliserMac($a['mac-address'] ?? null);
                 $username = (($a['user'] ?? '') !== '') ? $a['user'] : null;
@@ -774,10 +590,6 @@ class WifiSessionService
         return false;
     }
 
-    // -----------------------------------------------------------------
-    // Résolution SSID / appareil
-    // -----------------------------------------------------------------
-
     private function resoudreSsid(array $active): ?string
     {
         $mac = AppareilWifi::normaliserMac($active['mac-address'] ?? null);
@@ -788,18 +600,14 @@ class WifiSessionService
 
             if ($iface) {
                 $wifi = $this->wirelessPourInterface($iface);
-                if (!empty($wifi['ssid'])) {
-                    return mb_substr($wifi['ssid'], 0, 64);
-                }
+                if (!empty($wifi['ssid'])) return mb_substr($wifi['ssid'], 0, 64);
             }
         }
 
         $serveur = $active['server'] ?? null;
         if ($serveur) {
             $table = config('mikrotik.ssid_map', []);
-            if (isset($table[$serveur])) {
-                return mb_substr($table[$serveur], 0, 64);
-            }
+            if (isset($table[$serveur])) return mb_substr($table[$serveur], 0, 64);
         }
 
         $defaut = config('mikrotik.ssid_default');
