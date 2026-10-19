@@ -407,6 +407,26 @@ class WifiController extends Controller
         return response()->json(['ok' => true]);
     }
 
+    public function enregistrerRemarque(Request $request, Session $session): JsonResponse
+    {
+        if ($session->type_session !== 'wifi') {
+            return response()->json(['ok' => false, 'message' => 'Session non Wi-Fi.'], 422);
+        }
+
+        $data = $request->validate([
+            'remarque' => ['nullable', 'string', 'max:1000'],
+        ]);
+
+        $texte = isset($data['remarque']) ? trim((string) $data['remarque']) : null;
+        $session->update(['remarque' => $texte !== '' ? $texte : null]);
+
+        return response()->json([
+            'ok'       => true,
+            'remarque' => $session->remarque,
+            'message'  => 'Remarque enregistrée.',
+        ]);
+    }
+
     // -----------------------------------------------------------------
     // Comptes HotSpot
     // -----------------------------------------------------------------
@@ -524,6 +544,7 @@ class WifiController extends Controller
             'urlSupprimerSon'     => route('wifi.alarme.son.supprimer'),
             'urlReinitialiser'    => route('wifi.alarme.reinitialiser'),
             'urlHotspot'          => route('hotspot.index'),
+            'urlRemarque'         => url('/wifi/session'),
             'csrf'                => csrf_token(),
         ];
     }
@@ -612,6 +633,7 @@ class WifiController extends Controller
                 ? (int) $s->montant_total
                 : null,
             'client_encore_actif' => $clientEncoreActif,
+            'remarque'         => $s->remarque,
             'deconnecte_at'    => $s->deconnecte_at?->toIso8601String(),
             'pause_at'         => $s->pause_at?->toIso8601String(),
             'secondes_hors_ligne' => (int) $s->duree_hors_ligne_secondes,

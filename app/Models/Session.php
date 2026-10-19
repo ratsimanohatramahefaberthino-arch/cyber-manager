@@ -31,6 +31,7 @@ class Session extends Model
         'alarme_active', 'alarme_type', 'alarme_duree_minutes', 'alarme_montant',
         'alarme_fin_prevue', 'alarme_declenchee_at', 'alarme_message',
         'alarme_historique', 'alarme_secondes_restantes',
+        'remarque',
     ];
 
     protected $casts = [

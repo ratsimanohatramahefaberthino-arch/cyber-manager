@@ -7,7 +7,8 @@
 <div x-data="wifiPage({{ Illuminate\Support\Js::from($cfg) }})" x-init="init()">
 
     {{-- ═══ FENÊTRE D'ALARME PERSISTANTE ═══ --}}
-    <div x-show="fenetresAlarme.length > 0" x-cloak class="fixed inset-0 z-[200] flex items-center justify-center p-4 bg-slate-900/80">
+    <template x-teleport="body">
+    <div x-show="fenetresAlarme.length > 0" x-cloak class="fixed inset-0 z-[9100] flex items-center justify-center p-4 bg-slate-900/80">
         <div class="w-full max-w-2xl space-y-3 max-h-[90vh] overflow-y-auto">
             <template x-for="f in fenetresAlarme" :key="f.id">
                 <div class="rounded-2xl bg-white shadow-2xl border-4 border-rose-500 overflow-hidden">
@@ -71,6 +72,7 @@
             </template>
         </div>
     </div>
+    </template>
 
     {{-- En-tête --}}
     <div class="mb-6 flex flex-wrap items-center justify-between gap-3">
@@ -165,17 +167,18 @@
         <div class="max-h-[62vh] overflow-y-auto">
             <table class="w-full table-fixed text-sm">
                 <colgroup>
-                    <col style="width: 50px">
+                    <col style="width: 40px">
+                    <col style="width: 78px">
+                    <col style="width: 200px">
+                    <col style="width: 110px">
+                    <col style="width: 80px">
+                    <col style="width: 110px">
+                    <col style="width: 120px">
                     <col style="width: 90px">
-                    <col>
-                    <col style="width: 140px">
-                    <col style="width: 95px">
-                    <col style="width: 125px">
+                    <col style="width: 160px">
                     <col style="width: 130px">
-                    <col style="width: 105px">
-                    <col style="width: 220px">
                 </colgroup>
-                <thead class="sticky top-0 z-10 bg-slate-800 text-left text-xs font-semibold uppercase tracking-wide text-white">
+                <thead class="sticky top-0 z-[5] bg-slate-800 text-left text-xs font-semibold uppercase tracking-wide text-white">
                     <tr>
                         <th class="px-2 py-2.5 text-center">
                             <input type="checkbox" :checked="tousSelectionnes" @change="basculerTous()"
@@ -194,13 +197,14 @@
                         <th class="px-2 py-2.5">Durée / Montant</th>
                         <th class="px-2 py-2.5">Volume / Débit</th>
                         <th class="px-2 py-2.5 text-center">Alarme</th>
+                        <th class="px-2 py-2.5">Remarques</th>
                         <th class="px-2 py-2.5 text-right">Actions</th>
                     </tr>
                 </thead>
                 <tbody>
                     <template x-if="lignesAffichees.length === 0">
                         <tr>
-                            <td colspan="9" class="px-4 py-16 text-center text-slate-400 text-base">
+                            <td colspan="10" class="px-4 py-16 text-center text-slate-400 text-base">
                                 <span x-show="recherche">Aucun résultat.</span>
                                 <span x-show="!recherche">Aucune session Wi-Fi.</span>
                             </td>
@@ -320,8 +324,17 @@
                                     </button>
                                 </template>
                             </td>
+                            {{-- Remarques : zone toujours éditable, sauvegarde au blur --}}
                             <td class="px-2 py-2.5">
-                                <div class="flex items-center justify-end gap-1.5">
+                                <textarea x-model="l.remarque"
+                                          @focus="l._focusRemarque = true"
+                                          @blur="l._focusRemarque = false; sauverRemarque(l)"
+                                          rows="3" maxlength="1000"
+                                          placeholder="Tapez une remarque…"
+                                          class="w-full text-xs rounded border border-slate-200 px-2 py-1.5 focus:border-slate-800 focus:outline-none resize-y min-h-[64px] bg-white"></textarea>
+                            </td>
+                            <td class="px-2 py-2.5">
+                                <div class="flex flex-col items-stretch gap-1">
                                     {{-- ARRÊTER : fige durée + montant (le client reste connecté) --}}
                                     <template x-if="l.etat_appareil === 'connecte' || l.etat_appareil === 'deconnecte'">
                                         <button type="button" @click="confirmerArret(l)"
@@ -416,7 +429,8 @@
     <p class="mt-3 text-sm text-slate-400">Actualisation temps réel. Dernière sync : <span x-text="derniereSync || '—'"></span></p>
 
     {{-- ═══ Fenêtre de confirmation unique et dynamique ═══ --}}
-    <div x-show="confirmation.ouvert" x-cloak class="fixed inset-0 z-[300] flex items-center justify-center p-4">
+    <template x-teleport="body">
+    <div x-show="confirmation.ouvert" x-cloak class="fixed inset-0 z-[9200] flex items-center justify-center p-4">
         <div class="absolute inset-0 bg-slate-900/70" @click="confirmation.ouvert = false" x-transition.opacity></div>
         <div x-show="confirmation.ouvert" x-transition class="relative w-full max-w-lg overflow-hidden rounded-2xl bg-white shadow-2xl">
             <div class="flex items-start gap-3 border-b border-slate-100 px-6 pt-5 pb-4">
@@ -444,9 +458,11 @@
             </div>
         </div>
     </div>
+    </template>
 
     {{-- Modale Poser / Modifier alarme --}}
-    <div x-show="alarmeModal.ouvert" x-cloak class="fixed inset-0 z-[110] flex items-center justify-center p-4">
+    <template x-teleport="body">
+    <div x-show="alarmeModal.ouvert" x-cloak class="fixed inset-0 z-[9300] flex items-center justify-center p-4">
         <div class="absolute inset-0 bg-slate-900/60" @click="alarmeModal.ouvert = false" x-transition.opacity></div>
         <div x-show="alarmeModal.ouvert" x-transition class="relative w-full max-w-lg overflow-hidden rounded-2xl bg-white shadow-2xl">
             <div class="border-b border-slate-100 px-6 py-4">
@@ -537,9 +553,11 @@
             </div>
         </div>
     </div>
+    </template>
 
-    {{-- Modale Prolonger --}}
-    <div x-show="prolongerModal.ouvert" x-cloak class="fixed inset-0 z-[210] flex items-center justify-center p-4">
+     {{-- Modale Prolonger --}}
+    <template x-teleport="body">
+    <div x-show="prolongerModal.ouvert" x-cloak class="fixed inset-0 z-[9400] flex items-center justify-center p-4">
         <div class="absolute inset-0 bg-slate-900/60" @click="prolongerModal.ouvert = false" x-transition.opacity></div>
         <div x-show="prolongerModal.ouvert" x-transition class="relative w-full max-w-md overflow-hidden rounded-2xl bg-white shadow-2xl">
             <div class="border-b border-slate-100 px-6 py-4">
@@ -600,9 +618,11 @@
             </div>
         </div>
     </div>
+    </template>
 
     {{-- Modale Réglages --}}
-    <div x-show="reglages.ouvert" x-cloak class="fixed inset-0 z-[100] flex items-center justify-center p-4">
+    <template x-teleport="body">
+    <div x-show="reglages.ouvert" x-cloak class="fixed inset-0 z-[9300] flex items-center justify-center p-4">
         <div class="absolute inset-0 bg-slate-900/60" x-transition.opacity></div>
         <div x-show="reglages.ouvert" x-transition class="relative w-full max-w-3xl overflow-hidden rounded-2xl bg-white shadow-2xl">
             <div class="flex items-center justify-between border-b border-slate-100 px-6 py-4">
@@ -807,6 +827,7 @@
             </div>
         </div>
     </div>
+    </template>
 
     {{-- Modale confirmation suppression son --}}
     <div x-show="supprSonModal.ouvert" x-cloak class="fixed inset-0 z-[220] flex items-center justify-center p-4">
@@ -939,7 +960,16 @@ function wifiPage(cfg) {
                 const r = await fetch(cfg.urlEtat, { headers: { 'Accept': 'application/json' } });
                 if (!r.ok) return;
                 const d = await r.json();
-                this.lignes = d.lignes ?? [];
+                const anciens = new Map(this.lignes.map(x => [x.id, x]));
+                this.lignes = (d.lignes ?? []).map(nl => {
+                    const old = anciens.get(nl.id);
+                    if (old && old._focusRemarque) {
+                        // L'utilisateur est en train de taper : on garde sa valeur.
+                        nl.remarque = old.remarque;
+                        nl._focusRemarque = true;
+                    }
+                    return nl;
+                });
                 this.stats = d.stats ?? this.stats;
                 this.mettreAJourVouchers(d.vouchers_disponibles ?? []);
                 this.derniereSync = new Date().toLocaleTimeString('fr-FR');
@@ -1375,6 +1405,30 @@ function wifiPage(cfg) {
             }
             window.dispatchEvent(new CustomEvent('toast', { detail: d.message }));
             await this.rafraichir();
+        },
+
+        // Remarques (édition inline)
+        async sauverRemarque(l) {
+            const val = (l.remarque || '').trim();
+            // Rien à sauver si inchangé
+            if ((l._derniereRemarque ?? null) === val) return;
+            try {
+                const r = await window.cmFetch(`${cfg.urlRemarque}/${l.id}/remarque`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ remarque: val || null }),
+                });
+                const d = await r.json();
+                if (!r.ok || !d.ok) {
+                    window.dispatchEvent(new CustomEvent('toast', { detail: d.message || 'Erreur.' }));
+                    return;
+                }
+                l.remarque = d.remarque;
+                l._editionRemarque = false;
+                window.dispatchEvent(new CustomEvent('toast', { detail: 'Remarque enregistrée.' }));
+            } catch (e) {
+                window.dispatchEvent(new CustomEvent('toast', { detail: 'Erreur réseau.' }));
+            }
         },
 
         demanderSuppressionMasse() {
@@ -1832,14 +1886,28 @@ function wifiPage(cfg) {
             const key = l.id + '-' + sens;
             const volume = sens === 'entree' ? l.volume_entree : l.volume_sortie;
             const now = Date.now();
-            const c = this.volumeCache[key];
-            if (!c) { this.volumeCache[key] = { vol: volume, ts: now, mbps: 0 }; return '0 Ko/s'; }
-            const dOctets = volume - c.vol;
-            const dSec = (now - c.ts) / 1000;
-            if (dSec >= 1 && dOctets >= 0) {
-                c.mbps = (dOctets * 8) / (dSec * 1_000_000);
-                c.vol = volume;
-                c.ts = now;
+            let c = this.volumeCache[key];
+            if (!c) {
+                c = this.volumeCache[key] = { echantillons: [], mbps: 0, volActuel: volume };
+                return '0 Ko/s';
+            }
+            // Détection reset (compteur qui recule)
+            if (volume < c.volActuel) c.echantillons = [];
+            c.volActuel = volume;
+            // Ajouter un échantillon si volume bouge OU toutes les 2s
+            const dernier = c.echantillons[c.echantillons.length - 1];
+            if (!dernier || now - dernier.ts >= 2000 || volume !== dernier.vol) {
+                c.echantillons.push({ vol: volume, ts: now });
+                if (c.echantillons.length > 5) c.echantillons.shift();
+            }
+            // Calcul sur fenêtre glissante
+            if (c.echantillons.length >= 2) {
+                const premier = c.echantillons[0];
+                const dOctets = volume - premier.vol;
+                const dSec = (now - premier.ts) / 1000;
+                if (dSec >= 1 && dOctets >= 0) {
+                    c.mbps = (dOctets * 8) / (dSec * 1_000_000);
+                }
             }
             return this.formatDebit(c.mbps);
         },
