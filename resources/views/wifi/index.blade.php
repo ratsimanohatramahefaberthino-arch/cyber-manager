@@ -55,17 +55,15 @@
                                 </button>
                             </div>
                         </div>
-                        <div class="flex flex-wrap gap-3 border-t border-slate-100 pt-4">
+                        <div class="border-t border-slate-100 pt-4">
                             <button type="button" @click="acquitterAlarme(f)"
-                                    class="flex-1 min-w-[200px] rounded-xl bg-rose-600 px-6 py-4 text-lg font-bold text-white hover:bg-rose-500 shadow-lg active:scale-[0.98] transition">
+                                    class="w-full rounded-xl bg-rose-600 px-6 py-4 text-lg font-bold text-white hover:bg-rose-500 shadow-lg active:scale-[0.98] transition">
                                 <x-icone nom="bell" class="h-6 w-6 inline mr-2" />
                                 Arrêter l'alarme
                             </button>
-                            <button type="button" @click="arreterEtFermer(f)"
-                                    class="flex-1 min-w-[200px] rounded-xl border-2 border-slate-300 bg-white px-6 py-4 text-lg font-semibold text-slate-700 hover:bg-slate-50">
-                                <x-icone nom="ban" class="h-6 w-6 inline mr-2" />
-                                Arrêter la session
-                            </button>
+                            <p class="mt-2 text-sm text-center text-slate-500">
+                                La session continue. Utilisez « Arrêter » dans le tableau pour figer la durée/montant.
+                            </p>
                         </div>
                     </div>
                 </div>
@@ -284,24 +282,25 @@
                                 </div>
                             </td>
                             <td class="px-2 py-2.5 text-center">
-                                <template x-if="l.alarme.declenchee && !l.alarme.acquittee && l.etat_appareil !== 'termine'">
+                                {{-- 1) Alarme qui sonne (non acquittée) --}}
+                                <template x-if="l.alarme.active && l.alarme.declenchee && !l.alarme.acquittee && l.etat_appareil !== 'termine'">
                                     <span class="inline-flex items-center gap-1 rounded-full bg-rose-100 px-2 py-0.5 text-xs font-bold text-rose-700 animate-pulse">
                                         <x-icone nom="bell" class="h-3.5 w-3.5" /> Sonne
                                     </span>
                                 </template>
+
+                                {{-- 2) Alarme posée, en cours de décompte (toujours visible, à chaque prolongation) --}}
                                 <template x-if="l.alarme.active && !l.alarme.declenchee && l.etat_appareil !== 'termine'">
                                     <div class="space-y-1">
-                                        <!-- Si connecté, on affiche le chrono -->
                                         <template x-if="l.etat_appareil === 'connecte'">
                                             <div class="font-mono text-sm font-bold text-amber-700" x-text="chronoRestantTexte(l)"></div>
                                         </template>
-                                        <!-- Si déconnecté, on affiche que l'alarme est en pause -->
                                         <template x-if="l.etat_appareil !== 'connecte'">
                                             <div class="text-xs font-bold text-slate-500 flex items-center justify-center gap-1">
                                                 <x-icone nom="pause" class="h-3 w-3" /> Alarme en pause
                                             </div>
                                         </template>
-                                        
+
                                         <div class="h-1 w-full overflow-hidden rounded-full bg-slate-200">
                                             <div class="h-full bg-amber-500 transition-all"
                                                  :style="'width: ' + progressionAlarme(l) + '%'"></div>
@@ -314,10 +313,16 @@
                                         </div>
                                     </div>
                                 </template>
+
+                                {{-- 3) Session terminée (figée) --}}
                                 <template x-if="l.etat_appareil === 'termine'">
                                     <span class="text-xs text-slate-400">Session terminée</span>
                                 </template>
-                                <template x-if="!l.alarme.active && l.etat_appareil !== 'termine'">
+
+                                {{-- 4) Aucune alarme active → bouton « Poser »
+                                       Ce cas couvre AUSSI le retour après acquittement
+                                       (le backend remet alarme_active=false). --}}
+                                <template x-if="(!l.alarme.active || l.alarme.acquittee) && l.etat_appareil !== 'termine'">
                                     <button type="button" @click="ouvrirAlarme(l)"
                                             class="inline-flex items-center gap-1 rounded-md border border-slate-200 bg-white px-2 py-0.5 text-xs text-slate-600 hover:bg-slate-50">
                                         <x-icone nom="bell" class="h-3.5 w-3.5" /> Poser
@@ -1011,6 +1016,9 @@ function wifiPage(cfg) {
                     if (this.fenetresAlarme.find(f => f.id === l.id)) {
                         this.fermerFenetre(l.id);
                     }
+                    // Alarme inactive/terminée : on nettoie le marqueur de fermeture
+                    // pour qu'une future alarme puisse re-sonner.
+                    if (!l.alarme.active) this._alarmesFermees.delete(l.id);
                     return;
                 }
                 const fin = new Date(l.alarme.fin).getTime();
@@ -1021,6 +1029,8 @@ function wifiPage(cfg) {
                 }
                 if (this.now < fin && dejaDansListe) {
                     this.fermerFenetre(l.id);
+                    // Si la jauge est visible, on efface aussi le marqueur.
+                    this._alarmesFermees.delete(l.id);
                 }
             });
 
@@ -1111,12 +1121,16 @@ function wifiPage(cfg) {
 
         async acquitterAlarme(f) {
             this.arreterSon();
-            const l = this.lignes.find(x => x.id === f.id);
-            if (l && l.alarme) l.alarme.acquittee = true;
             this._alarmesFermees.add(f.id);
             this.fermerFenetre(f.id);
             try {
-                await window.cmFetch(`${cfg.urlSession}/${f.id}/alarme/acquitter`, { method: 'POST' });
+                const r = await window.cmFetch(`${cfg.urlSession}/${f.id}/alarme/acquitter`, { method: 'POST' });
+                const d = await r.json();
+                // Le serveur renvoie les lignes à jour : on rafraîchit tout de suite.
+                if (d && d.lignes) {
+                    this.lignes = d.lignes;
+                    this.stats = d.stats ?? this.stats;
+                }
             } catch (e) {}
             await this.rafraichir();
         },
@@ -1148,6 +1162,10 @@ function wifiPage(cfg) {
                 window.dispatchEvent(new CustomEvent('toast', { detail: d.message }));
                 this.fermerFenetre(f.id);
                 this._alarmesFermees.delete(f.id);
+                if (d.lignes) {
+                    this.lignes = d.lignes;
+                    this.stats = d.stats ?? this.stats;
+                }
                 await this.rafraichir();
             } catch (e) {}
         },

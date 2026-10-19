@@ -405,9 +405,10 @@ class WifiController extends Controller
             ? (int) $session->alarme_montant + ($data['type'] === 'montant' ? $montantAjoute : 0)
             : null;
 
-        $nouvelleFin = now()->addSeconds(
-            max(0, $nouvelleDuree * 60 - $session->secondesConsommees())
-        );
+        // Toujours strictement dans le futur (au moins 1 s) pour que la jauge
+        // s'affiche et que l'utilisateur voie la prolongation prendre effet.
+        $secondesRestantes = $nouvelleDuree * 60 - $session->secondesConsommees();
+        $nouvelleFin = now()->addSeconds(max(1, $secondesRestantes));
 
         $session->update([
             'alarme_duree_minutes' => $nouvelleDuree,
@@ -451,14 +452,31 @@ class WifiController extends Controller
         ]);
     }
 
+    /**
+     * Arrêt de l'alarme par l'utilisateur :
+     *  - libère l'alarme (alarme_active=false) → on pourra en poser une nouvelle
+     *  - conserve alarme_declenchee_at et alarme_message pour l'historique
+     *  - NE TOUCHE PAS à la session (elle reste connectée, montant/durée
+     *    continuent). Seul « Arrêter » ou « Supprimer » fige la session.
+     */
     public function acquitterAlarme(Session $session): JsonResponse
     {
         $session->update([
-            'alarme_declenchee_at' => $session->alarme_declenchee_at ?: now(),
-            'alarme_message'       => 'acquittee',
+            'alarme_active'             => false,
+            'alarme_type'               => null,
+            'alarme_duree_minutes'      => null,
+            'alarme_montant'            => null,
+            'alarme_fin_prevue'         => null,
+            'alarme_secondes_restantes' => null,
+            'alarme_declenchee_at'      => $session->alarme_declenchee_at ?: now(),
+            'alarme_message'            => 'acquittee',
         ]);
 
-        return response()->json(['ok' => true]);
+        return response()->json([
+            'ok'      => true,
+            'lignes'  => $this->lignesSerialisees(),
+            'stats'   => $this->stats(),
+        ]);
     }
 
     // -----------------------------------------------------------------
