@@ -1,6 +1,6 @@
 ╔════════════════════════════════════════════════════════════════════════════╗
 ║                CYBER MANAGER — GENERATOR.txt (module Wi-Fi)                ║
-║                      Généré le 13/10/2026 à 19:45:35                       ║
+║                      Généré le 20/10/2026 à 11:44:06                       ║
 ╚════════════════════════════════════════════════════════════════════════════╝
 
 
@@ -13,7 +13,7 @@
 📄  app/Http/Controllers/WifiController.php
 ──────────────────────────────────────────────────────────────────────────────
 
-# Taille : 25.1 Ko  |  Statut : OK
+# Taille : 28.7 Ko  |  Statut : OK
 
 <?php
 
@@ -39,10 +39,6 @@ class WifiController extends Controller
         private TarifService $tarifService,
     ) {}
 
-    // -----------------------------------------------------------------
-    // Page principale
-    // -----------------------------------------------------------------
-
     public function index()
     {
         $this->syncSilencieuse();
@@ -62,15 +58,6 @@ class WifiController extends Controller
         ]);
     }
 
-    // -----------------------------------------------------------------
-    // Arrêter / Supprimer
-    // -----------------------------------------------------------------
-
-    /**
-     * "Arrêter" : FIGE la durée et le montant (arrondi appliqué).
-     * Le client RESTE connecté au Wi-Fi : aucune déconnexion MikroTik ici.
-     * La déconnexion réelle se fait uniquement via "Supprimer".
-     */
     public function arreter(Session $session): JsonResponse
     {
         if ($session->type_session !== 'wifi') {
@@ -81,7 +68,6 @@ class WifiController extends Controller
             return response()->json(['ok' => false, 'message' => 'Déjà terminée.'], 422);
         }
 
-        // Calculé AVANT la mise à jour : la session n'est pas encore figée.
         $final      = $this->montant->montantFinal($session);
         $maintenant = now();
 
@@ -99,8 +85,6 @@ class WifiController extends Controller
             'duree_consommee'           => $final['minutes_reelles'],
         ];
 
-        // Intègre l'éventuelle période hors ligne / pause en cours, pour que
-        // (fin_reelle - début - hors_ligne - pause) donne exactement la durée figée.
         if ($session->estDeconnecte() && $session->deconnecte_at) {
             $maj['duree_hors_ligne_secondes'] = (int) $session->duree_hors_ligne_secondes
                 + max(0, $maintenant->getTimestamp() - $session->deconnecte_at->getTimestamp());
@@ -121,17 +105,49 @@ class WifiController extends Controller
         ]);
     }
 
-    /**
-     * Suppression définitive : déconnecte, efface le voucher du MikroTik,
-     * supprime la session. Autorisé même si connecté (déconnexion auto).
-     */
-    public function supprimer(Session $session): JsonResponse
+    public function continuer(Session $session): JsonResponse
     {
         if ($session->type_session !== 'wifi') {
             return response()->json(['ok' => false, 'message' => 'Session non Wi-Fi.'], 422);
         }
 
-        // Voucher protégé → redirection HotSpot (sécurité)
+        if (!$session->estTermine()) {
+            return response()->json(['ok' => false, 'message' => 'La session n\'est pas terminée.'], 422);
+        }
+
+        $maintenant = now();
+
+        $ajoutHorsLigne = 0;
+        if ($session->date_heure_fin_reelle) {
+            $ajoutHorsLigne = max(0, $maintenant->getTimestamp() - $session->date_heure_fin_reelle->getTimestamp());
+        }
+
+        $session->update([
+            'etat'                      => 'en_cours',
+            'etat_wifi'                 => Session::WIFI_CONNECTE,
+            'date_heure_fin_reelle'     => null,
+            'motif_fin'                 => null,
+            'duree_hors_ligne_secondes' => (int) $session->duree_hors_ligne_secondes + $ajoutHorsLigne,
+            'alarme_active'             => false,
+            'alarme_fin_prevue'         => null,
+            'alarme_secondes_restantes' => null,
+            'montant_restant'           => (int) $session->montant_total,
+        ]);
+
+        return response()->json([
+            'ok'      => true,
+            'message' => 'Session reprise : la durée et le montant reprennent.',
+            'lignes'  => $this->lignesSerialisees(),
+            'stats'   => $this->stats(),
+        ]);
+    }
+
+    public function supprimer(Request $request, Session $session): JsonResponse
+    {
+        if ($session->type_session !== 'wifi') {
+            return response()->json(['ok' => false, 'message' => 'Session non Wi-Fi.'], 422);
+        }
+
         if ($session->voucher && $session->voucher->protege) {
             return response()->json([
                 'ok'       => false,
@@ -140,14 +156,30 @@ class WifiController extends Controller
             ], 403);
         }
 
-        // Déconnecter le client du MikroTik si encore actif
+        $autres = $session->voucher ? $this->sessionsActivesDuMemeVoucher($session) : [];
+        $force  = $request->boolean('force');
+
+        if (!empty($autres) && !$force) {
+            return response()->json([
+                'ok'           => false,
+                'besoin_force' => true,
+                'autres'       => $autres,
+                'message'      => 'Ce voucher est encore utilisé par d\'autres connexions actives.',
+            ], 409);
+        }
+
+        foreach ($autres as $info) {
+            if (!empty($info['mac'])) {
+                try { $this->mikroTik->disconnectHotspotActiveByMac($info['mac']); } catch (\Throwable $e) {}
+            }
+        }
+
         if ($session->client_mac) {
             try {
                 $this->mikroTik->disconnectHotspotActiveByMac($session->client_mac);
             } catch (\Throwable $e) {}
         }
 
-        // Supprimer le voucher temporaire associé
         if ($session->voucher && !$session->voucher->estReutilisable()) {
             try {
                 $this->mikroTik->deleteHotspotUser($session->voucher->username);
@@ -165,7 +197,40 @@ class WifiController extends Controller
         ]);
     }
 
-    /** Suppression en masse. */
+    private function sessionsActivesDuMemeVoucher(Session $session): array
+    {
+        if (!$session->voucher) return [];
+
+        $username = $session->voucher->username;
+        $macSelf  = AppareilWifi::normaliserMac($session->client_mac);
+        $resultat = [];
+
+        try {
+            foreach ($this->mikroTik->listHotspotActive() as $a) {
+                if (($a['user'] ?? null) !== $username) continue;
+
+                $mac = AppareilWifi::normaliserMac($a['mac-address'] ?? null);
+                if ($mac && $macSelf && $mac === $macSelf) continue;
+
+                $resultat[] = ['mac' => $mac, 'appareil' => $a['mac-address'] ?? null];
+            }
+            return array_values($resultat);
+        } catch (\Throwable $e) {
+            $locales = Session::where('type_session', 'wifi')
+                ->where('voucher_id', $session->voucher_id)
+                ->where('id', '!=', $session->id)
+                ->whereIn('etat_wifi', [Session::WIFI_CONNECTE, Session::WIFI_EN_PAUSE])
+                ->get(['client_mac', 'appareil_wifi_id']);
+
+            foreach ($locales as $s) {
+                $mac = AppareilWifi::normaliserMac($s->client_mac);
+                if ($mac && $macSelf && $mac === $macSelf) continue;
+                $resultat[] = ['mac' => $mac, 'appareil' => null];
+            }
+            return array_values($resultat);
+        }
+    }
+
     public function supprimerMasse(Request $request): JsonResponse
     {
         $data = $request->validate([
@@ -205,9 +270,25 @@ class WifiController extends Controller
         ]);
     }
 
-    // -----------------------------------------------------------------
-    // Alarme — poser, prolonger, annuler, acquitter
-    // -----------------------------------------------------------------
+    public function enregistrerRemarque(Request $request, Session $session): JsonResponse
+    {
+        if ($session->type_session !== 'wifi') {
+            return response()->json(['ok' => false, 'message' => 'Session non Wi-Fi.'], 422);
+        }
+
+        $data = $request->validate([
+            'remarque' => ['nullable', 'string', 'max:1000'],
+        ]);
+
+        $texte = isset($data['remarque']) ? trim((string) $data['remarque']) : null;
+        $session->update(['remarque' => $texte !== '' ? $texte : null]);
+
+        return response()->json([
+            'ok'       => true,
+            'remarque' => $session->remarque,
+            'message'  => 'Remarque enregistrée.',
+        ]);
+    }
 
     public function definirAlarme(Request $request, Session $session): JsonResponse
     {
@@ -247,15 +328,18 @@ class WifiController extends Controller
             $secondesRestantes = $secondesTotal;
         }
 
+        $finPrevue = now()->addSeconds($secondesRestantes);
+
         $session->update([
-            'alarme_active'        => true,
-            'alarme_type'          => $data['type'],
-            'alarme_duree_minutes' => $minutes,
-            'alarme_montant'       => $montant,
-            'alarme_fin_prevue'    => now()->addSeconds($secondesRestantes),
-            'alarme_declenchee_at' => null,
-            'alarme_message'       => null,
-            'alarme_historique'    => array_merge($session->alarme_historique ?? [], [[
+            'alarme_active'           => true,
+            'alarme_type'             => $data['type'],
+            'alarme_duree_minutes'    => $minutes,
+            'alarme_montant'          => $montant,
+            'alarme_fin_prevue'       => $finPrevue,
+            'alarme_derniere_fin_at'  => $finPrevue,
+            'alarme_declenchee_at'    => null,
+            'alarme_message'          => null,
+            'alarme_historique'       => array_merge($session->alarme_historique ?? [], [[
                 'action' => 'pose',
                 'type'   => $data['type'],
                 'valeur' => (int) $data['valeur'],
@@ -283,8 +367,10 @@ class WifiController extends Controller
         $data = $request->validate([
             'type'   => ['required', 'in:duree,montant'],
             'valeur' => ['required', 'integer', 'min:1', 'max:1000000'],
+            'depart' => ['nullable', 'in:debut,maintenant,apres'],
         ]);
 
+        $mode  = $data['depart'] ?? 'apres';
         $tarif = $session->tarif ?: $this->tarifService->tarifWifi();
 
         if ($data['type'] === 'duree') {
@@ -297,26 +383,50 @@ class WifiController extends Controller
                 : (int) floor($montantAjoute / 20);
         }
 
-        $nouvelleDuree = (int) $session->alarme_duree_minutes + $minutesAjoutees;
+        $maintenant = now();
+        $debut      = $session->date_heure_debut ?: $maintenant;
+
+        if ($mode === 'debut') {
+            $minutesTotales = (int) $session->alarme_duree_minutes + $minutesAjoutees;
+            $nouvelleFin = $debut->copy()->addMinutes($minutesTotales);
+        } elseif ($mode === 'maintenant') {
+            $nouvelleFin = $maintenant->copy()->addMinutes($minutesAjoutees);
+        } else {
+            $base = $session->alarme_derniere_fin_at
+                ?: $session->alarme_fin_prevue
+                ?: $maintenant;
+                
+            if ($base->lt($maintenant)) {
+                $base = $maintenant;
+            }
+            
+            $nouvelleFin = $base->copy()->addMinutes($minutesAjoutees);
+        }
+
+        if ($nouvelleFin->lte($maintenant)) {
+            $nouvelleFin = $maintenant->copy()->addSecond();
+        }
+
+        $nouvelleDuree = max(1, (int) ceil(($nouvelleFin->getTimestamp() - $debut->getTimestamp()) / 60));
+
         $nouveauMontant = $session->alarme_type === 'montant'
             ? (int) $session->alarme_montant + ($data['type'] === 'montant' ? $montantAjoute : 0)
             : null;
 
-        $nouvelleFin = now()->addSeconds(
-            max(0, $nouvelleDuree * 60 - $session->secondesConsommees())
-        );
-
         $session->update([
-            'alarme_duree_minutes' => $nouvelleDuree,
-            'alarme_montant'       => $nouveauMontant,
-            'alarme_fin_prevue'    => $nouvelleFin,
-            'alarme_declenchee_at' => null,
-            'alarme_message'       => null,
-            'alarme_historique'    => array_merge($session->alarme_historique ?? [], [[
+            'alarme_duree_minutes'   => $nouvelleDuree,
+            'alarme_montant'         => $nouveauMontant,
+            'alarme_fin_prevue'      => $nouvelleFin,
+            'alarme_derniere_fin_at' => $nouvelleFin,
+            'alarme_declenchee_at'   => null,
+            'alarme_message'         => null,
+            'alarme_historique'      => array_merge($session->alarme_historique ?? [], [[
                 'action'           => 'prolongation',
+                'mode'             => $mode,
                 'type'             => $data['type'],
                 'valeur'           => (int) $data['valeur'],
                 'minutes_ajoutees' => $minutesAjoutees,
+                'nouvelle_fin'     => $nouvelleFin->toIso8601String(),
                 'at'               => now()->toIso8601String(),
             ]]),
         ]);
@@ -351,16 +461,25 @@ class WifiController extends Controller
     public function acquitterAlarme(Session $session): JsonResponse
     {
         $session->update([
-            'alarme_declenchee_at' => $session->alarme_declenchee_at ?: now(),
-            'alarme_message'       => 'acquittee',
+            'alarme_declenchee_at'      => $session->alarme_declenchee_at ?: now(),
+            'alarme_message'            => 'acquittee',
         ]);
+
+        return response()->json([
+            'ok'      => true,
+            'lignes'  => $this->lignesSerialisees(),
+            'stats'   => $this->stats(),
+        ]);
+    }
+
+    public function marquerAlarmeDeclenchee(Session $session): JsonResponse
+    {
+        if (!$session->alarme_declenchee_at) {
+            $session->update(['alarme_declenchee_at' => now()]);
+        }
 
         return response()->json(['ok' => true]);
     }
-
-    // -----------------------------------------------------------------
-    // Comptes HotSpot
-    // -----------------------------------------------------------------
 
     public function comptes()
     {
@@ -441,14 +560,6 @@ class WifiController extends Controller
         }
     }
 
-    // -----------------------------------------------------------------
-    // Helpers
-    // -----------------------------------------------------------------
-
-    /**
-     * Synchro opportuniste : seulement si la dernière a plus de 2 s.
-     * Le verrou et la protection anti-chevauchement sont dans le service.
-     */
     private function syncSilencieuse(): void
     {
         try {
@@ -468,13 +579,15 @@ class WifiController extends Controller
             'urlEtat'             => route('wifi.etat'),
             'urlSession'          => url('/wifi/session'),
             'urlSupprimerMasse'   => route('wifi.session.supprimer-masse'),
-            'urlReglagesGet'      => route('wifi.alarme.index'),      // ← GET
-            'urlReglagesSave'     => route('wifi.alarme.reglages'),   // ← POST
+            'urlReglagesGet'      => route('wifi.alarme.index'),
+            'urlReglagesSave'     => route('wifi.alarme.reglages'),
             'urlUploaderSon'      => route('wifi.alarme.son'),
             'urlChoisirSon'       => route('wifi.alarme.son.choisir'),
             'urlSupprimerSon'     => route('wifi.alarme.son.supprimer'),
             'urlReinitialiser'    => route('wifi.alarme.reinitialiser'),
             'urlHotspot'          => route('hotspot.index'),
+            'urlRemarque'         => url('/wifi/session'),
+            'urlContinuer'        => url('/wifi/session'),
             'csrf'                => csrf_token(),
         ];
     }
@@ -493,11 +606,8 @@ class WifiController extends Controller
             ->orderByDesc('date_heure_debut')
             ->get();
 
-        // Badge "Client encore connecté" : info publiée par la synchro (aucun appel
-        // MikroTik ici). null = inconnu/périmé → aucun badge.
         $macsActives = $this->wifiSessions->macsEncoreActives();
 
-        // Une MAC qui a déjà une session ouverte ne doit pas marquer d'anciennes lignes "Terminé".
         $macsOuvertes = $sessions
             ->filter(fn ($s) => $s->etat_wifi !== Session::WIFI_TERMINE)
             ->map(fn ($s) => AppareilWifi::normaliserMac($s->client_mac))
@@ -505,7 +615,7 @@ class WifiController extends Controller
             ->unique()
             ->all();
 
-        $dejaMarquees = [];   // un seul badge par MAC : le "Terminé" le plus récent
+        $dejaMarquees = [];
         $lignes = [];
 
         foreach ($sessions as $s) {
@@ -563,6 +673,7 @@ class WifiController extends Controller
                 ? (int) $s->montant_total
                 : null,
             'client_encore_actif' => $clientEncoreActif,
+            'remarque'         => $s->remarque,
             'deconnecte_at'    => $s->deconnecte_at?->toIso8601String(),
             'pause_at'         => $s->pause_at?->toIso8601String(),
             'secondes_hors_ligne' => (int) $s->duree_hors_ligne_secondes,
@@ -583,6 +694,7 @@ class WifiController extends Controller
                 'minutes'     => $s->alarme_duree_minutes,
                 'montant'     => $s->alarme_montant,
                 'fin'         => $s->alarme_fin_prevue?->toIso8601String(),
+                'derniere_fin'=> $s->alarme_derniere_fin_at?->toIso8601String(),
                 'declenchee'  => (bool) $s->alarme_declenchee_at,
                 'acquittee'   => ($s->alarme_message === 'acquittee'),
             ],
@@ -607,11 +719,6 @@ class WifiController extends Controller
         ];
     }
 
-    /**
-     * Vouchers disponibles = temporaires, état "disponible", sans session
-     * active en cours. On EXCLUT explicitement tout voucher dont une session
-     * Wi-Fi est actuellement "en_cours".
-     */
     private function vouchersDisponibles(): array
     {
         $usernamesActifs = Session::where('type_session', 'wifi')
@@ -880,7 +987,7 @@ class WifiAlarmController extends Controller
 📄  app/Services/WifiSessionService.php
 ──────────────────────────────────────────────────────────────────────────────
 
-# Taille : 32.0 Ko  |  Statut : OK
+# Taille : 23.7 Ko  |  Statut : OK
 
 <?php
 
@@ -900,63 +1007,28 @@ class WifiSessionService
     private const CLE_DERNIERE_SYNC   = 'wifi_sync_derniere_tentative';
     private const CLE_ETAT_ROUTEUR    = 'wifi_sync_etat_routeur';
     private const CLE_MACS_ACTIVES    = 'wifi_sync_macs_actives';
-    /** Au-delà de cet âge (s), la liste des MAC présentes est jugée périmée. */
     private const MACS_ACTIVES_AGE_MAX = 20;
     private const PREFIXE_ABSENCE     = 'wifi_absence_session_';
     private const PREFIXE_MAC_SANS_FIL = 'wifi_mac_sans_fil_';
     private const PREFIXE_APPAREIL    = 'wifi_appareil_rafraichi_';
     private const PREFIXE_VOLUME_BASE = 'wifi_volume_base_session_';
 
-    /**
-     * Seuils de confirmation d'une absence : 1 synchro, 0 seconde.
-     *
-     * Pourquoi si bas : la fiabilité ne vient plus de l'attente mais de la
-     * RELECTURE DE CONFIRMATION faite dans la même synchro (voir
-     * marquerSessionsDisparues() / relireEtatActuel()) : avant de déclarer un
-     * client absent, on relit /ip/hotspot/active ET la table d'enregistrement
-     * Wi-Fi ~300 ms plus tard. Il faut que les DEUX lectures concordent.
-     * Si la relecture échoue ou si la table Wi-Fi est indisponible, on ne
-     * déconnecte rien. Le délai de détection devient celui de la cadence des
-     * synchros (≈ 2 s) au lieu de 2 synchros + 3 s.
-     *
-     * (Les constantes restent là pour pouvoir durcir la règle sans toucher
-     * au code : ex. ABSENCE_SYNCS_MIN = 2 si un réseau Wi-Fi instable pose
-     * problème.)
-     */
     private const ABSENCE_SYNCS_MIN = 1;
     private const ABSENCE_SECONDES_MIN = 0;
-
-    /** Pause avant la relecture de confirmation (microsecondes) : 300 ms. */
     private const RELECTURE_PAUSE_US = 300000;
 
-    /** États d'une session "vivante" (par opposition à terminée). */
     private const ETATS_OUVERTS = [
         Session::WIFI_CONNECTE,
         Session::WIFI_DECONNECTE,
         Session::WIFI_EN_PAUSE,
     ];
 
-    /**
-     * Une connexion MikroTik qui a commencé au plus tard N secondes après
-     * l'arrêt d'une session terminée est considérée comme LA MÊME connexion
-     * (le client n'a jamais été déconnecté). Au-delà : nouvelle connexion.
-     */
-    private const TOLERANCE_FIN_SECONDES = 5;
-
     private ?array $baux = null;
-    private ?array $regTable = null;   // null = table Wi-Fi indisponible
+    private ?array $regTable = null;
     private ?array $wireless = null;
 
     public function __construct(private MikroTikService $mikroTik) {}
 
-    // -----------------------------------------------------------------
-    // Points d'entrée
-    // -----------------------------------------------------------------
-
-    /**
-     * Synchronise seulement si la dernière tentative est assez ancienne.
-     * Si le routeur est en panne, on réessaie moins souvent (évite de bloquer la page).
-     */
     public function synchroniserSiNecessaire(int $ageMaxSecondes = 2): ?array
     {
         $etat = Cache::get(self::CLE_ETAT_ROUTEUR);
@@ -972,10 +1044,6 @@ class WifiSessionService
         return $this->synchroniser();
     }
 
-    /**
-     * Synchronisation protégée par un verrou unique (page Wi-Fi, page HotSpot,
-     * cron et bouton manuel passent tous par ici).
-     */
     public function synchroniser(): array
     {
         $verrou = Cache::lock(self::CLE_VERROU, 30);
@@ -991,7 +1059,6 @@ class WifiSessionService
         }
     }
 
-    /** État de la dernière synchro (pour afficher un avertissement si MikroTik ne répond plus). */
     public function etatSynchro(): array
     {
         $e = Cache::get(self::CLE_ETAT_ROUTEUR);
@@ -1003,35 +1070,18 @@ class WifiSessionService
         ];
     }
 
-    /**
-     * MAC (normalisées) actuellement présentes d'après la dernière synchro réussie.
-     * Retourne null si l'information est inconnue ou périmée (routeur muet,
-     * synchro trop ancienne) : l'appelant ne doit alors afficher AUCUN badge.
-     *
-     * @return string[]|null
-     */
     public function macsEncoreActives(): ?array
     {
         $etat = Cache::get(self::CLE_ETAT_ROUTEUR);
-        if (is_array($etat) && empty($etat['ok'])) {
-            return null;
-        }
+        if (is_array($etat) && empty($etat['ok'])) return null;
 
         $d = Cache::get(self::CLE_MACS_ACTIVES);
-        if (!is_array($d) || !isset($d['at'], $d['macs'])) {
-            return null;
-        }
+        if (!is_array($d) || !isset($d['at'], $d['macs'])) return null;
 
-        if ((now()->getTimestamp() - (int) $d['at']) > self::MACS_ACTIVES_AGE_MAX) {
-            return null;
-        }
+        if ((now()->getTimestamp() - (int) $d['at']) > self::MACS_ACTIVES_AGE_MAX) return null;
 
         return (array) $d['macs'];
     }
-
-    // -----------------------------------------------------------------
-    // Cœur de la synchro
-    // -----------------------------------------------------------------
 
     private function executerSynchro(): array
     {
@@ -1044,7 +1094,6 @@ class WifiSessionService
         try {
             $actives = $this->mikroTik->listHotspotActive();
         } catch (\Throwable $e) {
-            // Routeur injoignable : on ne touche à AUCUNE session (pas de fausse déconnexion).
             Log::warning('Sync Wi-Fi : MikroTik injoignable', ['error' => $e->getMessage()]);
             Cache::put(self::CLE_ETAT_ROUTEUR, [
                 'ok' => false, 'at' => now()->getTimestamp(), 'erreur' => $e->getMessage(),
@@ -1059,29 +1108,23 @@ class WifiSessionService
 
         $this->chargerPresenceSansFil();
 
-        // Un appareil physique = une seule connexion réelle : si MikroTik garde
-        // plusieurs entrées pour la même MAC, on ne retient que la plus récente.
         $actives = $this->actifsCanoniques($actives);
 
-        $ouvertes     = 0;
-        $maj          = 0;
-        $idsPresents  = [];
-        $macsPresentes = [];   // MAC réellement présentes (pour le badge "Client encore connecté")
+        $ouvertes      = 0;
+        $maj           = 0;
+        $idsPresents   = [];
+        $macsPresentes = [];
 
         foreach ($actives as $active) {
             $activeId = $active['.id'] ?? null;
-            if (!$activeId) {
-                continue;
-            }
+            if (!$activeId) continue;
 
             $present = $this->estPresent($active);
             if ($present) {
                 $idsPresents[] = $activeId;
 
                 $macPresente = AppareilWifi::normaliserMac($active['mac-address'] ?? null);
-                if ($macPresente) {
-                    $macsPresentes[] = $macPresente;
-                }
+                if ($macPresente) $macsPresentes[] = $macPresente;
             }
 
             try {
@@ -1106,12 +1149,6 @@ class WifiSessionService
         return ['ouvertes' => $ouvertes, 'maj' => $maj, 'fermees' => $fermees, 'erreur' => null];
     }
 
-    /**
-     * Ramène les entrées actives à UNE par appareil (MAC).
-     * Si plusieurs entrées partagent la même MAC, la plus récente (plus petit
-     * uptime) est la connexion réelle ; les autres sont des restes ignorés.
-     * Les entrées sans MAC valide sont conservées telles quelles.
-     */
     private function actifsCanoniques(array $actives): array
     {
         $resultat = [];
@@ -1134,7 +1171,6 @@ class WifiSessionService
                 Log::info('Sync Wi-Fi : plusieurs entrées MikroTik pour une même MAC, la plus récente est retenue', [
                     'mac'     => $mac,
                     'retenue' => $liste[0]['.id'] ?? null,
-                    'ignores' => array_map(fn ($x) => $x['.id'] ?? null, array_slice($liste, 1)),
                 ]);
             }
             $resultat[] = $liste[0];
@@ -1143,11 +1179,6 @@ class WifiSessionService
         return $resultat;
     }
 
-    /**
-     * Charge la liste des téléphones réellement accrochés à l'antenne.
-     * Mémorise aussi quelles MAC sont "sans fil" : seules celles-là pourront
-     * être jugées absentes via cette table (les postes en câble ne sont jamais touchés).
-     */
     private function chargerPresenceSansFil(): void
     {
         $this->regTable = null;
@@ -1156,46 +1187,27 @@ class WifiSessionService
             $table = [];
             foreach ($this->mikroTik->listWirelessRegistrationTable() as $r) {
                 $m = AppareilWifi::normaliserMac($r['mac-address'] ?? null);
-                if (!$m) {
-                    continue;
-                }
+                if (!$m) continue;
                 $table[$m] = $r;
                 Cache::add(self::PREFIXE_MAC_SANS_FIL . str_replace(':', '', $m), 1, 604800);
             }
             $this->regTable = $table;
         } catch (\Throwable $e) {
-            // Table indisponible (autre type de Wi-Fi, erreur...) : on ne conclut rien.
             $this->regTable = null;
         }
     }
 
-    /**
-     * Le client est-il vraiment là ?
-     * Absent seulement si : table Wi-Fi lue avec succès + MAC déjà connue comme
-     * "sans fil" + MAC absente de la table maintenant.
-     * Dans tous les autres cas (doute) : on le considère présent.
-     */
     private function estPresent(array $active): bool
     {
-        if ($this->regTable === null) {
-            return true;
-        }
+        if ($this->regTable === null) return true;
 
         $mac = AppareilWifi::normaliserMac($active['mac-address'] ?? null);
-        if (!$mac) {
-            return true;
-        }
+        if (!$mac) return true;
 
-        if (isset($this->regTable[$mac])) {
-            return true;
-        }
+        if (isset($this->regTable[$mac])) return true;
 
         return !Cache::has(self::PREFIXE_MAC_SANS_FIL . str_replace(':', '', $mac));
     }
-
-    // -----------------------------------------------------------------
-    // Rattachement d'une entrée active à une session (anti-doublons)
-    // -----------------------------------------------------------------
 
     private function traiterActive(array $active, bool $present): ?string
     {
@@ -1203,36 +1215,36 @@ class WifiSessionService
         $mac      = AppareilWifi::normaliserMac($active['mac-address'] ?? null);
         $username = (($active['user'] ?? '') !== '') ? $active['user'] : null;
 
-        // 1) Session OUVERTE qui correspond à cette connexion
-        //    (même .id, ou même appareil + même voucher après un nouvel .id).
+        // 1) Session OUVERTE correspondante
         $candidats = $this->sessionsOuvertesCorrespondantes($active, $activeId, $mac, $username);
 
         if ($candidats->isNotEmpty()) {
-            $session  = $candidats->first();      // la plus ancienne = celle qu'on garde
+            $session  = $candidats->first();
             $doublons = $candidats->slice(1);
 
             if ($doublons->isNotEmpty()) {
                 $this->fusionner($session, $doublons);
             }
 
-            if (!$present) {
-                // Entrée "fantôme" gardée par MikroTik : on n'y touche pas,
-                // marquerSessionsDisparues() s'occupe de l'absence.
-                return null;
-            }
+            if (!$present) return null;
 
             $this->mettreAJour($session, $active);
             return 'maj';
         }
 
-        if (!$present) {
-            return null; // ne pas créer de session pour un fantôme
-        }
+        if (!$present) return null;
 
-        // 2) Aucune session ouverte. Cette connexion est-elle celle d'une session
-        //    déjà TERMINÉE (figée) ? Alors le client n'a jamais été déconnecté :
-        //    on ne crée rien, la ligne "Terminé" reste telle quelle.
-        if ($this->connexionDejaTerminee($active, $activeId, $mac, $username)) {
+        // 2) Aucune session ouverte. Si une session TERMINÉE existe pour le
+        //    même appareil + voucher, on rattache le nouvel .id SANS créer
+        //    de nouvelle ligne. L'état reste "terminé" : le responsable
+        //    décidera de cliquer "Continuer" ou de supprimer.
+        $terminee = $this->sessionTermineeARattacher($active, $activeId, $mac, $username);
+        if ($terminee) {
+            $terminee->mikrotik_active_id = $activeId;
+            $terminee->client_ip = $active['address'] ?? $terminee->client_ip;
+            $terminee->client_mac = $active['mac-address'] ?? $terminee->client_mac;
+            $terminee->derniere_sync_at = now();
+            $terminee->save();
             return null;
         }
 
@@ -1241,12 +1253,6 @@ class WifiSessionService
         return 'ouverte';
     }
 
-    /**
-     * Sessions ouvertes qui représentent cette même connexion réelle,
-     * de la plus ancienne à la plus récente.
-     *
-     * @return Collection<int, Session>
-     */
     private function sessionsOuvertesCorrespondantes(array $active, string $activeId, ?string $mac, ?string $username): Collection
     {
         $limite = now()->subMinutes($this->fenetreRepriseMinutes());
@@ -1256,12 +1262,8 @@ class WifiSessionService
             ->orderBy('id')
             ->get()
             ->filter(function (Session $s) use ($activeId, $mac, $username, $limite) {
-                if (!$this->correspond($s, $activeId, $mac, $username)) {
-                    return false;
-                }
+                if (!$this->correspond($s, $activeId, $mac, $username)) return false;
 
-                // Reprise par MAC (nouvel .id) : seulement si la déconnexion est récente.
-                // Un retour plusieurs heures plus tard = nouvelle session.
                 $memeId = (string) $s->mikrotik_active_id === (string) $activeId;
                 if (!$memeId
                     && $s->etat_wifi === Session::WIFI_DECONNECTE
@@ -1269,40 +1271,29 @@ class WifiSessionService
                     && $s->deconnecte_at->lt($limite)) {
                     return false;
                 }
-
                 return true;
             })
             ->values();
     }
 
-    /**
-     * Une session TERMINÉE correspond-elle à la connexion en cours, c'est-à-dire
-     * la connexion MikroTik a-t-elle commencé AVANT l'arrêt de cette session ?
-     */
-    private function connexionDejaTerminee(array $active, string $activeId, ?string $mac, ?string $username): bool
+    private function sessionTermineeARattacher(array $active, string $activeId, ?string $mac, ?string $username): ?Session
     {
-        $debutConnexion = now()->getTimestamp() - $this->parseUptime($active['uptime'] ?? '0s');
+        if ($mac === null) return null;
 
         $terminees = $this->requeteParIdOuMac($activeId, $active, [Session::WIFI_TERMINE])
-            ->whereNotNull('date_heure_fin_reelle')
             ->orderByDesc('date_heure_fin_reelle')
-            ->limit(10)
+            ->orderByDesc('id')
+            ->limit(5)
             ->get();
 
         foreach ($terminees as $t) {
-            if (!$this->correspond($t, $activeId, $mac, $username)) {
-                continue;
-            }
-
-            if ($debutConnexion <= $t->date_heure_fin_reelle->getTimestamp() + self::TOLERANCE_FIN_SECONDES) {
-                return true;
+            if ($this->correspond($t, $activeId, $mac, $username)) {
+                return $t;
             }
         }
-
-        return false;
+        return null;
     }
 
-    /** Pré-filtre SQL : même .id actif OU même MAC (brute ou normalisée). */
     private function requeteParIdOuMac(string $activeId, array $active, array $etats)
     {
         $macBrute = $active['mac-address'] ?? null;
@@ -1319,12 +1310,6 @@ class WifiSessionService
             });
     }
 
-    /**
-     * Critères combinés (aucun ne suffit seul) :
-     *  - même .id actif : accepté seulement si la MAC est cohérente
-     *    (protège contre la réutilisation d'un .id après redémarrage du routeur) ;
-     *  - sinon : même MAC ET même voucher (username).
-     */
     private function correspond(Session $s, string $activeId, ?string $mac, ?string $username): bool
     {
         $macSession = AppareilWifi::normaliserMac($s->client_mac);
@@ -1333,9 +1318,7 @@ class WifiSessionService
             return $mac === null || $macSession === null || $macSession === $mac;
         }
 
-        if ($mac === null || $macSession !== $mac) {
-            return false;
-        }
+        if ($mac === null || $macSession !== $mac) return false;
 
         return (($s->hotspot_username ?: null) === $username);
     }
@@ -1345,13 +1328,6 @@ class WifiSessionService
         return max(1, (int) config('mikrotik.wifi_reprise_minutes', 60));
     }
 
-    /**
-     * Fusionne des doublons opérationnels dans la session conservée.
-     * On garde la plus ancienne (date de début d'origine) ; si elle n'a pas
-     * d'alarme et qu'un doublon en a une, l'alarme est reprise.
-     *
-     * @param Collection<int, Session> $doublons
-     */
     private function fusionner(Session $garde, Collection $doublons): void
     {
         foreach ($doublons as $d) {
@@ -1364,12 +1340,13 @@ class WifiSessionService
                     $garde->{$champ} = $d->{$champ};
                 }
             }
+            if (empty($garde->remarque) && !empty($d->remarque)) {
+                $garde->remarque = $d->remarque;
+            }
 
             Log::info('Sync Wi-Fi : doublon de session fusionné', [
                 'garde'    => $garde->id,
                 'supprime' => $d->id,
-                'mac'      => $d->client_mac,
-                'voucher'  => $d->hotspot_username,
             ]);
 
             Cache::forget(self::PREFIXE_ABSENCE . $d->id);
@@ -1377,14 +1354,8 @@ class WifiSessionService
             $d->delete();
         }
 
-        if ($garde->isDirty()) {
-            $garde->save();
-        }
+        if ($garde->isDirty()) $garde->save();
     }
-
-    // -----------------------------------------------------------------
-    // Création / mise à jour
-    // -----------------------------------------------------------------
 
     private function creer(array $active): Session
     {
@@ -1426,7 +1397,6 @@ class WifiSessionService
             'derniere_sync_at'      => now(),
         ], $this->calculerVolumes($active)));
 
-        // Le voucher passe "en cours" tout de suite : il disparaît de la liste "disponibles".
         if ($voucher) {
             try {
                 $voucher->marquerEnCours($appareil);
@@ -1443,12 +1413,8 @@ class WifiSessionService
 
     private function mettreAJour(Session $session, array $active): void
     {
-        // Le client est bien là : on efface tout compteur d'absence en cours.
         Cache::forget(self::PREFIXE_ABSENCE . $session->id);
 
-        // Reconnexion avec un nouvel .id MikroTik : la session adopte la nouvelle
-        // entrée et on mémorise le volume déjà cumulé (les compteurs MikroTik
-        // repartent de zéro).
         $nouvelId = $active['.id'] ?? null;
         if ($nouvelId && (string) $session->mikrotik_active_id !== (string) $nouvelId) {
             Cache::put(self::PREFIXE_VOLUME_BASE . $session->id, [
@@ -1469,7 +1435,6 @@ class WifiSessionService
             $session->reconnecte_at = now();
             $session->deconnecte_at = null;
 
-            // Reprendre l'alarme si elle était en pause
             if ($session->alarme_active && $session->alarme_secondes_restantes > 0) {
                 $session->alarme_fin_prevue = now()->addSeconds($session->alarme_secondes_restantes);
                 $session->alarme_secondes_restantes = null;
@@ -1480,7 +1445,6 @@ class WifiSessionService
         $session->client_mac       = $active['mac-address'] ?? $session->client_mac;
         $session->derniere_sync_at = now();
 
-        // Infos de l'appareil : rafraîchies au plus une fois par minute (évite DHCP + écriture à chaque synchro)
         $mac = AppareilWifi::normaliserMac($active['mac-address'] ?? null);
         $rafraichir = !$session->appareil_wifi_id
             || ($mac && Cache::add(self::PREFIXE_APPAREIL . str_replace(':', '', $mac), 1, 60));
@@ -1508,19 +1472,6 @@ class WifiSessionService
         $session->save();
     }
 
-    // -----------------------------------------------------------------
-    // Détection des départs (avec relecture de confirmation)
-    // -----------------------------------------------------------------
-
-    /**
-     * Sessions "connecté" dont le client n'est plus présent.
-     *
-     * Pour chaque candidat, une RELECTURE de confirmation (une seule pour tous,
-     * faite seulement s'il y a au moins un candidat) vérifie que le client est
-     * toujours absent. Si la relecture est impossible (MikroTik muet), on ne
-     * déconnecte personne. L'heure de déconnexion retenue est celle de la
-     * première absence constatée.
-     */
     private function marquerSessionsDisparues(array $idsPresents): int
     {
         $query = Session::where('type_session', 'wifi')
@@ -1532,17 +1483,10 @@ class WifiSessionService
         }
 
         $candidats = $query->get();
+        if ($candidats->isEmpty()) return 0;
 
-        if ($candidats->isEmpty()) {
-            return 0;
-        }
-
-        // Relecture unique, partagée par tous les candidats.
         $relecture = $this->relireEtatActuel();
-
-        if ($relecture === null) {
-            return 0; // doute : aucune fausse déconnexion
-        }
+        if ($relecture === null) return 0;
 
         $n = 0;
         $maintenant = now()->getTimestamp();
@@ -1550,24 +1494,20 @@ class WifiSessionService
         foreach ($candidats as $s) {
             $cle = self::PREFIXE_ABSENCE . $s->id;
 
-            // La seconde lecture le revoit : fausse alerte, on oublie.
             if ($this->sessionEncorePresente($s, $relecture)) {
                 Cache::forget($cle);
                 continue;
             }
 
             $abs = Cache::get($cle);
-
-            if (!is_array($abs)) {
-                $abs = ['depuis' => $maintenant, 'n' => 0];
-            }
+            if (!is_array($abs)) $abs = ['depuis' => $maintenant, 'n' => 0];
 
             $abs['n'] = (int) $abs['n'] + 1;
             Cache::put($cle, $abs, 120);
 
             if ($abs['n'] < self::ABSENCE_SYNCS_MIN
                 || ($maintenant - (int) $abs['depuis']) < self::ABSENCE_SECONDES_MIN) {
-                continue; // pas encore confirmé
+                continue;
             }
 
             $moment = Carbon::createFromTimestamp((int) $abs['depuis']);
@@ -1577,7 +1517,6 @@ class WifiSessionService
             $s->derniere_sync_at = now();
             $s->duree_consommee  = (int) floor($s->secondesConsommees() / 60);
 
-            // Alarme en pause : le temps restant est figé à l'instant du départ
             if ($s->alarme_active && $s->alarme_fin_prevue) {
                 $restant = $s->alarme_fin_prevue->getTimestamp() - $moment->getTimestamp();
                 if ($restant > 0) {
@@ -1594,14 +1533,6 @@ class WifiSessionService
         return $n;
     }
 
-    /**
-     * Seconde lecture : liste active + table Wi-Fi, après une courte pause.
-     * Retourne null si la liste active est illisible (on ne conclut rien).
-     * Une table Wi-Fi illisible donne 'reg' = null : estPresent() répondra
-     * alors "présent" (comportement prudent, inchangé).
-     *
-     * @return array{actives: array, reg: ?array}|null
-     */
     private function relireEtatActuel(): ?array
     {
         usleep(self::RELECTURE_PAUSE_US);
@@ -1617,9 +1548,7 @@ class WifiSessionService
             $reg = [];
             foreach ($this->mikroTik->listWirelessRegistrationTable() as $r) {
                 $m = AppareilWifi::normaliserMac($r['mac-address'] ?? null);
-                if ($m) {
-                    $reg[$m] = $r;
-                }
+                if ($m) $reg[$m] = $r;
             }
         } catch (\Throwable $e) {
             $reg = null;
@@ -1628,10 +1557,6 @@ class WifiSessionService
         return ['actives' => $actives, 'reg' => $reg];
     }
 
-    /**
-     * La session est-elle toujours représentée, à la relecture, par une entrée
-     * active ET présente sur l'antenne ? Même critère que l'anti-doublons (P2).
-     */
     private function sessionEncorePresente(Session $s, array $relecture): bool
     {
         $ancienneTable  = $this->regTable;
@@ -1640,9 +1565,7 @@ class WifiSessionService
         try {
             foreach ($relecture['actives'] as $a) {
                 $id = (string) ($a['.id'] ?? '');
-                if ($id === '') {
-                    continue;
-                }
+                if ($id === '') continue;
 
                 $mac      = AppareilWifi::normaliserMac($a['mac-address'] ?? null);
                 $username = (($a['user'] ?? '') !== '') ? $a['user'] : null;
@@ -1658,10 +1581,6 @@ class WifiSessionService
         return false;
     }
 
-    // -----------------------------------------------------------------
-    // Résolution SSID / appareil
-    // -----------------------------------------------------------------
-
     private function resoudreSsid(array $active): ?string
     {
         $mac = AppareilWifi::normaliserMac($active['mac-address'] ?? null);
@@ -1672,18 +1591,14 @@ class WifiSessionService
 
             if ($iface) {
                 $wifi = $this->wirelessPourInterface($iface);
-                if (!empty($wifi['ssid'])) {
-                    return mb_substr($wifi['ssid'], 0, 64);
-                }
+                if (!empty($wifi['ssid'])) return mb_substr($wifi['ssid'], 0, 64);
             }
         }
 
         $serveur = $active['server'] ?? null;
         if ($serveur) {
             $table = config('mikrotik.ssid_map', []);
-            if (isset($table[$serveur])) {
-                return mb_substr($table[$serveur], 0, 64);
-            }
+            if (isset($table[$serveur])) return mb_substr($table[$serveur], 0, 64);
         }
 
         $defaut = config('mikrotik.ssid_default');
@@ -1769,7 +1684,7 @@ class WifiSessionService
 📄  app/Services/WifiMontantService.php
 ──────────────────────────────────────────────────────────────────────────────
 
-# Taille : 1.6 Ko  |  Statut : OK
+# Taille : 1.8 Ko  |  Statut : OK
 
 <?php
 
@@ -1780,14 +1695,18 @@ use App\Models\Tarif;
 
 /**
  * Montants Wi-Fi :
- *   - montantTempsReel() : brut (sans arrondi), augmente en continu.
+ *   - montantTempsReel() : brut + minimum, sans arrondi, augmente en continu.
  *   - montantFinal()     : minimum + arrondi appliqués, à l'arrêt.
  */
 class WifiMontantService
 {
     public function __construct(private TarifService $tarifService) {}
 
-    /** Montant brut affiché pendant la session (pas d'arrondi). */
+    /**
+     * Montant affiché pendant la session (pas d'arrondi).
+     * Le minimum configurable est appliqué dès t=0 : la 1re seconde
+     * affiche déjà montant_minimum (ex : 300 Ar).
+     */
     public function montantTempsReel(Session $s): int
     {
         $tarif = $this->tarifPour($s);
@@ -1796,7 +1715,10 @@ class WifiMontantService
         $secondes = $s->secondesConsommees();
         $minutes  = $secondes / 60;
 
-        return (int) floor($minutes * $tarif->montant_par_minute);
+        $brut = (int) floor($minutes * $tarif->montant_par_minute);
+        $brut = $this->tarifService->appliquerMinimum($brut, $tarif);
+
+        return $brut;
     }
 
     /** Montant à payer : minimum + arrondi appliqués. */
@@ -2510,7 +2432,7 @@ class MikrotikConnection
 📄  resources/views/wifi/index.blade.php
 ──────────────────────────────────────────────────────────────────────────────
 
-# Taille : 105.0 Ko  |  Statut : OK
+# Taille : 118.1 Ko  |  Statut : OK
 
 @extends('layouts.cyber-manager', ['title' => 'Wi-Fi — Cyber Manager'])
 
@@ -2520,16 +2442,34 @@ class MikrotikConnection
 
 <div x-data="wifiPage({{ Illuminate\Support\Js::from($cfg) }})" x-init="init()">
 
-    {{-- ═══ FENÊTRE D'ALARME PERSISTANTE ═══ --}}
-    <div x-show="fenetresAlarme.length > 0" x-cloak class="fixed inset-0 z-[200] flex items-center justify-center p-4 bg-slate-900/80">
-        <div class="w-full max-w-2xl space-y-3 max-h-[90vh] overflow-y-auto">
-            <template x-for="f in fenetresAlarme" :key="f.id">
-                <div class="rounded-2xl bg-white shadow-2xl border-4 border-rose-500 overflow-hidden">
+    {{-- ═══ FENÊTRE D'ALARME À ONGLETS ═══ --}}
+    <template x-teleport="body">
+    <div x-show="fenetresAlarme.length > 0" x-cloak class="fixed inset-0 z-[9100] flex items-center justify-center p-4 bg-slate-900/80">
+        <div class="w-full max-w-2xl flex flex-col max-h-[90vh]">
+            
+            <!-- BARRE D'ONGLETS -->
+            <div class="flex items-end gap-1 px-2 overflow-x-auto bg-slate-800 rounded-t-xl pt-2">
+                <template x-for="f in fenetresAlarme" :key="f.id">
+                    <button type="button" @click="ongletAlarmeActif = f.id"
+                            class="flex items-center gap-2 px-4 py-2 text-sm font-semibold rounded-t-lg transition-colors whitespace-nowrap focus:outline-none"
+                            :class="ongletAlarmeActif === f.id ? 'bg-white text-rose-600' : 'bg-slate-700 text-slate-300 hover:bg-slate-600'">
+                        <x-icone nom="bell" class="h-4 w-4" />
+                        <span x-text="f.appareil"></span>
+                        <button type="button" @click.stop="acquitterAlarme(f)" class="ml-1 hover:text-rose-900 rounded p-0.5">
+                            <x-icone nom="x" class="h-3 w-3" />
+                        </button>
+                    </button>
+                </template>
+            </div>
+
+            <!-- CONTENU DE L'ONGLET ACTIF -->
+            <template x-for="f in fenetresAlarme" :key="'content-'+f.id">
+                <div x-show="ongletAlarmeActif === f.id" class="rounded-b-2xl bg-white shadow-2xl border-4 border-t-0 border-rose-500 overflow-hidden flex-1">
                     <div class="bg-rose-600 px-6 py-4 flex items-center gap-3 animate-pulse">
                         <x-icone nom="bell" class="h-8 w-8 text-white shrink-0" />
                         <h2 class="text-2xl font-bold text-white">Temps écoulé</h2>
                     </div>
-                    <div class="p-6 space-y-4 text-lg">
+                    <div class="p-6 space-y-4 text-lg overflow-y-auto max-h-[60vh]">
                         <div class="grid grid-cols-2 gap-4">
                             <div>
                                 <div class="text-sm font-medium text-slate-500">Appareil</div>
@@ -2568,23 +2508,22 @@ class MikrotikConnection
                                 </button>
                             </div>
                         </div>
-                        <div class="flex flex-wrap gap-3 border-t border-slate-100 pt-4">
+                        <div class="border-t border-slate-100 pt-4">
                             <button type="button" @click="acquitterAlarme(f)"
-                                    class="flex-1 min-w-[200px] rounded-xl bg-rose-600 px-6 py-4 text-lg font-bold text-white hover:bg-rose-500 shadow-lg active:scale-[0.98] transition">
+                                    class="w-full rounded-xl bg-rose-600 px-6 py-4 text-lg font-bold text-white hover:bg-rose-500 shadow-lg active:scale-[0.98] transition">
                                 <x-icone nom="bell" class="h-6 w-6 inline mr-2" />
-                                Arrêter l'alarme
+                                Arrêter l'alarme (couper le son)
                             </button>
-                            <button type="button" @click="arreterEtFermer(f)"
-                                    class="flex-1 min-w-[200px] rounded-xl border-2 border-slate-300 bg-white px-6 py-4 text-lg font-semibold text-slate-700 hover:bg-slate-50">
-                                <x-icone nom="ban" class="h-6 w-6 inline mr-2" />
-                                Arrêter la session
-                            </button>
+                            <p class="mt-2 text-sm text-center text-slate-500">
+                                La session continue. La jauge reste dans le tableau.
+                            </p>
                         </div>
                     </div>
                 </div>
             </template>
         </div>
     </div>
+    </template>
 
     {{-- En-tête --}}
     <div class="mb-6 flex flex-wrap items-center justify-between gap-3">
@@ -2658,7 +2597,7 @@ class MikrotikConnection
         </div>
 
         <div class="relative min-w-[200px] flex-1 sm:max-w-sm">
-            <x-icone nom="search" class="pointer-events-none absolute left-3 top-1/2 h-5 w-5 -translate-y-1/2 text-slate-400 z-10" />
+            <x-icone nom="search" class="pointer-events-none absolute left-3 top-1/2 h-5 w-5 -translate-y-1/2 text-slate-400" />
             <input type="search" x-model="recherche" placeholder="Rechercher…"
                    class="h-11 w-full rounded-lg border border-slate-200 bg-white pl-10 pr-10 text-base shadow-sm focus:border-slate-800 focus:outline-none">
             <button type="button" x-show="recherche.length > 0" x-cloak @click="recherche = ''"
@@ -2679,42 +2618,67 @@ class MikrotikConnection
         <div class="max-h-[62vh] overflow-y-auto">
             <table class="w-full table-fixed text-sm">
                 <colgroup>
-                    <col style="width: 50px">
-                    <col style="width: 90px">
-                    <col>
-                    <col style="width: 140px">
-                    <col style="width: 95px">
-                    <col style="width: 125px">
-                    <col style="width: 130px">
-                    <col style="width: 105px">
-                    <col style="width: 220px">
+                    <col :style="'width: ' + colWidths.c0 + 'px'">
+                    <col :style="'width: ' + colWidths.c1 + 'px'">
+                    <col :style="'width: ' + colWidths.c2 + 'px'">
+                    <col :style="'width: ' + colWidths.c3 + 'px'">
+                    <col :style="'width: ' + colWidths.c4 + 'px'">
+                    <col :style="'width: ' + colWidths.c5 + 'px'">
+                    <col :style="'width: ' + colWidths.c6 + 'px'">
+                    <col :style="'width: ' + colWidths.c7 + 'px'">
+                    <col :style="'width: ' + colWidths.c8 + 'px'">
+                    <col :style="'width: ' + colWidths.c9 + 'px'">
                 </colgroup>
-                <thead class="sticky top-0 z-10 bg-slate-800 text-left text-xs font-semibold uppercase tracking-wide text-white">
+                <thead class="sticky top-0 z-[5] bg-slate-800 text-left text-xs font-semibold uppercase tracking-wide text-white">
                     <tr>
-                        <th class="px-2 py-2.5 text-center">
-                            <input type="checkbox" :checked="tousSelectionnes" @change="basculerTous()"
-                                   class="h-4 w-4 rounded border-slate-400 text-slate-900">
+                        <th class="px-2 py-2.5 text-center relative">
+                            <input type="checkbox" :checked="tousSelectionnes" @change="basculerTous()" class="h-4 w-4 rounded border-slate-400 text-slate-900">
+                            <div class="absolute top-0 right-0 w-1.5 h-full cursor-col-resize hover:bg-slate-500" @mousedown.prevent="startResize($event, 'c0')"></div>
                         </th>
-                        <th class="px-2 py-2.5">
+                        <th class="px-2 py-2.5 relative">
                             <button type="button" @click="trier('date_debut')" class="inline-flex items-center gap-1 hover:text-white/80">
-                                Heure
-                                <span class="text-white/50" x-show="cleTri !== 'date_debut'">↕</span>
-                                <span x-show="cleTri === 'date_debut'" x-text="sensTri === 'asc' ? '↑' : '↓'"></span>
+                                Heure <span class="text-white/50" x-show="cleTri !== 'date_debut'">↕</span><span x-show="cleTri === 'date_debut'" x-text="sensTri === 'asc' ? '↑' : '↓'"></span>
                             </button>
+                            <div class="absolute top-0 right-0 w-1.5 h-full cursor-col-resize hover:bg-slate-500" @mousedown.prevent="startResize($event, 'c1')"></div>
                         </th>
-                        <th class="px-2 py-2.5">Appareil</th>
-                        <th class="px-2 py-2.5">Réseau</th>
-                        <th class="px-2 py-2.5">État</th>
-                        <th class="px-2 py-2.5">Durée / Montant</th>
-                        <th class="px-2 py-2.5">Volume / Débit</th>
-                        <th class="px-2 py-2.5 text-center">Alarme</th>
-                        <th class="px-2 py-2.5 text-right">Actions</th>
+                        <th class="px-2 py-2.5 relative">
+                            Appareil
+                            <div class="absolute top-0 right-0 w-1.5 h-full cursor-col-resize hover:bg-slate-500" @mousedown.prevent="startResize($event, 'c2')"></div>
+                        </th>
+                        <th class="px-2 py-2.5 relative">
+                            Réseau
+                            <div class="absolute top-0 right-0 w-1.5 h-full cursor-col-resize hover:bg-slate-500" @mousedown.prevent="startResize($event, 'c3')"></div>
+                        </th>
+                        <th class="px-2 py-2.5 relative">
+                            État
+                            <div class="absolute top-0 right-0 w-1.5 h-full cursor-col-resize hover:bg-slate-500" @mousedown.prevent="startResize($event, 'c4')"></div>
+                        </th>
+                        <th class="px-2 py-2.5 relative">
+                            Durée / Montant
+                            <div class="absolute top-0 right-0 w-1.5 h-full cursor-col-resize hover:bg-slate-500" @mousedown.prevent="startResize($event, 'c5')"></div>
+                        </th>
+                        <th class="px-2 py-2.5 relative">
+                            Volume / Débit
+                            <div class="absolute top-0 right-0 w-1.5 h-full cursor-col-resize hover:bg-slate-500" @mousedown.prevent="startResize($event, 'c6')"></div>
+                        </th>
+                        <th class="px-2 py-2.5 text-center relative">
+                            Alarme
+                            <div class="absolute top-0 right-0 w-1.5 h-full cursor-col-resize hover:bg-slate-500" @mousedown.prevent="startResize($event, 'c7')"></div>
+                        </th>
+                        <th class="px-2 py-2.5 relative">
+                            Remarques
+                            <div class="absolute top-0 right-0 w-1.5 h-full cursor-col-resize hover:bg-slate-500" @mousedown.prevent="startResize($event, 'c8')"></div>
+                        </th>
+                        <th class="px-2 py-2.5 text-right relative">
+                            Actions
+                            <div class="absolute top-0 right-0 w-1.5 h-full cursor-col-resize hover:bg-slate-500" @mousedown.prevent="startResize($event, 'c9')"></div>
+                        </th>
                     </tr>
                 </thead>
                 <tbody>
                     <template x-if="lignesAffichees.length === 0">
                         <tr>
-                            <td colspan="9" class="px-4 py-16 text-center text-slate-400 text-base">
+                            <td colspan="10" class="px-4 py-16 text-center text-slate-400 text-base">
                                 <span x-show="recherche">Aucun résultat.</span>
                                 <span x-show="!recherche">Aucune session Wi-Fi.</span>
                             </td>
@@ -2794,39 +2758,51 @@ class MikrotikConnection
                                 </div>
                             </td>
                             <td class="px-2 py-2.5 text-center">
-                                <template x-if="l.alarme.declenchee && !l.alarme.acquittee && l.etat_appareil !== 'termine'">
-                                    <span class="inline-flex items-center gap-1 rounded-full bg-rose-100 px-2 py-0.5 text-xs font-bold text-rose-700 animate-pulse">
+                                {{-- 1) Alarme qui sonne (non acquittée) : on rend le bouton cliquable pour prolonger --}}
+                                <template x-if="l.alarme.active && l.alarme.declenchee && !l.alarme.acquittee && l.etat_appareil !== 'termine'">
+                                    <button type="button" @click="ouvrirProlonger(l)" title="Cliquer pour prolonger" class="inline-flex items-center gap-1 rounded-full bg-rose-100 px-2 py-0.5 text-xs font-bold text-rose-700 animate-pulse hover:bg-rose-200">
                                         <x-icone nom="bell" class="h-3.5 w-3.5" /> Sonne
-                                    </span>
+                                    </button>
                                 </template>
+
+                                {{-- 2) Alarme acquittée : le son est coupé, mais la jauge reste et permet de prolonger --}}
+                                <template x-if="l.alarme.active && l.alarme.acquittee && l.etat_appareil !== 'termine'">
+                                    <div class="space-y-1">
+                                        <div class="font-mono text-sm font-bold text-amber-700" x-text="chronoRestantTexte(l)"></div>
+                                        <div class="h-1 w-full overflow-hidden rounded-full bg-slate-200">
+                                            <div class="h-full bg-amber-500 transition-all" :style="'width: ' + progressionAlarme(l) + '%'"></div>
+                                        </div>
+                                        <button type="button" @click="ouvrirProlonger(l)" class="rounded text-[10px] font-medium text-emerald-700 hover:bg-emerald-50 px-1">+ Prolonger</button>
+                                    </div>
+                                </template>
+
+                                {{-- 3) Alarme posée, en cours de décompte --}}
                                 <template x-if="l.alarme.active && !l.alarme.declenchee && l.etat_appareil !== 'termine'">
                                     <div class="space-y-1">
-                                        <!-- Si connecté, on affiche le chrono -->
                                         <template x-if="l.etat_appareil === 'connecte'">
                                             <div class="font-mono text-sm font-bold text-amber-700" x-text="chronoRestantTexte(l)"></div>
                                         </template>
-                                        <!-- Si déconnecté, on affiche que l'alarme est en pause -->
                                         <template x-if="l.etat_appareil !== 'connecte'">
                                             <div class="text-xs font-bold text-slate-500 flex items-center justify-center gap-1">
                                                 <x-icone nom="pause" class="h-3 w-3" /> Alarme en pause
                                             </div>
                                         </template>
-                                        
                                         <div class="h-1 w-full overflow-hidden rounded-full bg-slate-200">
-                                            <div class="h-full bg-amber-500 transition-all"
-                                                 :style="'width: ' + progressionAlarme(l) + '%'"></div>
+                                            <div class="h-full bg-amber-500 transition-all" :style="'width: ' + progressionAlarme(l) + '%'"></div>
                                         </div>
                                         <div class="flex items-center justify-center gap-1">
-                                            <button type="button" @click="ouvrirProlonger(l)"
-                                                    class="rounded text-[10px] font-medium text-emerald-700 hover:bg-emerald-50 px-1">+ Prolonger</button>
-                                            <button type="button" @click="ouvrirAlarme(l, true)"
-                                                    class="rounded text-[10px] font-medium text-slate-600 hover:bg-slate-100 px-1">Modifier</button>
+                                            <button type="button" @click="ouvrirProlonger(l)" class="rounded text-[10px] font-medium text-emerald-700 hover:bg-emerald-50 px-1">+ Prolonger</button>
+                                            <button type="button" @click="ouvrirAlarme(l, true)" class="rounded text-[10px] font-medium text-slate-600 hover:bg-slate-100 px-1">Modifier</button>
                                         </div>
                                     </div>
                                 </template>
+
+                                {{-- 4) Session terminée --}}
                                 <template x-if="l.etat_appareil === 'termine'">
                                     <span class="text-xs text-slate-400">Session terminée</span>
                                 </template>
+
+                                {{-- 5) Aucune alarme --}}
                                 <template x-if="!l.alarme.active && l.etat_appareil !== 'termine'">
                                     <button type="button" @click="ouvrirAlarme(l)"
                                             class="inline-flex items-center gap-1 rounded-md border border-slate-200 bg-white px-2 py-0.5 text-xs text-slate-600 hover:bg-slate-50">
@@ -2834,23 +2810,38 @@ class MikrotikConnection
                                     </button>
                                 </template>
                             </td>
+                            {{-- Remarques --}}
                             <td class="px-2 py-2.5">
-                                <div class="flex items-center justify-end gap-1.5">
-                                    {{-- ARRÊTER : fige durée + montant (le client reste connecté) --}}
+                                <textarea x-model="l.remarque"
+                                          @focus="l._focusRemarque = true"
+                                          @blur="l._focusRemarque = false; sauverRemarque(l)"
+                                          rows="3" maxlength="1000"
+                                          placeholder="Tapez une remarque…"
+                                          class="w-full text-xs rounded border border-slate-200 px-2 py-1.5 focus:border-slate-800 focus:outline-none resize-y min-h-[64px] bg-white"></textarea>
+                            </td>
+                            <td class="px-2 py-2.5">
+                                <div class="flex flex-col items-stretch gap-1">
+                                    {{-- ARRÊTER --}}
                                     <template x-if="l.etat_appareil === 'connecte' || l.etat_appareil === 'deconnecte'">
                                         <button type="button" @click="confirmerArret(l)"
-                                                class="inline-flex items-center gap-1 rounded-md border border-amber-300 bg-white px-2 py-1 text-xs font-semibold text-amber-700 hover:bg-amber-50"
+                                                class="inline-flex items-center justify-center gap-1 rounded-md border border-amber-300 bg-white px-2 py-1 text-xs font-semibold text-amber-700 hover:bg-amber-50"
                                                 title="Figer la durée et le montant (le client reste connecté)">
-                                            <x-icone nom="ban" class="h-3.5 w-3.5" />
-                                            Arrêter
+                                            <x-icone nom="ban" class="h-3.5 w-3.5" /> Arrêter
+                                        </button>
+                                    </template>
+                                    {{-- CONTINUER --}}
+                                    <template x-if="l.etat_appareil === 'termine'">
+                                        <button type="button" @click="confirmerContinuer(l)"
+                                                class="inline-flex items-center justify-center gap-1 rounded-md border border-emerald-300 bg-white px-2 py-1 text-xs font-semibold text-emerald-700 hover:bg-emerald-50"
+                                                title="Reprendre la session depuis la même ligne">
+                                            <x-icone nom="play" class="h-3.5 w-3.5" /> Continuer
                                         </button>
                                     </template>
                                     {{-- SUPPRIMER --}}
                                     <button type="button" @click="confirmerSuppression(l)"
                                             class="inline-flex items-center gap-1 rounded-md border border-rose-300 bg-white px-2 py-1 text-xs font-semibold text-rose-700 hover:bg-rose-50"
                                             title="Supprimer définitivement">
-                                        <x-icone nom="trash" class="h-3.5 w-3.5" />
-                                        Supprimer
+                                        <x-icone nom="trash" class="h-3.5 w-3.5" /> Supprimer
                                     </button>
                                 </div>
                             </td>
@@ -2929,8 +2920,9 @@ class MikrotikConnection
 
     <p class="mt-3 text-sm text-slate-400">Actualisation temps réel. Dernière sync : <span x-text="derniereSync || '—'"></span></p>
 
-    {{-- ═══ Fenêtre de confirmation unique et dynamique ═══ --}}
-    <div x-show="confirmation.ouvert" x-cloak class="fixed inset-0 z-[300] flex items-center justify-center p-4">
+    {{-- Modales --}}
+    <template x-teleport="body">
+    <div x-show="confirmation.ouvert" x-cloak class="fixed inset-0 z-[9200] flex items-center justify-center p-4">
         <div class="absolute inset-0 bg-slate-900/70" @click="confirmation.ouvert = false" x-transition.opacity></div>
         <div x-show="confirmation.ouvert" x-transition class="relative w-full max-w-lg overflow-hidden rounded-2xl bg-white shadow-2xl">
             <div class="flex items-start gap-3 border-b border-slate-100 px-6 pt-5 pb-4">
@@ -2958,9 +2950,10 @@ class MikrotikConnection
             </div>
         </div>
     </div>
+    </template>
 
-    {{-- Modale Poser / Modifier alarme --}}
-    <div x-show="alarmeModal.ouvert" x-cloak class="fixed inset-0 z-[110] flex items-center justify-center p-4">
+    <template x-teleport="body">
+    <div x-show="alarmeModal.ouvert" x-cloak class="fixed inset-0 z-[9300] flex items-center justify-center p-4">
         <div class="absolute inset-0 bg-slate-900/60" @click="alarmeModal.ouvert = false" x-transition.opacity></div>
         <div x-show="alarmeModal.ouvert" x-transition class="relative w-full max-w-lg overflow-hidden rounded-2xl bg-white shadow-2xl">
             <div class="border-b border-slate-100 px-6 py-4">
@@ -3051,20 +3044,25 @@ class MikrotikConnection
             </div>
         </div>
     </div>
+    </template>
 
-    {{-- Modale Prolonger --}}
-    <div x-show="prolongerModal.ouvert" x-cloak class="fixed inset-0 z-[210] flex items-center justify-center p-4">
+    <template x-teleport="body">
+    <div x-show="prolongerModal.ouvert" x-cloak class="fixed inset-0 z-[9400] flex items-center justify-center p-4">
         <div class="absolute inset-0 bg-slate-900/60" @click="prolongerModal.ouvert = false" x-transition.opacity></div>
-        <div x-show="prolongerModal.ouvert" x-transition class="relative w-full max-w-md overflow-hidden rounded-2xl bg-white shadow-2xl">
+        <div x-show="prolongerModal.ouvert" x-transition class="relative w-full max-w-lg overflow-hidden rounded-2xl bg-white shadow-2xl">
             <div class="border-b border-slate-100 px-6 py-4">
                 <h2 class="text-xl font-bold text-slate-900">Prolonger l'alarme</h2>
                 <p class="text-base text-slate-500" x-text="prolongerModal.ligne?.appareil"></p>
             </div>
-            <div class="p-6 space-y-4">
+            <div class="p-6 space-y-4 max-h-[75vh] overflow-y-auto">
                 <div class="rounded-lg bg-slate-50 px-4 py-2.5 text-base">
                     <div class="text-slate-500">Limite actuelle</div>
                     <div class="font-bold text-slate-900" x-text="prolongerModal.ligne ? (formatDuree(prolongerModal.ligne.alarme.minutes) + ' (' + formatAr(prolongerModal.ligne.alarme.montant || 0) + ')') : ''"></div>
+                    <div class="text-xs text-slate-500 mt-1" x-show="prolongerModal.ligne?.alarme?.derniere_fin">
+                        Fin prévue actuelle : <span x-text="prolongerModal.ligne ? heureExacte(prolongerModal.ligne.alarme.derniere_fin || prolongerModal.ligne.alarme.fin) : ''"></span>
+                    </div>
                 </div>
+
                 <div>
                     <label class="mb-2 block text-base font-semibold text-slate-700">Ajouter</label>
                     <div class="flex gap-2">
@@ -3076,6 +3074,7 @@ class MikrotikConnection
                                 class="flex-1 rounded-lg px-4 py-2.5 text-base font-medium">Montant</button>
                     </div>
                 </div>
+
                 <div>
                     <template x-if="prolongerModal.type === 'duree'">
                         <div class="flex items-center gap-2">
@@ -3092,6 +3091,29 @@ class MikrotikConnection
                                class="w-full rounded-lg border-2 border-slate-300 px-3 py-2.5 font-mono text-lg">
                     </template>
                 </div>
+
+                <div>
+                    <label class="mb-2 block text-base font-semibold text-slate-700">Point de départ</label>
+                    <div class="space-y-1.5">
+                        <label class="flex items-start gap-3 rounded-lg border-2 border-slate-200 p-2.5 hover:bg-slate-50 cursor-pointer"
+                               :class="prolongerModal.depart === 'apres' ? 'border-slate-900 bg-slate-50' : ''">
+                            <input type="radio" x-model="prolongerModal.depart" value="apres" class="mt-1">
+                            <div>
+                                <div class="text-sm font-semibold text-slate-900">À la suite de l'alarme précédente <span class="text-xs text-emerald-700">(recommandé)</span></div>
+                                <div class="text-xs text-slate-500">S'ajoute à la fin prévue : pas de minute perdue.</div>
+                            </div>
+                        </label>
+                        <label class="flex items-start gap-3 rounded-lg border-2 border-slate-200 p-2.5 hover:bg-slate-50 cursor-pointer"
+                               :class="prolongerModal.depart === 'maintenant' ? 'border-slate-900 bg-slate-50' : ''">
+                            <input type="radio" x-model="prolongerModal.depart" value="maintenant" class="mt-1">
+                            <div>
+                                <div class="text-sm font-semibold text-slate-900">À partir de maintenant</div>
+                                <div class="text-xs text-slate-500">Compte à partir de l'instant où vous validez.</div>
+                            </div>
+                        </label>
+                    </div>
+                </div>
+
                 <div class="flex flex-wrap gap-2">
                     <template x-for="r in prolongerModal.raccourcis" :key="r.label">
                         <button type="button" @click="appliquerRaccourciProlongation(r)"
@@ -3099,6 +3121,7 @@ class MikrotikConnection
                                 x-text="r.label"></button>
                     </template>
                 </div>
+
                 <template x-if="prolongerModal.erreur">
                     <div class="rounded-lg border border-rose-200 bg-rose-50 px-4 py-2.5 text-base text-rose-700" x-text="prolongerModal.erreur"></div>
                 </template>
@@ -3114,9 +3137,10 @@ class MikrotikConnection
             </div>
         </div>
     </div>
+    </template>
 
-    {{-- Modale Réglages --}}
-    <div x-show="reglages.ouvert" x-cloak class="fixed inset-0 z-[100] flex items-center justify-center p-4">
+    <template x-teleport="body">
+    <div x-show="reglages.ouvert" x-cloak class="fixed inset-0 z-[9300] flex items-center justify-center p-4">
         <div class="absolute inset-0 bg-slate-900/60" x-transition.opacity></div>
         <div x-show="reglages.ouvert" x-transition class="relative w-full max-w-3xl overflow-hidden rounded-2xl bg-white shadow-2xl">
             <div class="flex items-center justify-between border-b border-slate-100 px-6 py-4">
@@ -3137,7 +3161,6 @@ class MikrotikConnection
                         class="rounded-md px-4 py-2 text-base font-medium">Sons</button>
             </div>
             <div class="max-h-[60vh] overflow-y-auto p-6 text-base">
-                {{-- Onglet Général --}}
                 <div x-show="reglages.tab === 'general'" class="space-y-6">
                     <div class="flex items-center justify-between rounded-lg border border-slate-200 p-4">
                         <div>
@@ -3189,7 +3212,6 @@ class MikrotikConnection
                     </div>
                 </div>
 
-                {{-- Onglet Sons --}}
                 <div x-show="reglages.tab === 'sons'" class="space-y-5">
                     <div class="rounded-lg border border-slate-200 p-4 space-y-3">
                         <div class="flex items-center justify-between">
@@ -3321,8 +3343,8 @@ class MikrotikConnection
             </div>
         </div>
     </div>
+    </template>
 
-    {{-- Modale confirmation suppression son --}}
     <div x-show="supprSonModal.ouvert" x-cloak class="fixed inset-0 z-[220] flex items-center justify-center p-4">
         <div class="absolute inset-0 bg-slate-900/60" @click="supprSonModal.ouvert = false" x-transition.opacity></div>
         <div x-show="supprSonModal.ouvert" x-transition class="relative w-full max-w-md overflow-hidden rounded-2xl bg-white shadow-2xl">
@@ -3344,7 +3366,6 @@ class MikrotikConnection
         </div>
     </div>
 
-    {{-- Modale réinitialisation --}}
     <div x-show="resetModal.ouvert" x-cloak class="fixed inset-0 z-[220] flex items-center justify-center p-4">
         <div class="absolute inset-0 bg-slate-900/60" @click="resetModal.ouvert = false" x-transition.opacity></div>
         <div x-show="resetModal.ouvert" x-transition class="relative w-full max-w-md overflow-hidden rounded-2xl bg-white shadow-2xl">
@@ -3397,7 +3418,7 @@ function wifiPage(cfg) {
 
         alarmeModal: {
             ouvert: false, ligne: null, modifier: false,
-            type: 'duree', h: 0, m: 30, montant: 1000, depart: 'maintenant',
+            type: 'duree', h: 0, m: 30, montant: 1000, depart: 'apres',
             raccourcis: [
                 { label: '15 min', type: 'duree', h: 0, m: 15 },
                 { label: '30 min', type: 'duree', h: 0, m: 30 },
@@ -3409,7 +3430,7 @@ function wifiPage(cfg) {
         },
 
         prolongerModal: {
-            ouvert: false, ligne: null, type: 'duree', h: 0, m: 15, montant: 500,
+            ouvert: false, ligne: null, type: 'duree', depart: 'apres', h: 0, m: 15, montant: 500,
             raccourcis: [
                 { label: '+15 min', type: 'duree', h: 0, m: 15 },
                 { label: '+30 min', type: 'duree', h: 0, m: 30 },
@@ -3417,13 +3438,14 @@ function wifiPage(cfg) {
                 { label: '+500 Ar', type: 'montant', montant: 500 },
                 { label: '+1000 Ar', type: 'montant', montant: 1000 },
             ],
-            erreur: '', enCours: false, depuisFenetre: false,
+            erreur: '', enCours: false,
         },
 
         supprSonModal: { ouvert: false, nom: '', son: null },
         resetModal: { ouvert: false },
 
         fenetresAlarme: [],
+        ongletAlarmeActif: null,
 
         dragActif: false,
 
@@ -3436,6 +3458,26 @@ function wifiPage(cfg) {
         _alarmesFermees: new Set(),
 
         volumeCache: {},
+        
+        colWidths: JSON.parse(localStorage.getItem('cm_wifi_cols')) || { c0: 40, c1: 75, c2: 150, c3: 90, c4: 75, c5: 100, c6: 100, c7: 85, c8: 120, c9: 110 },
+        resizing: null,
+        startResize(e, colKey) {
+            this.resizing = { key: colKey, startX: e.pageX, startW: this.colWidths[colKey] };
+            const onMove = (ev) => {
+                if (!this.resizing) return;
+                const delta = ev.pageX - this.resizing.startX;
+                this.colWidths[this.resizing.key] = Math.max(50, this.resizing.startW + delta);
+            };
+            const onUp = () => {
+                localStorage.setItem('cm_wifi_cols', JSON.stringify(this.colWidths));
+                this.resizing = null;
+                document.removeEventListener('mousemove', onMove);
+                document.removeEventListener('mouseup', onUp);
+            };
+            document.addEventListener('mousemove', onMove);
+            document.addEventListener('mouseup', onUp);
+        },
+
         now: Date.now(),
 
         init() {
@@ -3453,7 +3495,15 @@ function wifiPage(cfg) {
                 const r = await fetch(cfg.urlEtat, { headers: { 'Accept': 'application/json' } });
                 if (!r.ok) return;
                 const d = await r.json();
-                this.lignes = d.lignes ?? [];
+                const anciens = new Map(this.lignes.map(x => [x.id, x]));
+                this.lignes = (d.lignes ?? []).map(nl => {
+                    const old = anciens.get(nl.id);
+                    if (old && old._focusRemarque) {
+                        nl.remarque = old.remarque;
+                        nl._focusRemarque = true;
+                    }
+                    return nl;
+                });
                 this.stats = d.stats ?? this.stats;
                 this.mettreAJourVouchers(d.vouchers_disponibles ?? []);
                 this.derniereSync = new Date().toLocaleTimeString('fr-FR');
@@ -3465,13 +3515,11 @@ function wifiPage(cfg) {
         mettreAJourVouchers(nouveaux) {
             const idsNouveaux = new Set(nouveaux.map(v => v.id));
 
-            // Retirer ceux qui ne sont plus dans la réponse (utilisés depuis)
             this.vouchersDisponibles.forEach(v => {
                 if (!idsNouveaux.has(v.id) && !v.transition) {
                     v.transition = true;
                     setTimeout(() => {
                         this.vouchersDisponibles = this.vouchersDisponibles.filter(x => x.id !== v.id);
-                        // Ajouter les nouveaux qui ne sont pas encore là
                         nouveaux.forEach(nv => {
                             if (!this.vouchersDisponibles.find(x => x.id === nv.id)) {
                                 this.vouchersDisponibles.push({...nv, masque: true, transition: false});
@@ -3481,7 +3529,6 @@ function wifiPage(cfg) {
                 }
             });
 
-            // Ajouter les nouveaux immédiatement
             nouveaux.forEach(nv => {
                 if (!this.vouchersDisponibles.find(x => x.id === nv.id)) {
                     this.vouchersDisponibles.push({...nv, masque: true, transition: false});
@@ -3491,20 +3538,29 @@ function wifiPage(cfg) {
 
         verifierAlarmes() {
             this.lignes.forEach(l => {
-                if (!l.alarme.active || !l.alarme.fin) {
-                    if (this.fenetresAlarme.find(f => f.id === l.id)) {
-                        this.fermerFenetre(l.id);
-                    }
+                const fenetreOuverte = this.fenetresAlarme.find(f => f.id === l.id);
+
+                if (this._alarmesFermees.has(l.id)) {
+                    if (fenetreOuverte) this.fermerFenetre(l.id);
                     return;
                 }
-                const fin = new Date(l.alarme.fin).getTime();
-                const dejaDansListe = this.fenetresAlarme.find(f => f.id === l.id);
 
-                if (this.now >= fin && !dejaDansListe && !this._alarmesFermees.has(l.id) && l.etat_appareil === 'connecte') {
-                    this.ouvrirFenetreAlarme(l);
-                }
-                if (this.now < fin && dejaDansListe) {
+                if (l.alarme.acquittee && fenetreOuverte) {
                     this.fermerFenetre(l.id);
+                    this._alarmesFermees.add(l.id);
+                    return;
+                }
+
+                if (l.alarme.active && l.alarme.fin) {
+                    const fin = new Date(l.alarme.fin).getTime();
+
+                    if (this.now >= fin && !fenetreOuverte && l.etat_appareil === 'connecte') {
+                        this.ouvrirFenetreAlarme(l);
+                    }
+
+                    if (this.now < fin && fenetreOuverte) {
+                        this.fermerFenetre(l.id);
+                    }
                 }
             });
 
@@ -3520,9 +3576,19 @@ function wifiPage(cfg) {
             });
 
             if (this.fenetresAlarme.length > 0 && this.alarme.enabled) {
-                if (this.now - this._lastBeep > 2500) {
-                    this._lastBeep = this.now;
-                    this.jouerSon();
+                const dureeMax = parseInt(this.alarme.duree_secondes ?? 0, 10);
+
+                const fenetresActives = this.fenetresAlarme.filter(f => {
+                    if (!f._debutSonnerie) f._debutSonnerie = this.now;
+                    if (!dureeMax || dureeMax <= 0) return true;
+                    return (this.now - f._debutSonnerie) < dureeMax * 1000;
+                });
+
+                if (fenetresActives.length > 0) {
+                    if (this.now - this._lastBeep > 2500) {
+                        this._lastBeep = this.now;
+                        this.jouerSon();
+                    }
                 }
             }
         },
@@ -3538,6 +3604,7 @@ function wifiPage(cfg) {
                 heureFin: this.heureExacte(l.alarme.fin),
                 depassementSecondes: 0,
                 depassementMontant: 0,
+                _debutSonnerie: Date.now(),
                 prolongationsRapides: [
                     { label: '+15 min', type: 'duree', h: 0, m: 15 },
                     { label: '+30 min', type: 'duree', h: 0, m: 30 },
@@ -3545,6 +3612,10 @@ function wifiPage(cfg) {
                     { label: '+1000 Ar', type: 'montant', montant: 1000 },
                 ],
             });
+
+            if (!this.ongletAlarmeActif || !this.fenetresAlarme.find(x => x.id === this.ongletAlarmeActif)) {
+                this.ongletAlarmeActif = l.id;
+            }
 
             this.marquerDeclenchee(l.id);
             if (l.alarme) l.alarme.declenchee = true;
@@ -3564,6 +3635,9 @@ function wifiPage(cfg) {
 
         fermerFenetre(id) {
             this.fenetresAlarme = this.fenetresAlarme.filter(f => f.id !== id);
+            if (this.ongletAlarmeActif === id) {
+                this.ongletAlarmeActif = this.fenetresAlarme.length > 0 ? this.fenetresAlarme[0].id : null;
+            }
             if (this.fenetresAlarme.length === 0) {
                 this.arreterSon();
                 this.clignoterTitre(false);
@@ -3589,18 +3663,20 @@ function wifiPage(cfg) {
 
         async marquerDeclenchee(id) {
             try {
-                await window.cmFetch(`${cfg.urlSession}/${id}/alarme/acquitter`, { method: 'POST' });
+                await window.cmFetch(`${cfg.urlSession}/${id}/alarme/declencher`, { method: 'POST' });
             } catch (e) {}
         },
 
         async acquitterAlarme(f) {
             this.arreterSon();
-            const l = this.lignes.find(x => x.id === f.id);
-            if (l && l.alarme) l.alarme.acquittee = true;
-            this._alarmesFermees.add(f.id);
             this.fermerFenetre(f.id);
             try {
-                await window.cmFetch(`${cfg.urlSession}/${f.id}/alarme/acquitter`, { method: 'POST' });
+                const r = await window.cmFetch(`${cfg.urlSession}/${f.id}/alarme/acquitter`, { method: 'POST' });
+                const d = await r.json();
+                if (d && d.lignes) {
+                    this.lignes = d.lignes;
+                    this.stats = d.stats ?? this.stats;
+                }
             } catch (e) {}
             await this.rafraichir();
         },
@@ -3632,6 +3708,10 @@ function wifiPage(cfg) {
                 window.dispatchEvent(new CustomEvent('toast', { detail: d.message }));
                 this.fermerFenetre(f.id);
                 this._alarmesFermees.delete(f.id);
+                if (d.lignes) {
+                    this.lignes = d.lignes;
+                    this.stats = d.stats ?? this.stats;
+                }
                 await this.rafraichir();
             } catch (e) {}
         },
@@ -3647,7 +3727,7 @@ function wifiPage(cfg) {
                 type: l.alarme.type || 'duree',
                 h: 0, m: l.alarme.minutes || 30,
                 montant: l.alarme.montant || 1000,
-                depart: 'maintenant',
+                depart: 'apres',
                 raccourcis: this.alarmeModal.raccourcis,
                 apercu: '', erreur: '', enCours: false,
             };
@@ -3741,8 +3821,14 @@ function wifiPage(cfg) {
         ouvrirProlonger(l, depuisFenetre = false) {
             this.prolongerModal = {
                 ouvert: true, ligne: l, depuisFenetre: depuisFenetre,
-                type: 'duree', h: 0, m: 15, montant: 500,
-                raccourcis: this.prolongerModal.raccourcis,
+                type: 'duree', depart: 'apres', h: 0, m: 15, montant: 500,
+                raccourcis: [
+                    { label: '+15 min', type: 'duree', h: 0, m: 15 },
+                    { label: '+30 min', type: 'duree', h: 0, m: 30 },
+                    { label: '+1 h', type: 'duree', h: 1, m: 0 },
+                    { label: '+500 Ar', type: 'montant', montant: 500 },
+                    { label: '+1000 Ar', type: 'montant', montant: 1000 },
+                ],
                 erreur: '', enCours: false,
             };
         },
@@ -3764,6 +3850,7 @@ function wifiPage(cfg) {
             this.prolongerModal.enCours = true;
             const body = {
                 type: this.prolongerModal.type,
+                depart: this.prolongerModal.depart,
                 valeur: this.prolongerModal.type === 'duree'
                     ? (this.prolongerModal.h * 60 + this.prolongerModal.m)
                     : this.prolongerModal.montant,
@@ -3793,9 +3880,6 @@ function wifiPage(cfg) {
             this.prolongerModal.enCours = false;
         },
 
-        // -----------------------------------------------------------------
-        // ═══ CONFIRMATIONS DYNAMIQUES ═══
-        // -----------------------------------------------------------------
         ouvrirConfirmation(opts) {
             this.confirmation = {
                 ouvert: true, enCours: false,
@@ -3834,6 +3918,25 @@ function wifiPage(cfg) {
             });
         },
 
+        confirmerContinuer(l) {
+            this.ouvrirConfirmation({
+                titre: 'Continuer cette session ?',
+                message: `La durée et le montant de <strong>${this.escapeHtml(l.appareil)}</strong> vont reprendre.<br><br>Le temps passé hors ligne n'est pas facturé.`,
+                bouton: 'Continuer',
+                danger: false,
+                action: async () => {
+                    const r = await window.cmFetch(`${cfg.urlContinuer}/${l.id}/continuer`, { method: 'POST' });
+                    const d = await r.json();
+                    if (!r.ok || !d.ok) {
+                        window.dispatchEvent(new CustomEvent('toast', { detail: d.message || 'Erreur.' }));
+                        return;
+                    }
+                    window.dispatchEvent(new CustomEvent('toast', { detail: d.message }));
+                    await this.rafraichir();
+                }
+            });
+        },
+
         confirmerSuppression(l) {
             const montant = this.montantFinalCalcule(l);
             const montantTxt = Number(montant || 0).toLocaleString('fr-FR');
@@ -3850,17 +3953,66 @@ function wifiPage(cfg) {
                 bouton: 'Supprimer définitivement',
                 danger: true,
                 action: async () => {
-                    const r = await window.cmFetch(`${cfg.urlSession}/${l.id}`, { method: 'DELETE' });
-                    const d = await r.json();
-                    if (!r.ok || !d.ok) {
-                        window.dispatchEvent(new CustomEvent('toast', { detail: d.message || 'Erreur.' }));
-                        if (d.redirect) window.location.href = d.redirect;
-                        return;
-                    }
-                    window.dispatchEvent(new CustomEvent('toast', { detail: d.message }));
-                    await this.rafraichir();
+                    await this.executerSuppression(l, false);
                 }
             });
+        },
+
+        async executerSuppression(l, force) {
+            const url = `${cfg.urlSession}/${l.id}` + (force ? '?force=1' : '');
+            const r = await window.cmFetch(url, { method: 'DELETE' });
+            const d = await r.json();
+
+            if (r.status === 409 && d.besoin_force) {
+                const liste = (d.autres || [])
+                    .map(x => `<li class="font-mono">${this.escapeHtml(x.mac || '—')}</li>`)
+                    .join('');
+                this.ouvrirConfirmation({
+                    titre: '⚠ Cet identifiant est encore utilisé',
+                    message:
+                        `Le voucher <strong>${this.escapeHtml(l.voucher?.username || '')}</strong> ` +
+                        `est actuellement associé à <strong>${d.autres.length}</strong> autre(s) connexion(s) active(s) :` +
+                        `<ul class="list-disc pl-6 mt-2 text-sm">${liste}</ul><br>` +
+                        `Sa suppression va interrompre ces connexions et couper leur accès Internet.<br><br>` +
+                        `<strong>Voulez-vous vraiment continuer ?</strong>`,
+                    bouton: 'Supprimer et déconnecter',
+                    danger: true,
+                    action: async () => {
+                        await this.executerSuppression(l, true);
+                    }
+                });
+                return;
+            }
+
+            if (!r.ok || !d.ok) {
+                window.dispatchEvent(new CustomEvent('toast', { detail: d.message || 'Erreur.' }));
+                if (d.redirect) window.location.href = d.redirect;
+                return;
+            }
+            window.dispatchEvent(new CustomEvent('toast', { detail: d.message }));
+            await this.rafraichir();
+        },
+
+        async sauverRemarque(l) {
+            const val = (l.remarque || '').trim();
+            if ((l._derniereRemarque ?? null) === val) return;
+            try {
+                const r = await window.cmFetch(`${cfg.urlRemarque}/${l.id}/remarque`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ remarque: val || null }),
+                });
+                const d = await r.json();
+                if (!r.ok || !d.ok) {
+                    window.dispatchEvent(new CustomEvent('toast', { detail: d.message || 'Erreur.' }));
+                    return;
+                }
+                l.remarque = d.remarque;
+                l._editionRemarque = false;
+                window.dispatchEvent(new CustomEvent('toast', { detail: 'Remarque enregistrée.' }));
+            } catch (e) {
+                window.dispatchEvent(new CustomEvent('toast', { detail: 'Erreur réseau.' }));
+            }
         },
 
         demanderSuppressionMasse() {
@@ -3885,9 +4037,6 @@ function wifiPage(cfg) {
             });
         },
 
-        // -----------------------------------------------------------------
-        // Réglages
-        // -----------------------------------------------------------------
         async chargerReglages() {
             try {
                 const r = await fetch(cfg.urlReglagesGet, { headers: { 'Accept': 'application/json' } });
@@ -3981,7 +4130,6 @@ function wifiPage(cfg) {
                     return;
                 }
 
-                // Choix du son actif
                 if (this.reglages.form.sonUrl && this.reglages.form.sonUrl.startsWith('/sounds/')) {
                     const nom = this.reglages.form.sonUrl.split('/').pop();
                     await window.cmFetch(cfg.urlChoisirSon, {
@@ -4027,9 +4175,6 @@ function wifiPage(cfg) {
             } catch (e) {}
         },
 
-        // -----------------------------------------------------------------
-        // Upload son
-        // -----------------------------------------------------------------
         dropSon(event) {
             this.dragActif = false;
             const f = event.dataTransfer?.files?.[0];
@@ -4108,9 +4253,6 @@ function wifiPage(cfg) {
             } catch (e) {}
         },
 
-        // -----------------------------------------------------------------
-        // Son
-        // -----------------------------------------------------------------
         jouerSon() {
             if (this.alarme.son_url) {
                 const a = this.$refs.audio;
@@ -4212,9 +4354,6 @@ function wifiPage(cfg) {
             Notification.requestPermission().then(p => this.notifAutorisee = p === 'granted');
         },
 
-        // -----------------------------------------------------------------
-        // Formats
-        // -----------------------------------------------------------------
         formatAr(n) { return Number(n || 0).toLocaleString('fr-FR') + ' Ar'; },
         formatDuree(m) {
             m = parseInt(m, 10) || 0;
@@ -4265,7 +4404,6 @@ function wifiPage(cfg) {
             } else if (l.etat_appareil === 'deconnecte' && l.deconnecte_at) {
                 fin = new Date(l.deconnecte_at).getTime();
             } else if (l.etat_appareil === 'termine') {
-                // Session figée : on ne regarde JAMAIS l'heure courante.
                 fin = l.date_fin_reelle
                     ? new Date(l.date_fin_reelle).getTime()
                     : (l.deconnecte_at ? new Date(l.deconnecte_at).getTime() : debut);
@@ -4281,7 +4419,9 @@ function wifiPage(cfg) {
         montantTempsReel(l) {
             if (!l.tarif) return 0;
             const sec = this.secondesConsommees(l);
-            return Math.floor((sec / 60) * l.tarif.montant_par_minute);
+            const brut = Math.floor((sec / 60) * l.tarif.montant_par_minute);
+            const mini = l.tarif.montant_minimum || 0;
+            return Math.max(brut, mini);
         },
 
         montantFinalCalcule(l) {
@@ -4299,7 +4439,7 @@ function wifiPage(cfg) {
         },
 
         chronoRestantTexte(l) {
-            if (!l.alarme.fin) return 'En pause'; // Si pas de date de fin, c'est en pause
+            if (!l.alarme.fin) return 'En pause';
             const fin = new Date(l.alarme.fin).getTime();
             const sec = Math.max(0, Math.floor((fin - this.now) / 1000));
             return this.formatDureeSec(sec);
@@ -4316,14 +4456,25 @@ function wifiPage(cfg) {
             const key = l.id + '-' + sens;
             const volume = sens === 'entree' ? l.volume_entree : l.volume_sortie;
             const now = Date.now();
-            const c = this.volumeCache[key];
-            if (!c) { this.volumeCache[key] = { vol: volume, ts: now, mbps: 0 }; return '0 Ko/s'; }
-            const dOctets = volume - c.vol;
-            const dSec = (now - c.ts) / 1000;
-            if (dSec >= 1 && dOctets >= 0) {
-                c.mbps = (dOctets * 8) / (dSec * 1_000_000);
-                c.vol = volume;
-                c.ts = now;
+            let c = this.volumeCache[key];
+            if (!c) {
+                c = this.volumeCache[key] = { echantillons: [], mbps: 0, volActuel: volume };
+                return '0 Ko/s';
+            }
+            if (volume < c.volActuel) c.echantillons = [];
+            c.volActuel = volume;
+            const dernier = c.echantillons[c.echantillons.length - 1];
+            if (!dernier || now - dernier.ts >= 2000 || volume !== dernier.vol) {
+                c.echantillons.push({ vol: volume, ts: now });
+                if (c.echantillons.length > 5) c.echantillons.shift();
+            }
+            if (c.echantillons.length >= 2) {
+                const premier = c.echantillons[0];
+                const dOctets = volume - premier.vol;
+                const dSec = (now - premier.ts) / 1000;
+                if (dSec >= 1 && dOctets >= 0) {
+                    c.mbps = (dOctets * 8) / (dSec * 1_000_000);
+                }
             }
             return this.formatDebit(c.mbps);
         },
@@ -4351,7 +4502,7 @@ function wifiPage(cfg) {
             };
         },
         classeLigne(l) {
-            if (l.alarme.declenchee && !l.alarme.acquittee && l.etat_appareil !== 'termine') return 'bg-rose-50 border-l-4 border-rose-500';
+            if (l.alarme.active && l.alarme.declenchee && !l.alarme.acquittee && l.etat_appareil !== 'termine') return 'bg-rose-50 border-l-4 border-rose-500';
             return {
                 'bg-emerald-50/60 border-l-4 border-emerald-500': l.etat_appareil === 'connecte',
                 'bg-amber-100/70 border-l-4 border-amber-500': l.etat_appareil === 'deconnecte',
@@ -4548,7 +4699,7 @@ function wifiPage(cfg) {
 📄  app/Models/Session.php
 ──────────────────────────────────────────────────────────────────────────────
 
-# Taille : 4.7 Ko  |  Statut : OK
+# Taille : 4.0 Ko  |  Statut : OK
 
 <?php
 
@@ -4581,8 +4732,9 @@ class Session extends Model
         'etat_wifi', 'deconnecte_at', 'reconnecte_at', 'duree_hors_ligne_secondes',
         'pause_at', 'duree_pause_secondes',
         'alarme_active', 'alarme_type', 'alarme_duree_minutes', 'alarme_montant',
-        'alarme_fin_prevue', 'alarme_declenchee_at', 'alarme_message',
-        'alarme_historique', 'alarme_secondes_restantes',
+        'alarme_fin_prevue', 'alarme_derniere_fin_at', 'alarme_declenchee_at',
+        'alarme_message', 'alarme_historique', 'alarme_secondes_restantes',
+        'remarque',
     ];
 
     protected $casts = [
@@ -4596,6 +4748,7 @@ class Session extends Model
         'reconnecte_at' => 'datetime',
         'pause_at' => 'datetime',
         'alarme_fin_prevue' => 'datetime',
+        'alarme_derniere_fin_at' => 'datetime',
         'alarme_declenchee_at' => 'datetime',
         'alarme_active' => 'boolean',
         'duree_hors_ligne_secondes' => 'integer',
@@ -4606,10 +4759,6 @@ class Session extends Model
         'alarme_secondes_restantes' => 'integer',
     ];
 
-    // -----------------------------------------------------------------
-    // Relations
-    // -----------------------------------------------------------------
-
     public function poste(): BelongsTo { return $this->belongsTo(Poste::class); }
     public function recharges(): HasMany { return $this->hasMany(Recharge::class); }
     public function restitutions(): HasMany { return $this->hasMany(Restitution::class); }
@@ -4617,56 +4766,24 @@ class Session extends Model
     public function voucher(): BelongsTo { return $this->belongsTo(Voucher::class); }
     public function appareilWifi(): BelongsTo { return $this->belongsTo(AppareilWifi::class, 'appareil_wifi_id'); }
 
-    // -----------------------------------------------------------------
-    // Helpers
-    // -----------------------------------------------------------------
+    public function estConnecte(): bool   { return $this->etat_wifi === self::WIFI_CONNECTE; }
+    public function estDeconnecte(): bool { return $this->etat_wifi === self::WIFI_DECONNECTE; }
+    public function estEnPause(): bool    { return $this->etat_wifi === self::WIFI_EN_PAUSE; }
+    public function estTermine(): bool    { return $this->etat_wifi === self::WIFI_TERMINE; }
 
-    public function estConnecte(): bool
-    {
-        return $this->etat_wifi === self::WIFI_CONNECTE;
-    }
-
-    public function estDeconnecte(): bool
-    {
-        return $this->etat_wifi === self::WIFI_DECONNECTE;
-    }
-
-    public function estEnPause(): bool
-    {
-        return $this->etat_wifi === self::WIFI_EN_PAUSE;
-    }
-
-    public function estTermine(): bool
-    {
-        return $this->etat_wifi === self::WIFI_TERMINE;
-    }
-
-    /**
-     * Vrai si le compteur doit tourner maintenant.
-     */
     public function compteurActif(): bool
     {
         return $this->etat_wifi === self::WIFI_CONNECTE;
     }
 
-    /**
-     * Secondes consommées au moment présent.
-     *
-     * Décrémente du temps de :
-     *   - duree_hors_ligne_secondes (déconnexions)
-     *   - duree_pause_secondes (mises en pause manuelles)
-     *   - du temps depuis pause_at si en pause actuellement
-     */
     public function secondesConsommees(): int
     {
         if (!$this->date_heure_debut) return 0;
 
-        // Terminé = figé
         if ($this->estTermine()) {
             return max(0, (int) $this->duree_consommee * 60);
         }
 
-        // Fin virtuelle : maintenant, ou pause_at, ou deconnecte_at
         if ($this->estEnPause() && $this->pause_at) {
             $fin = $this->pause_at;
         } elseif ($this->estDeconnecte() && $this->deconnecte_at) {
@@ -7291,7 +7408,7 @@ class ExpireSessions extends Command
 📄  routes/web.php
 ──────────────────────────────────────────────────────────────────────────────
 
-# Taille : 8.5 Ko  |  Statut : OK
+# Taille : 8.9 Ko  |  Statut : OK
 
 <?php
 
@@ -7448,14 +7565,17 @@ Route::middleware('auth')->group(function () {
 
     // Actions Wi-Fi session (jamais de "démarrer" : c'est MikroTik qui détecte les connexions)
     Route::post('/wifi/session/{session}/arreter',  [WifiController::class, 'arreter'])->name('wifi.session.arreter');
+    Route::post('/wifi/session/{session}/continuer', [WifiController::class, 'continuer'])->name('wifi.session.continuer');
     Route::delete('/wifi/session/{session}',         [WifiController::class, 'supprimer'])->name('wifi.session.supprimer');
     Route::post('/wifi/session/supprimer-masse',     [WifiController::class, 'supprimerMasse'])->name('wifi.session.supprimer-masse');
+    Route::post('/wifi/session/{session}/remarque', [WifiController::class, 'enregistrerRemarque'])->name('wifi.session.remarque');
 
     // Alarmes par appareil
     Route::post('/wifi/session/{session}/alarme',            [WifiController::class, 'definirAlarme'])->name('wifi.session.alarme');
     Route::post('/wifi/session/{session}/alarme/prolonger',  [WifiController::class, 'prolongerAlarme'])->name('wifi.session.alarme.prolonger');
     Route::post('/wifi/session/{session}/alarme/annuler',    [WifiController::class, 'annulerAlarme'])->name('wifi.session.alarme.annuler');
     Route::post('/wifi/session/{session}/alarme/acquitter',  [WifiController::class, 'acquitterAlarme'])->name('wifi.session.alarme.acquitter');
+    Route::post('/wifi/session/{session}/alarme/declencher', [WifiController::class, 'marquerAlarmeDeclenchee'])->name('wifi.session.alarme.declencher');
 
     // Réglages alarme
     Route::get('/wifi/alarme',              [WifiAlarmController::class, 'index'])->name('wifi.alarme.index');
@@ -7846,16 +7966,115 @@ return new class extends Migration
 };
 
 
+──────────────────────────────────────────────────────────────────────────────
+📄  database/migrations/2026_10_12_000000_add_alarme_pause_to_cyber_sessions.php
+──────────────────────────────────────────────────────────────────────────────
+
+# Taille : 718 o  |  Statut : OK
+
+<?php
+
+use Illuminate\Database\Migrations\Migration;
+use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Support\Facades\Schema;
+
+return new class extends Migration
+{
+    public function up(): void
+    {
+        Schema::table('cyber_sessions', function (Blueprint $table) {
+            // Stocke le nombre de secondes restantes de l'alarme lorsque l'appareil est déconnecté
+            $table->unsignedInteger('alarme_secondes_restantes')->nullable()->after('alarme_fin_prevue');
+        });
+    }
+
+    public function down(): void
+    {
+        Schema::table('cyber_sessions', function (Blueprint $table) {
+            $table->dropColumn('alarme_secondes_restantes');
+        });
+    }
+};
+
+
+──────────────────────────────────────────────────────────────────────────────
+📄  database/migrations/2026_10_13_120000_add_remarque_to_cyber_sessions.php
+──────────────────────────────────────────────────────────────────────────────
+
+# Taille : 745 o  |  Statut : OK
+
+<?php
+
+use Illuminate\Database\Migrations\Migration;
+use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Support\Facades\Schema;
+
+return new class extends Migration
+{
+    public function up(): void
+    {
+        if (!Schema::hasColumn('cyber_sessions', 'remarque')) {
+            Schema::table('cyber_sessions', function (Blueprint $table) {
+                $table->text('remarque')->nullable()->after('alarme_historique');
+            });
+        }
+    }
+
+    public function down(): void
+    {
+        if (Schema::hasColumn('cyber_sessions', 'remarque')) {
+            Schema::table('cyber_sessions', function (Blueprint $table) {
+                $table->dropColumn('remarque');
+            });
+        }
+    }
+};
+
+
+──────────────────────────────────────────────────────────────────────────────
+📄  database/migrations/2026_10_19_100000_add_alarme_derniere_fin_to_cyber_sessions.php
+──────────────────────────────────────────────────────────────────────────────
+
+# Taille : 806 o  |  Statut : OK
+
+<?php
+
+use Illuminate\Database\Migrations\Migration;
+use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Support\Facades\Schema;
+
+return new class extends Migration
+{
+    public function up(): void
+    {
+        if (!Schema::hasColumn('cyber_sessions', 'alarme_derniere_fin_at')) {
+            Schema::table('cyber_sessions', function (Blueprint $table) {
+                $table->timestamp('alarme_derniere_fin_at')->nullable()->after('alarme_fin_prevue');
+            });
+        }
+    }
+
+    public function down(): void
+    {
+        if (Schema::hasColumn('cyber_sessions', 'alarme_derniere_fin_at')) {
+            Schema::table('cyber_sessions', function (Blueprint $table) {
+                $table->dropColumn('alarme_derniere_fin_at');
+            });
+        }
+    }
+};
+
+
 
 ══════════════════════════════════════════════════════════════════════════════
   RÉCAPITULATIF
 ══════════════════════════════════════════════════════════════════════════════
-  Total demandés   : 37
-  Trouvés et inclus: 37
+  Total demandés   : 40
+  Trouvés et inclus: 40
   Manquants        : 0
   En erreur        : 0
-  Poids code       : 313.5 Ko
-  Durée génération : 0.02 s
+  Poids code       : 323.9 Ko
+  Durée génération : 2.50 s
 ══════════════════════════════════════════════════════════════════════════════
 
   Fin du GENERATOR.txt.

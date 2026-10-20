@@ -6,17 +6,34 @@
 
 <div x-data="wifiPage({{ Illuminate\Support\Js::from($cfg) }})" x-init="init()">
 
-    {{-- ═══ FENÊTRE D'ALARME PERSISTANTE ═══ --}}
+    {{-- ═══ FENÊTRE D'ALARME À ONGLETS ═══ --}}
     <template x-teleport="body">
     <div x-show="fenetresAlarme.length > 0" x-cloak class="fixed inset-0 z-[9100] flex items-center justify-center p-4 bg-slate-900/80">
-        <div class="w-full max-w-2xl space-y-3 max-h-[90vh] overflow-y-auto">
-            <template x-for="f in fenetresAlarme" :key="f.id">
-                <div class="rounded-2xl bg-white shadow-2xl border-4 border-rose-500 overflow-hidden">
+        <div class="w-full max-w-2xl flex flex-col max-h-[90vh]">
+            
+            <!-- BARRE D'ONGLETS -->
+            <div class="flex items-end gap-1 px-2 overflow-x-auto bg-slate-800 rounded-t-xl pt-2">
+                <template x-for="f in fenetresAlarme" :key="f.id">
+                    <button type="button" @click="ongletAlarmeActif = f.id"
+                            class="flex items-center gap-2 px-4 py-2 text-sm font-semibold rounded-t-lg transition-colors whitespace-nowrap focus:outline-none"
+                            :class="ongletAlarmeActif === f.id ? 'bg-white text-rose-600' : 'bg-slate-700 text-slate-300 hover:bg-slate-600'">
+                        <x-icone nom="bell" class="h-4 w-4" />
+                        <span x-text="f.appareil"></span>
+                        <button type="button" @click.stop="acquitterAlarme(f)" class="ml-1 hover:text-rose-900 rounded p-0.5">
+                            <x-icone nom="x" class="h-3 w-3" />
+                        </button>
+                    </button>
+                </template>
+            </div>
+
+            <!-- CONTENU DE L'ONGLET ACTIF -->
+            <template x-for="f in fenetresAlarme" :key="'content-'+f.id">
+                <div x-show="ongletAlarmeActif === f.id" class="rounded-b-2xl bg-white shadow-2xl border-4 border-t-0 border-rose-500 overflow-hidden flex-1">
                     <div class="bg-rose-600 px-6 py-4 flex items-center gap-3 animate-pulse">
                         <x-icone nom="bell" class="h-8 w-8 text-white shrink-0" />
                         <h2 class="text-2xl font-bold text-white">Temps écoulé</h2>
                     </div>
-                    <div class="p-6 space-y-4 text-lg">
+                    <div class="p-6 space-y-4 text-lg overflow-y-auto max-h-[60vh]">
                         <div class="grid grid-cols-2 gap-4">
                             <div>
                                 <div class="text-sm font-medium text-slate-500">Appareil</div>
@@ -59,10 +76,10 @@
                             <button type="button" @click="acquitterAlarme(f)"
                                     class="w-full rounded-xl bg-rose-600 px-6 py-4 text-lg font-bold text-white hover:bg-rose-500 shadow-lg active:scale-[0.98] transition">
                                 <x-icone nom="bell" class="h-6 w-6 inline mr-2" />
-                                Arrêter l'alarme
+                                Arrêter l'alarme (couper le son)
                             </button>
                             <p class="mt-2 text-sm text-center text-slate-500">
-                                La session continue. Utilisez « Arrêter » dans le tableau pour figer la durée/montant.
+                                La session continue. La jauge reste dans le tableau.
                             </p>
                         </div>
                     </div>
@@ -144,7 +161,7 @@
         </div>
 
         <div class="relative min-w-[200px] flex-1 sm:max-w-sm">
-            <x-icone nom="search" class="pointer-events-none absolute left-3 top-1/2 h-5 w-5 -translate-y-1/2 text-slate-400 z-10" />
+            <x-icone nom="search" class="pointer-events-none absolute left-3 top-1/2 h-5 w-5 -translate-y-1/2 text-slate-400" />
             <input type="search" x-model="recherche" placeholder="Rechercher…"
                    class="h-11 w-full rounded-lg border border-slate-200 bg-white pl-10 pr-10 text-base shadow-sm focus:border-slate-800 focus:outline-none">
             <button type="button" x-show="recherche.length > 0" x-cloak @click="recherche = ''"
@@ -165,38 +182,61 @@
         <div class="max-h-[62vh] overflow-y-auto">
             <table class="w-full table-fixed text-sm">
                 <colgroup>
-                    <col style="width: 40px">
-                    <col style="width: 78px">
-                    <col style="width: 200px">
-                    <col style="width: 110px">
-                    <col style="width: 80px">
-                    <col style="width: 110px">
-                    <col style="width: 120px">
-                    <col style="width: 90px">
-                    <col style="width: 160px">
-                    <col style="width: 130px">
+                    <col :style="'width: ' + colWidths.c0 + 'px'">
+                    <col :style="'width: ' + colWidths.c1 + 'px'">
+                    <col :style="'width: ' + colWidths.c2 + 'px'">
+                    <col :style="'width: ' + colWidths.c3 + 'px'">
+                    <col :style="'width: ' + colWidths.c4 + 'px'">
+                    <col :style="'width: ' + colWidths.c5 + 'px'">
+                    <col :style="'width: ' + colWidths.c6 + 'px'">
+                    <col :style="'width: ' + colWidths.c7 + 'px'">
+                    <col :style="'width: ' + colWidths.c8 + 'px'">
+                    <col :style="'width: ' + colWidths.c9 + 'px'">
                 </colgroup>
                 <thead class="sticky top-0 z-[5] bg-slate-800 text-left text-xs font-semibold uppercase tracking-wide text-white">
                     <tr>
-                        <th class="px-2 py-2.5 text-center">
-                            <input type="checkbox" :checked="tousSelectionnes" @change="basculerTous()"
-                                   class="h-4 w-4 rounded border-slate-400 text-slate-900">
+                        <th class="px-2 py-2.5 text-center relative">
+                            <input type="checkbox" :checked="tousSelectionnes" @change="basculerTous()" class="h-4 w-4 rounded border-slate-400 text-slate-900">
+                            <div class="absolute top-0 right-0 w-1.5 h-full cursor-col-resize hover:bg-slate-500" @mousedown.prevent="startResize($event, 'c0')"></div>
                         </th>
-                        <th class="px-2 py-2.5">
+                        <th class="px-2 py-2.5 relative">
                             <button type="button" @click="trier('date_debut')" class="inline-flex items-center gap-1 hover:text-white/80">
-                                Heure
-                                <span class="text-white/50" x-show="cleTri !== 'date_debut'">↕</span>
-                                <span x-show="cleTri === 'date_debut'" x-text="sensTri === 'asc' ? '↑' : '↓'"></span>
+                                Heure <span class="text-white/50" x-show="cleTri !== 'date_debut'">↕</span><span x-show="cleTri === 'date_debut'" x-text="sensTri === 'asc' ? '↑' : '↓'"></span>
                             </button>
+                            <div class="absolute top-0 right-0 w-1.5 h-full cursor-col-resize hover:bg-slate-500" @mousedown.prevent="startResize($event, 'c1')"></div>
                         </th>
-                        <th class="px-2 py-2.5">Appareil</th>
-                        <th class="px-2 py-2.5">Réseau</th>
-                        <th class="px-2 py-2.5">État</th>
-                        <th class="px-2 py-2.5">Durée / Montant</th>
-                        <th class="px-2 py-2.5">Volume / Débit</th>
-                        <th class="px-2 py-2.5 text-center">Alarme</th>
-                        <th class="px-2 py-2.5">Remarques</th>
-                        <th class="px-2 py-2.5 text-right">Actions</th>
+                        <th class="px-2 py-2.5 relative">
+                            Appareil
+                            <div class="absolute top-0 right-0 w-1.5 h-full cursor-col-resize hover:bg-slate-500" @mousedown.prevent="startResize($event, 'c2')"></div>
+                        </th>
+                        <th class="px-2 py-2.5 relative">
+                            Réseau
+                            <div class="absolute top-0 right-0 w-1.5 h-full cursor-col-resize hover:bg-slate-500" @mousedown.prevent="startResize($event, 'c3')"></div>
+                        </th>
+                        <th class="px-2 py-2.5 relative">
+                            État
+                            <div class="absolute top-0 right-0 w-1.5 h-full cursor-col-resize hover:bg-slate-500" @mousedown.prevent="startResize($event, 'c4')"></div>
+                        </th>
+                        <th class="px-2 py-2.5 relative">
+                            Durée / Montant
+                            <div class="absolute top-0 right-0 w-1.5 h-full cursor-col-resize hover:bg-slate-500" @mousedown.prevent="startResize($event, 'c5')"></div>
+                        </th>
+                        <th class="px-2 py-2.5 relative">
+                            Volume / Débit
+                            <div class="absolute top-0 right-0 w-1.5 h-full cursor-col-resize hover:bg-slate-500" @mousedown.prevent="startResize($event, 'c6')"></div>
+                        </th>
+                        <th class="px-2 py-2.5 text-center relative">
+                            Alarme
+                            <div class="absolute top-0 right-0 w-1.5 h-full cursor-col-resize hover:bg-slate-500" @mousedown.prevent="startResize($event, 'c7')"></div>
+                        </th>
+                        <th class="px-2 py-2.5 relative">
+                            Remarques
+                            <div class="absolute top-0 right-0 w-1.5 h-full cursor-col-resize hover:bg-slate-500" @mousedown.prevent="startResize($event, 'c8')"></div>
+                        </th>
+                        <th class="px-2 py-2.5 text-right relative">
+                            Actions
+                            <div class="absolute top-0 right-0 w-1.5 h-full cursor-col-resize hover:bg-slate-500" @mousedown.prevent="startResize($event, 'c9')"></div>
+                        </th>
                     </tr>
                 </thead>
                 <tbody>
@@ -282,14 +322,25 @@
                                 </div>
                             </td>
                             <td class="px-2 py-2.5 text-center">
-                                {{-- 1) Alarme qui sonne (non acquittée) --}}
+                                {{-- 1) Alarme qui sonne (non acquittée) : on rend le bouton cliquable pour prolonger --}}
                                 <template x-if="l.alarme.active && l.alarme.declenchee && !l.alarme.acquittee && l.etat_appareil !== 'termine'">
-                                    <span class="inline-flex items-center gap-1 rounded-full bg-rose-100 px-2 py-0.5 text-xs font-bold text-rose-700 animate-pulse">
+                                    <button type="button" @click="ouvrirProlonger(l)" title="Cliquer pour prolonger" class="inline-flex items-center gap-1 rounded-full bg-rose-100 px-2 py-0.5 text-xs font-bold text-rose-700 animate-pulse hover:bg-rose-200">
                                         <x-icone nom="bell" class="h-3.5 w-3.5" /> Sonne
-                                    </span>
+                                    </button>
                                 </template>
 
-                                {{-- 2) Alarme posée, en cours de décompte (toujours visible, à chaque prolongation) --}}
+                                {{-- 2) Alarme acquittée : le son est coupé, mais la jauge reste et permet de prolonger --}}
+                                <template x-if="l.alarme.active && l.alarme.acquittee && l.etat_appareil !== 'termine'">
+                                    <div class="space-y-1">
+                                        <div class="font-mono text-sm font-bold text-amber-700" x-text="chronoRestantTexte(l)"></div>
+                                        <div class="h-1 w-full overflow-hidden rounded-full bg-slate-200">
+                                            <div class="h-full bg-amber-500 transition-all" :style="'width: ' + progressionAlarme(l) + '%'"></div>
+                                        </div>
+                                        <button type="button" @click="ouvrirProlonger(l)" class="rounded text-[10px] font-medium text-emerald-700 hover:bg-emerald-50 px-1">+ Prolonger</button>
+                                    </div>
+                                </template>
+
+                                {{-- 3) Alarme posée, en cours de décompte --}}
                                 <template x-if="l.alarme.active && !l.alarme.declenchee && l.etat_appareil !== 'termine'">
                                     <div class="space-y-1">
                                         <template x-if="l.etat_appareil === 'connecte'">
@@ -300,36 +351,30 @@
                                                 <x-icone nom="pause" class="h-3 w-3" /> Alarme en pause
                                             </div>
                                         </template>
-
                                         <div class="h-1 w-full overflow-hidden rounded-full bg-slate-200">
-                                            <div class="h-full bg-amber-500 transition-all"
-                                                 :style="'width: ' + progressionAlarme(l) + '%'"></div>
+                                            <div class="h-full bg-amber-500 transition-all" :style="'width: ' + progressionAlarme(l) + '%'"></div>
                                         </div>
                                         <div class="flex items-center justify-center gap-1">
-                                            <button type="button" @click="ouvrirProlonger(l)"
-                                                    class="rounded text-[10px] font-medium text-emerald-700 hover:bg-emerald-50 px-1">+ Prolonger</button>
-                                            <button type="button" @click="ouvrirAlarme(l, true)"
-                                                    class="rounded text-[10px] font-medium text-slate-600 hover:bg-slate-100 px-1">Modifier</button>
+                                            <button type="button" @click="ouvrirProlonger(l)" class="rounded text-[10px] font-medium text-emerald-700 hover:bg-emerald-50 px-1">+ Prolonger</button>
+                                            <button type="button" @click="ouvrirAlarme(l, true)" class="rounded text-[10px] font-medium text-slate-600 hover:bg-slate-100 px-1">Modifier</button>
                                         </div>
                                     </div>
                                 </template>
 
-                                {{-- 3) Session terminée (figée) --}}
+                                {{-- 4) Session terminée --}}
                                 <template x-if="l.etat_appareil === 'termine'">
                                     <span class="text-xs text-slate-400">Session terminée</span>
                                 </template>
 
-                                {{-- 4) Aucune alarme active → bouton « Poser »
-                                       Ce cas couvre AUSSI le retour après acquittement
-                                       (le backend remet alarme_active=false). --}}
-                                <template x-if="(!l.alarme.active || l.alarme.acquittee) && l.etat_appareil !== 'termine'">
+                                {{-- 5) Aucune alarme --}}
+                                <template x-if="!l.alarme.active && l.etat_appareil !== 'termine'">
                                     <button type="button" @click="ouvrirAlarme(l)"
                                             class="inline-flex items-center gap-1 rounded-md border border-slate-200 bg-white px-2 py-0.5 text-xs text-slate-600 hover:bg-slate-50">
                                         <x-icone nom="bell" class="h-3.5 w-3.5" /> Poser
                                     </button>
                                 </template>
                             </td>
-                            {{-- Remarques : zone toujours éditable, sauvegarde au blur --}}
+                            {{-- Remarques --}}
                             <td class="px-2 py-2.5">
                                 <textarea x-model="l.remarque"
                                           @focus="l._focusRemarque = true"
@@ -340,30 +385,27 @@
                             </td>
                             <td class="px-2 py-2.5">
                                 <div class="flex flex-col items-stretch gap-1">
-                                    {{-- ARRÊTER : fige durée + montant (le client reste connecté) --}}
+                                    {{-- ARRÊTER --}}
                                     <template x-if="l.etat_appareil === 'connecte' || l.etat_appareil === 'deconnecte'">
                                         <button type="button" @click="confirmerArret(l)"
                                                 class="inline-flex items-center justify-center gap-1 rounded-md border border-amber-300 bg-white px-2 py-1 text-xs font-semibold text-amber-700 hover:bg-amber-50"
                                                 title="Figer la durée et le montant (le client reste connecté)">
-                                            <x-icone nom="ban" class="h-3.5 w-3.5" />
-                                            Arrêter
+                                            <x-icone nom="ban" class="h-3.5 w-3.5" /> Arrêter
                                         </button>
                                     </template>
-                                    {{-- CONTINUER : reprend une session terminée --}}
+                                    {{-- CONTINUER --}}
                                     <template x-if="l.etat_appareil === 'termine'">
                                         <button type="button" @click="confirmerContinuer(l)"
                                                 class="inline-flex items-center justify-center gap-1 rounded-md border border-emerald-300 bg-white px-2 py-1 text-xs font-semibold text-emerald-700 hover:bg-emerald-50"
                                                 title="Reprendre la session depuis la même ligne">
-                                            <x-icone nom="play" class="h-3.5 w-3.5" />
-                                            Continuer
+                                            <x-icone nom="play" class="h-3.5 w-3.5" /> Continuer
                                         </button>
                                     </template>
                                     {{-- SUPPRIMER --}}
                                     <button type="button" @click="confirmerSuppression(l)"
                                             class="inline-flex items-center gap-1 rounded-md border border-rose-300 bg-white px-2 py-1 text-xs font-semibold text-rose-700 hover:bg-rose-50"
                                             title="Supprimer définitivement">
-                                        <x-icone nom="trash" class="h-3.5 w-3.5" />
-                                        Supprimer
+                                        <x-icone nom="trash" class="h-3.5 w-3.5" /> Supprimer
                                     </button>
                                 </div>
                             </td>
@@ -442,7 +484,7 @@
 
     <p class="mt-3 text-sm text-slate-400">Actualisation temps réel. Dernière sync : <span x-text="derniereSync || '—'"></span></p>
 
-    {{-- ═══ Fenêtre de confirmation unique et dynamique ═══ --}}
+    {{-- Modales --}}
     <template x-teleport="body">
     <div x-show="confirmation.ouvert" x-cloak class="fixed inset-0 z-[9200] flex items-center justify-center p-4">
         <div class="absolute inset-0 bg-slate-900/70" @click="confirmation.ouvert = false" x-transition.opacity></div>
@@ -474,7 +516,6 @@
     </div>
     </template>
 
-    {{-- Modale Poser / Modifier alarme --}}
     <template x-teleport="body">
     <div x-show="alarmeModal.ouvert" x-cloak class="fixed inset-0 z-[9300] flex items-center justify-center p-4">
         <div class="absolute inset-0 bg-slate-900/60" @click="alarmeModal.ouvert = false" x-transition.opacity></div>
@@ -569,7 +610,6 @@
     </div>
     </template>
 
-    {{-- Modale Prolonger --}}
     <template x-teleport="body">
     <div x-show="prolongerModal.ouvert" x-cloak class="fixed inset-0 z-[9400] flex items-center justify-center p-4">
         <div class="absolute inset-0 bg-slate-900/60" @click="prolongerModal.ouvert = false" x-transition.opacity></div>
@@ -578,7 +618,7 @@
                 <h2 class="text-xl font-bold text-slate-900">Prolonger l'alarme</h2>
                 <p class="text-base text-slate-500" x-text="prolongerModal.ligne?.appareil"></p>
             </div>
-            <div class="p-6 space-y-4">
+            <div class="p-6 space-y-4 max-h-[75vh] overflow-y-auto">
                 <div class="rounded-lg bg-slate-50 px-4 py-2.5 text-base">
                     <div class="text-slate-500">Limite actuelle</div>
                     <div class="font-bold text-slate-900" x-text="prolongerModal.ligne ? (formatDuree(prolongerModal.ligne.alarme.minutes) + ' (' + formatAr(prolongerModal.ligne.alarme.montant || 0) + ')') : ''"></div>
@@ -635,14 +675,6 @@
                                 <div class="text-xs text-slate-500">Compte à partir de l'instant où vous validez.</div>
                             </div>
                         </label>
-                        <label class="flex items-start gap-3 rounded-lg border-2 border-slate-200 p-2.5 hover:bg-slate-50 cursor-pointer"
-                               :class="prolongerModal.depart === 'debut' ? 'border-slate-900 bg-slate-50' : ''">
-                            <input type="radio" x-model="prolongerModal.depart" value="debut" class="mt-1">
-                            <div>
-                                <div class="text-sm font-semibold text-slate-900">Durée totale depuis la connexion</div>
-                                <div class="text-xs text-slate-500">La valeur saisie est la durée totale (ex : 72 = 72 min depuis le début).</div>
-                            </div>
-                        </label>
                     </div>
                 </div>
 
@@ -671,7 +703,6 @@
     </div>
     </template>
 
-    {{-- Modale Réglages --}}
     <template x-teleport="body">
     <div x-show="reglages.ouvert" x-cloak class="fixed inset-0 z-[9300] flex items-center justify-center p-4">
         <div class="absolute inset-0 bg-slate-900/60" x-transition.opacity></div>
@@ -694,7 +725,6 @@
                         class="rounded-md px-4 py-2 text-base font-medium">Sons</button>
             </div>
             <div class="max-h-[60vh] overflow-y-auto p-6 text-base">
-                {{-- Onglet Général --}}
                 <div x-show="reglages.tab === 'general'" class="space-y-6">
                     <div class="flex items-center justify-between rounded-lg border border-slate-200 p-4">
                         <div>
@@ -746,7 +776,6 @@
                     </div>
                 </div>
 
-                {{-- Onglet Sons --}}
                 <div x-show="reglages.tab === 'sons'" class="space-y-5">
                     <div class="rounded-lg border border-slate-200 p-4 space-y-3">
                         <div class="flex items-center justify-between">
@@ -880,7 +909,6 @@
     </div>
     </template>
 
-    {{-- Modale confirmation suppression son --}}
     <div x-show="supprSonModal.ouvert" x-cloak class="fixed inset-0 z-[220] flex items-center justify-center p-4">
         <div class="absolute inset-0 bg-slate-900/60" @click="supprSonModal.ouvert = false" x-transition.opacity></div>
         <div x-show="supprSonModal.ouvert" x-transition class="relative w-full max-w-md overflow-hidden rounded-2xl bg-white shadow-2xl">
@@ -902,7 +930,6 @@
         </div>
     </div>
 
-    {{-- Modale réinitialisation --}}
     <div x-show="resetModal.ouvert" x-cloak class="fixed inset-0 z-[220] flex items-center justify-center p-4">
         <div class="absolute inset-0 bg-slate-900/60" @click="resetModal.ouvert = false" x-transition.opacity></div>
         <div x-show="resetModal.ouvert" x-transition class="relative w-full max-w-md overflow-hidden rounded-2xl bg-white shadow-2xl">
@@ -955,7 +982,7 @@ function wifiPage(cfg) {
 
         alarmeModal: {
             ouvert: false, ligne: null, modifier: false,
-            type: 'duree', h: 0, m: 30, montant: 1000, depart: 'maintenant',
+            type: 'duree', h: 0, m: 30, montant: 1000, depart: 'apres',
             raccourcis: [
                 { label: '15 min', type: 'duree', h: 0, m: 15 },
                 { label: '30 min', type: 'duree', h: 0, m: 30 },
@@ -975,13 +1002,14 @@ function wifiPage(cfg) {
                 { label: '+500 Ar', type: 'montant', montant: 500 },
                 { label: '+1000 Ar', type: 'montant', montant: 1000 },
             ],
-            erreur: '', enCours: false ouvrirProlonger(l, de, depuisFenetre: false,
+            erreur: '', enCours: false,
         },
 
         supprSonModal: { ouvert: false, nom: '', son: null },
         resetModal: { ouvert: false },
 
         fenetresAlarme: [],
+        ongletAlarmeActif: null,
 
         dragActif: false,
 
@@ -994,6 +1022,26 @@ function wifiPage(cfg) {
         _alarmesFermees: new Set(),
 
         volumeCache: {},
+        
+        colWidths: JSON.parse(localStorage.getItem('cm_wifi_cols')) || { c0: 40, c1: 75, c2: 150, c3: 90, c4: 75, c5: 100, c6: 100, c7: 85, c8: 120, c9: 110 },
+        resizing: null,
+        startResize(e, colKey) {
+            this.resizing = { key: colKey, startX: e.pageX, startW: this.colWidths[colKey] };
+            const onMove = (ev) => {
+                if (!this.resizing) return;
+                const delta = ev.pageX - this.resizing.startX;
+                this.colWidths[this.resizing.key] = Math.max(50, this.resizing.startW + delta);
+            };
+            const onUp = () => {
+                localStorage.setItem('cm_wifi_cols', JSON.stringify(this.colWidths));
+                this.resizing = null;
+                document.removeEventListener('mousemove', onMove);
+                document.removeEventListener('mouseup', onUp);
+            };
+            document.addEventListener('mousemove', onMove);
+            document.addEventListener('mouseup', onUp);
+        },
+
         now: Date.now(),
 
         init() {
@@ -1015,7 +1063,6 @@ function wifiPage(cfg) {
                 this.lignes = (d.lignes ?? []).map(nl => {
                     const old = anciens.get(nl.id);
                     if (old && old._focusRemarque) {
-                        // L'utilisateur est en train de taper : on garde sa valeur.
                         nl.remarque = old.remarque;
                         nl._focusRemarque = true;
                     }
@@ -1032,13 +1079,11 @@ function wifiPage(cfg) {
         mettreAJourVouchers(nouveaux) {
             const idsNouveaux = new Set(nouveaux.map(v => v.id));
 
-            // Retirer ceux qui ne sont plus dans la réponse (utilisés depuis)
             this.vouchersDisponibles.forEach(v => {
                 if (!idsNouveaux.has(v.id) && !v.transition) {
                     v.transition = true;
                     setTimeout(() => {
                         this.vouchersDisponibles = this.vouchersDisponibles.filter(x => x.id !== v.id);
-                        // Ajouter les nouveaux qui ne sont pas encore là
                         nouveaux.forEach(nv => {
                             if (!this.vouchersDisponibles.find(x => x.id === nv.id)) {
                                 this.vouchersDisponibles.push({...nv, masque: true, transition: false});
@@ -1048,7 +1093,6 @@ function wifiPage(cfg) {
                 }
             });
 
-            // Ajouter les nouveaux immédiatement
             nouveaux.forEach(nv => {
                 if (!this.vouchersDisponibles.find(x => x.id === nv.id)) {
                     this.vouchersDisponibles.push({...nv, masque: true, transition: false});
@@ -1060,36 +1104,30 @@ function wifiPage(cfg) {
             this.lignes.forEach(l => {
                 const fenetreOuverte = this.fenetresAlarme.find(f => f.id === l.id);
 
-                // Fermer si l'utilisateur a cliqué "Arrêter l'alarme"
                 if (this._alarmesFermees.has(l.id)) {
                     if (fenetreOuverte) this.fermerFenetre(l.id);
                     return;
                 }
 
-                // Si l'alarme est acquittée côté serveur (ex. autre onglet) → fermer
                 if (l.alarme.acquittee && fenetreOuverte) {
                     this.fermerFenetre(l.id);
                     this._alarmesFermees.add(l.id);
                     return;
                 }
 
-                // Alarme posée et toujours décomptée
                 if (l.alarme.active && l.alarme.fin) {
                     const fin = new Date(l.alarme.fin).getTime();
 
-                    // Déclenchement
                     if (this.now >= fin && !fenetreOuverte && l.etat_appareil === 'connecte') {
                         this.ouvrirFenetreAlarme(l);
                     }
 
-                    // Si la fin a été repoussée (prolongation), fermer l'ancienne fenêtre
                     if (this.now < fin && fenetreOuverte) {
                         this.fermerFenetre(l.id);
                     }
                 }
             });
 
-            // Dépassement affiché dans les fenêtres ouvertes
             this.fenetresAlarme.forEach(f => {
                 const l = this.lignes.find(x => x.id === f.id);
                 if (l && l.alarme.fin) {
@@ -1101,14 +1139,12 @@ function wifiPage(cfg) {
                 }
             });
 
-            // --- SONNERIE : respecter alarme.duree_secondes ---
             if (this.fenetresAlarme.length > 0 && this.alarme.enabled) {
                 const dureeMax = parseInt(this.alarme.duree_secondes ?? 0, 10);
 
-                // Filtre : fenêtres dont la sonnerie n'a pas expiré
                 const fenetresActives = this.fenetresAlarme.filter(f => {
                     if (!f._debutSonnerie) f._debutSonnerie = this.now;
-                    if (!dureeMax || dureeMax <= 0) return true; // "Automatique" : sans limite
+                    if (!dureeMax || dureeMax <= 0) return true;
                     return (this.now - f._debutSonnerie) < dureeMax * 1000;
                 });
 
@@ -1132,7 +1168,7 @@ function wifiPage(cfg) {
                 heureFin: this.heureExacte(l.alarme.fin),
                 depassementSecondes: 0,
                 depassementMontant: 0,
-                _debutSonnerie: Date.now(),   // <-- ajout
+                _debutSonnerie: Date.now(),
                 prolongationsRapides: [
                     { label: '+15 min', type: 'duree', h: 0, m: 15 },
                     { label: '+30 min', type: 'duree', h: 0, m: 30 },
@@ -1140,6 +1176,10 @@ function wifiPage(cfg) {
                     { label: '+1000 Ar', type: 'montant', montant: 1000 },
                 ],
             });
+
+            if (!this.ongletAlarmeActif || !this.fenetresAlarme.find(x => x.id === this.ongletAlarmeActif)) {
+                this.ongletAlarmeActif = l.id;
+            }
 
             this.marquerDeclenchee(l.id);
             if (l.alarme) l.alarme.declenchee = true;
@@ -1159,6 +1199,9 @@ function wifiPage(cfg) {
 
         fermerFenetre(id) {
             this.fenetresAlarme = this.fenetresAlarme.filter(f => f.id !== id);
+            if (this.ongletAlarmeActif === id) {
+                this.ongletAlarmeActif = this.fenetresAlarme.length > 0 ? this.fenetresAlarme[0].id : null;
+            }
             if (this.fenetresAlarme.length === 0) {
                 this.arreterSon();
                 this.clignoterTitre(false);
@@ -1190,12 +1233,10 @@ function wifiPage(cfg) {
 
         async acquitterAlarme(f) {
             this.arreterSon();
-            this._alarmesFermees.add(f.id);
             this.fermerFenetre(f.id);
             try {
                 const r = await window.cmFetch(`${cfg.urlSession}/${f.id}/alarme/acquitter`, { method: 'POST' });
                 const d = await r.json();
-                // Le serveur renvoie les lignes à jour : on rafraîchit tout de suite.
                 if (d && d.lignes) {
                     this.lignes = d.lignes;
                     this.stats = d.stats ?? this.stats;
@@ -1250,7 +1291,7 @@ function wifiPage(cfg) {
                 type: l.alarme.type || 'duree',
                 h: 0, m: l.alarme.minutes || 30,
                 montant: l.alarme.montant || 1000,
-                depart: 'maintenant',
+                depart: 'apres',
                 raccourcis: this.alarmeModal.raccourcis,
                 apercu: '', erreur: '', enCours: false,
             };
@@ -1403,9 +1444,6 @@ function wifiPage(cfg) {
             this.prolongerModal.enCours = false;
         },
 
-        // -----------------------------------------------------------------
-        // ═══ CONFIRMATIONS DYNAMIQUES ═══
-        // -----------------------------------------------------------------
         ouvrirConfirmation(opts) {
             this.confirmation = {
                 ouvert: true, enCours: false,
@@ -1444,7 +1482,7 @@ function wifiPage(cfg) {
             });
         },
 
-                confirmerContinuer(l) {
+        confirmerContinuer(l) {
             this.ouvrirConfirmation({
                 titre: 'Continuer cette session ?',
                 message: `La durée et le montant de <strong>${this.escapeHtml(l.appareil)}</strong> vont reprendre.<br><br>Le temps passé hors ligne n'est pas facturé.`,
@@ -1462,7 +1500,7 @@ function wifiPage(cfg) {
                 }
             });
         },
-        
+
         confirmerSuppression(l) {
             const montant = this.montantFinalCalcule(l);
             const montantTxt = Number(montant || 0).toLocaleString('fr-FR');
@@ -1489,7 +1527,6 @@ function wifiPage(cfg) {
             const r = await window.cmFetch(url, { method: 'DELETE' });
             const d = await r.json();
 
-            // 409 : le voucher est encore utilisé ailleurs → 2e modale d'avertissement
             if (r.status === 409 && d.besoin_force) {
                 const liste = (d.autres || [])
                     .map(x => `<li class="font-mono">${this.escapeHtml(x.mac || '—')}</li>`)
@@ -1520,10 +1557,8 @@ function wifiPage(cfg) {
             await this.rafraichir();
         },
 
-        // Remarques (édition inline)
         async sauverRemarque(l) {
             const val = (l.remarque || '').trim();
-            // Rien à sauver si inchangé
             if ((l._derniereRemarque ?? null) === val) return;
             try {
                 const r = await window.cmFetch(`${cfg.urlRemarque}/${l.id}/remarque`, {
@@ -1566,9 +1601,6 @@ function wifiPage(cfg) {
             });
         },
 
-        // -----------------------------------------------------------------
-        // Réglages
-        // -----------------------------------------------------------------
         async chargerReglages() {
             try {
                 const r = await fetch(cfg.urlReglagesGet, { headers: { 'Accept': 'application/json' } });
@@ -1662,7 +1694,6 @@ function wifiPage(cfg) {
                     return;
                 }
 
-                // Choix du son actif
                 if (this.reglages.form.sonUrl && this.reglages.form.sonUrl.startsWith('/sounds/')) {
                     const nom = this.reglages.form.sonUrl.split('/').pop();
                     await window.cmFetch(cfg.urlChoisirSon, {
@@ -1708,9 +1739,6 @@ function wifiPage(cfg) {
             } catch (e) {}
         },
 
-        // -----------------------------------------------------------------
-        // Upload son
-        // -----------------------------------------------------------------
         dropSon(event) {
             this.dragActif = false;
             const f = event.dataTransfer?.files?.[0];
@@ -1789,9 +1817,6 @@ function wifiPage(cfg) {
             } catch (e) {}
         },
 
-        // -----------------------------------------------------------------
-        // Son
-        // -----------------------------------------------------------------
         jouerSon() {
             if (this.alarme.son_url) {
                 const a = this.$refs.audio;
@@ -1893,9 +1918,6 @@ function wifiPage(cfg) {
             Notification.requestPermission().then(p => this.notifAutorisee = p === 'granted');
         },
 
-        // -----------------------------------------------------------------
-        // Formats
-        // -----------------------------------------------------------------
         formatAr(n) { return Number(n || 0).toLocaleString('fr-FR') + ' Ar'; },
         formatDuree(m) {
             m = parseInt(m, 10) || 0;
@@ -1946,7 +1968,6 @@ function wifiPage(cfg) {
             } else if (l.etat_appareil === 'deconnecte' && l.deconnecte_at) {
                 fin = new Date(l.deconnecte_at).getTime();
             } else if (l.etat_appareil === 'termine') {
-                // Session figée : on ne regarde JAMAIS l'heure courante.
                 fin = l.date_fin_reelle
                     ? new Date(l.date_fin_reelle).getTime()
                     : (l.deconnecte_at ? new Date(l.deconnecte_at).getTime() : debut);
@@ -1982,7 +2003,7 @@ function wifiPage(cfg) {
         },
 
         chronoRestantTexte(l) {
-            if (!l.alarme.fin) return 'En pause'; // Si pas de date de fin, c'est en pause
+            if (!l.alarme.fin) return 'En pause';
             const fin = new Date(l.alarme.fin).getTime();
             const sec = Math.max(0, Math.floor((fin - this.now) / 1000));
             return this.formatDureeSec(sec);
@@ -2004,16 +2025,13 @@ function wifiPage(cfg) {
                 c = this.volumeCache[key] = { echantillons: [], mbps: 0, volActuel: volume };
                 return '0 Ko/s';
             }
-            // Détection reset (compteur qui recule)
             if (volume < c.volActuel) c.echantillons = [];
             c.volActuel = volume;
-            // Ajouter un échantillon si volume bouge OU toutes les 2s
             const dernier = c.echantillons[c.echantillons.length - 1];
             if (!dernier || now - dernier.ts >= 2000 || volume !== dernier.vol) {
                 c.echantillons.push({ vol: volume, ts: now });
                 if (c.echantillons.length > 5) c.echantillons.shift();
             }
-            // Calcul sur fenêtre glissante
             if (c.echantillons.length >= 2) {
                 const premier = c.echantillons[0];
                 const dOctets = volume - premier.vol;
@@ -2048,7 +2066,7 @@ function wifiPage(cfg) {
             };
         },
         classeLigne(l) {
-            if (l.alarme.declenchee && !l.alarme.acquittee && l.etat_appareil !== 'termine') return 'bg-rose-50 border-l-4 border-rose-500';
+            if (l.alarme.active && l.alarme.declenchee && !l.alarme.acquittee && l.etat_appareil !== 'termine') return 'bg-rose-50 border-l-4 border-rose-500';
             return {
                 'bg-emerald-50/60 border-l-4 border-emerald-500': l.etat_appareil === 'connecte',
                 'bg-amber-100/70 border-l-4 border-amber-500': l.etat_appareil === 'deconnecte',

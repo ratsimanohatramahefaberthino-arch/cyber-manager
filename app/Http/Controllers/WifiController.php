@@ -22,10 +22,6 @@ class WifiController extends Controller
         private TarifService $tarifService,
     ) {}
 
-    // -----------------------------------------------------------------
-    // Page principale
-    // -----------------------------------------------------------------
-
     public function index()
     {
         $this->syncSilencieuse();
@@ -44,10 +40,6 @@ class WifiController extends Controller
             'sync'                 => $this->wifiSessions->etatSynchro(),
         ]);
     }
-
-    // -----------------------------------------------------------------
-    // Arrêter / Continuer / Supprimer
-    // -----------------------------------------------------------------
 
     public function arreter(Session $session): JsonResponse
     {
@@ -261,10 +253,6 @@ class WifiController extends Controller
         ]);
     }
 
-    // -----------------------------------------------------------------
-    // Remarque libre
-    // -----------------------------------------------------------------
-
     public function enregistrerRemarque(Request $request, Session $session): JsonResponse
     {
         if ($session->type_session !== 'wifi') {
@@ -284,10 +272,6 @@ class WifiController extends Controller
             'message'  => 'Remarque enregistrée.',
         ]);
     }
-
-    // -----------------------------------------------------------------
-    // Alarme
-    // -----------------------------------------------------------------
 
     public function definirAlarme(Request $request, Session $session): JsonResponse
     {
@@ -394,6 +378,11 @@ class WifiController extends Controller
             $base = $session->alarme_derniere_fin_at
                 ?: $session->alarme_fin_prevue
                 ?: $maintenant;
+                
+            if ($base->lt($maintenant)) {
+                $base = $maintenant;
+            }
+            
             $nouvelleFin = $base->copy()->addMinutes($minutesAjoutees);
         }
 
@@ -455,12 +444,6 @@ class WifiController extends Controller
     public function acquitterAlarme(Session $session): JsonResponse
     {
         $session->update([
-            'alarme_active'             => false,
-            'alarme_type'               => null,
-            'alarme_duree_minutes'      => null,
-            'alarme_montant'            => null,
-            'alarme_fin_prevue'         => null,
-            'alarme_secondes_restantes' => null,
             'alarme_declenchee_at'      => $session->alarme_declenchee_at ?: now(),
             'alarme_message'            => 'acquittee',
         ]);
@@ -480,10 +463,6 @@ class WifiController extends Controller
 
         return response()->json(['ok' => true]);
     }
-
-    // -----------------------------------------------------------------
-    // Comptes HotSpot
-    // -----------------------------------------------------------------
 
     public function comptes()
     {
@@ -563,10 +542,6 @@ class WifiController extends Controller
             return back()->withErrors(['global' => $e->getMessage()]);
         }
     }
-
-    // -----------------------------------------------------------------
-    // Helpers
-    // -----------------------------------------------------------------
 
     private function syncSilencieuse(): void
     {

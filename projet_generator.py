@@ -119,6 +119,9 @@ SECTIONS = {
         "database/migrations/2026_10_08_100000_add_wifi_tracking_to_cyber_sessions.php",
         "database/migrations/2026_10_09_100000_add_pause_state_to_cyber_sessions.php",
         "database/migrations/2026_10_09_110000_add_alarme_historique_to_cyber_sessions.php",
+        "database/migrations/2026_10_12_000000_add_alarme_pause_to_cyber_sessions.php",
+        "database/migrations/2026_10_13_120000_add_remarque_to_cyber_sessions.php",
+        "database/migrations/2026_10_19_100000_add_alarme_derniere_fin_to_cyber_sessions.php",
     ],
 }
 
