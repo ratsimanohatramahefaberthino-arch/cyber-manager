@@ -343,10 +343,19 @@
                                     {{-- ARRÊTER : fige durée + montant (le client reste connecté) --}}
                                     <template x-if="l.etat_appareil === 'connecte' || l.etat_appareil === 'deconnecte'">
                                         <button type="button" @click="confirmerArret(l)"
-                                                class="inline-flex items-center gap-1 rounded-md border border-amber-300 bg-white px-2 py-1 text-xs font-semibold text-amber-700 hover:bg-amber-50"
+                                                class="inline-flex items-center justify-center gap-1 rounded-md border border-amber-300 bg-white px-2 py-1 text-xs font-semibold text-amber-700 hover:bg-amber-50"
                                                 title="Figer la durée et le montant (le client reste connecté)">
                                             <x-icone nom="ban" class="h-3.5 w-3.5" />
                                             Arrêter
+                                        </button>
+                                    </template>
+                                    {{-- CONTINUER : reprend une session terminée --}}
+                                    <template x-if="l.etat_appareil === 'termine'">
+                                        <button type="button" @click="confirmerContinuer(l)"
+                                                class="inline-flex items-center justify-center gap-1 rounded-md border border-emerald-300 bg-white px-2 py-1 text-xs font-semibold text-emerald-700 hover:bg-emerald-50"
+                                                title="Reprendre la session depuis la même ligne">
+                                            <x-icone nom="play" class="h-3.5 w-3.5" />
+                                            Continuer
                                         </button>
                                     </template>
                                     {{-- SUPPRIMER --}}
@@ -560,11 +569,11 @@
     </div>
     </template>
 
-     {{-- Modale Prolonger --}}
+    {{-- Modale Prolonger --}}
     <template x-teleport="body">
     <div x-show="prolongerModal.ouvert" x-cloak class="fixed inset-0 z-[9400] flex items-center justify-center p-4">
         <div class="absolute inset-0 bg-slate-900/60" @click="prolongerModal.ouvert = false" x-transition.opacity></div>
-        <div x-show="prolongerModal.ouvert" x-transition class="relative w-full max-w-md overflow-hidden rounded-2xl bg-white shadow-2xl">
+        <div x-show="prolongerModal.ouvert" x-transition class="relative w-full max-w-lg overflow-hidden rounded-2xl bg-white shadow-2xl">
             <div class="border-b border-slate-100 px-6 py-4">
                 <h2 class="text-xl font-bold text-slate-900">Prolonger l'alarme</h2>
                 <p class="text-base text-slate-500" x-text="prolongerModal.ligne?.appareil"></p>
@@ -573,7 +582,11 @@
                 <div class="rounded-lg bg-slate-50 px-4 py-2.5 text-base">
                     <div class="text-slate-500">Limite actuelle</div>
                     <div class="font-bold text-slate-900" x-text="prolongerModal.ligne ? (formatDuree(prolongerModal.ligne.alarme.minutes) + ' (' + formatAr(prolongerModal.ligne.alarme.montant || 0) + ')') : ''"></div>
+                    <div class="text-xs text-slate-500 mt-1" x-show="prolongerModal.ligne?.alarme?.derniere_fin">
+                        Fin prévue actuelle : <span x-text="prolongerModal.ligne ? heureExacte(prolongerModal.ligne.alarme.derniere_fin || prolongerModal.ligne.alarme.fin) : ''"></span>
+                    </div>
                 </div>
+
                 <div>
                     <label class="mb-2 block text-base font-semibold text-slate-700">Ajouter</label>
                     <div class="flex gap-2">
@@ -585,6 +598,7 @@
                                 class="flex-1 rounded-lg px-4 py-2.5 text-base font-medium">Montant</button>
                     </div>
                 </div>
+
                 <div>
                     <template x-if="prolongerModal.type === 'duree'">
                         <div class="flex items-center gap-2">
@@ -601,6 +615,37 @@
                                class="w-full rounded-lg border-2 border-slate-300 px-3 py-2.5 font-mono text-lg">
                     </template>
                 </div>
+
+                <div>
+                    <label class="mb-2 block text-base font-semibold text-slate-700">Point de départ</label>
+                    <div class="space-y-1.5">
+                        <label class="flex items-start gap-3 rounded-lg border-2 border-slate-200 p-2.5 hover:bg-slate-50 cursor-pointer"
+                               :class="prolongerModal.depart === 'apres' ? 'border-slate-900 bg-slate-50' : ''">
+                            <input type="radio" x-model="prolongerModal.depart" value="apres" class="mt-1">
+                            <div>
+                                <div class="text-sm font-semibold text-slate-900">À la suite de l'alarme précédente <span class="text-xs text-emerald-700">(recommandé)</span></div>
+                                <div class="text-xs text-slate-500">S'ajoute à la fin prévue : pas de minute perdue.</div>
+                            </div>
+                        </label>
+                        <label class="flex items-start gap-3 rounded-lg border-2 border-slate-200 p-2.5 hover:bg-slate-50 cursor-pointer"
+                               :class="prolongerModal.depart === 'maintenant' ? 'border-slate-900 bg-slate-50' : ''">
+                            <input type="radio" x-model="prolongerModal.depart" value="maintenant" class="mt-1">
+                            <div>
+                                <div class="text-sm font-semibold text-slate-900">À partir de maintenant</div>
+                                <div class="text-xs text-slate-500">Compte à partir de l'instant où vous validez.</div>
+                            </div>
+                        </label>
+                        <label class="flex items-start gap-3 rounded-lg border-2 border-slate-200 p-2.5 hover:bg-slate-50 cursor-pointer"
+                               :class="prolongerModal.depart === 'debut' ? 'border-slate-900 bg-slate-50' : ''">
+                            <input type="radio" x-model="prolongerModal.depart" value="debut" class="mt-1">
+                            <div>
+                                <div class="text-sm font-semibold text-slate-900">Durée totale depuis la connexion</div>
+                                <div class="text-xs text-slate-500">La valeur saisie est la durée totale (ex : 72 = 72 min depuis le début).</div>
+                            </div>
+                        </label>
+                    </div>
+                </div>
+
                 <div class="flex flex-wrap gap-2">
                     <template x-for="r in prolongerModal.raccourcis" :key="r.label">
                         <button type="button" @click="appliquerRaccourciProlongation(r)"
@@ -608,6 +653,7 @@
                                 x-text="r.label"></button>
                     </template>
                 </div>
+
                 <template x-if="prolongerModal.erreur">
                     <div class="rounded-lg border border-rose-200 bg-rose-50 px-4 py-2.5 text-base text-rose-700" x-text="prolongerModal.erreur"></div>
                 </template>
@@ -921,7 +967,7 @@ function wifiPage(cfg) {
         },
 
         prolongerModal: {
-            ouvert: false, ligne: null, type: 'duree', h: 0, m: 15, montant: 500,
+            ouvert: false, ligne: null, type: 'duree', depart: 'apres', h: 0, m: 15, montant: 500,
             raccourcis: [
                 { label: '+15 min', type: 'duree', h: 0, m: 15 },
                 { label: '+30 min', type: 'duree', h: 0, m: 30 },
@@ -929,7 +975,7 @@ function wifiPage(cfg) {
                 { label: '+500 Ar', type: 'montant', montant: 500 },
                 { label: '+1000 Ar', type: 'montant', montant: 1000 },
             ],
-            erreur: '', enCours: false, depuisFenetre: false,
+            erreur: '', enCours: false ouvrirProlonger(l, de, depuisFenetre: false,
         },
 
         supprSonModal: { ouvert: false, nom: '', son: null },
@@ -1012,28 +1058,38 @@ function wifiPage(cfg) {
 
         verifierAlarmes() {
             this.lignes.forEach(l => {
-                if (!l.alarme.active || !l.alarme.fin) {
-                    if (this.fenetresAlarme.find(f => f.id === l.id)) {
-                        this.fermerFenetre(l.id);
-                    }
-                    // Alarme inactive/terminée : on nettoie le marqueur de fermeture
-                    // pour qu'une future alarme puisse re-sonner.
-                    if (!l.alarme.active) this._alarmesFermees.delete(l.id);
+                const fenetreOuverte = this.fenetresAlarme.find(f => f.id === l.id);
+
+                // Fermer si l'utilisateur a cliqué "Arrêter l'alarme"
+                if (this._alarmesFermees.has(l.id)) {
+                    if (fenetreOuverte) this.fermerFenetre(l.id);
                     return;
                 }
-                const fin = new Date(l.alarme.fin).getTime();
-                const dejaDansListe = this.fenetresAlarme.find(f => f.id === l.id);
 
-                if (this.now >= fin && !dejaDansListe && !this._alarmesFermees.has(l.id) && l.etat_appareil === 'connecte') {
-                    this.ouvrirFenetreAlarme(l);
-                }
-                if (this.now < fin && dejaDansListe) {
+                // Si l'alarme est acquittée côté serveur (ex. autre onglet) → fermer
+                if (l.alarme.acquittee && fenetreOuverte) {
                     this.fermerFenetre(l.id);
-                    // Si la jauge est visible, on efface aussi le marqueur.
-                    this._alarmesFermees.delete(l.id);
+                    this._alarmesFermees.add(l.id);
+                    return;
+                }
+
+                // Alarme posée et toujours décomptée
+                if (l.alarme.active && l.alarme.fin) {
+                    const fin = new Date(l.alarme.fin).getTime();
+
+                    // Déclenchement
+                    if (this.now >= fin && !fenetreOuverte && l.etat_appareil === 'connecte') {
+                        this.ouvrirFenetreAlarme(l);
+                    }
+
+                    // Si la fin a été repoussée (prolongation), fermer l'ancienne fenêtre
+                    if (this.now < fin && fenetreOuverte) {
+                        this.fermerFenetre(l.id);
+                    }
                 }
             });
 
+            // Dépassement affiché dans les fenêtres ouvertes
             this.fenetresAlarme.forEach(f => {
                 const l = this.lignes.find(x => x.id === f.id);
                 if (l && l.alarme.fin) {
@@ -1045,10 +1101,22 @@ function wifiPage(cfg) {
                 }
             });
 
+            // --- SONNERIE : respecter alarme.duree_secondes ---
             if (this.fenetresAlarme.length > 0 && this.alarme.enabled) {
-                if (this.now - this._lastBeep > 2500) {
-                    this._lastBeep = this.now;
-                    this.jouerSon();
+                const dureeMax = parseInt(this.alarme.duree_secondes ?? 0, 10);
+
+                // Filtre : fenêtres dont la sonnerie n'a pas expiré
+                const fenetresActives = this.fenetresAlarme.filter(f => {
+                    if (!f._debutSonnerie) f._debutSonnerie = this.now;
+                    if (!dureeMax || dureeMax <= 0) return true; // "Automatique" : sans limite
+                    return (this.now - f._debutSonnerie) < dureeMax * 1000;
+                });
+
+                if (fenetresActives.length > 0) {
+                    if (this.now - this._lastBeep > 2500) {
+                        this._lastBeep = this.now;
+                        this.jouerSon();
+                    }
                 }
             }
         },
@@ -1064,6 +1132,7 @@ function wifiPage(cfg) {
                 heureFin: this.heureExacte(l.alarme.fin),
                 depassementSecondes: 0,
                 depassementMontant: 0,
+                _debutSonnerie: Date.now(),   // <-- ajout
                 prolongationsRapides: [
                     { label: '+15 min', type: 'duree', h: 0, m: 15 },
                     { label: '+30 min', type: 'duree', h: 0, m: 30 },
@@ -1115,7 +1184,7 @@ function wifiPage(cfg) {
 
         async marquerDeclenchee(id) {
             try {
-                await window.cmFetch(`${cfg.urlSession}/${id}/alarme/acquitter`, { method: 'POST' });
+                await window.cmFetch(`${cfg.urlSession}/${id}/alarme/declencher`, { method: 'POST' });
             } catch (e) {}
         },
 
@@ -1275,8 +1344,14 @@ function wifiPage(cfg) {
         ouvrirProlonger(l, depuisFenetre = false) {
             this.prolongerModal = {
                 ouvert: true, ligne: l, depuisFenetre: depuisFenetre,
-                type: 'duree', h: 0, m: 15, montant: 500,
-                raccourcis: this.prolongerModal.raccourcis,
+                type: 'duree', depart: 'apres', h: 0, m: 15, montant: 500,
+                raccourcis: [
+                    { label: '+15 min', type: 'duree', h: 0, m: 15 },
+                    { label: '+30 min', type: 'duree', h: 0, m: 30 },
+                    { label: '+1 h', type: 'duree', h: 1, m: 0 },
+                    { label: '+500 Ar', type: 'montant', montant: 500 },
+                    { label: '+1000 Ar', type: 'montant', montant: 1000 },
+                ],
                 erreur: '', enCours: false,
             };
         },
@@ -1298,6 +1373,7 @@ function wifiPage(cfg) {
             this.prolongerModal.enCours = true;
             const body = {
                 type: this.prolongerModal.type,
+                depart: this.prolongerModal.depart,
                 valeur: this.prolongerModal.type === 'duree'
                     ? (this.prolongerModal.h * 60 + this.prolongerModal.m)
                     : this.prolongerModal.montant,
@@ -1368,6 +1444,25 @@ function wifiPage(cfg) {
             });
         },
 
+                confirmerContinuer(l) {
+            this.ouvrirConfirmation({
+                titre: 'Continuer cette session ?',
+                message: `La durée et le montant de <strong>${this.escapeHtml(l.appareil)}</strong> vont reprendre.<br><br>Le temps passé hors ligne n'est pas facturé.`,
+                bouton: 'Continuer',
+                danger: false,
+                action: async () => {
+                    const r = await window.cmFetch(`${cfg.urlContinuer}/${l.id}/continuer`, { method: 'POST' });
+                    const d = await r.json();
+                    if (!r.ok || !d.ok) {
+                        window.dispatchEvent(new CustomEvent('toast', { detail: d.message || 'Erreur.' }));
+                        return;
+                    }
+                    window.dispatchEvent(new CustomEvent('toast', { detail: d.message }));
+                    await this.rafraichir();
+                }
+            });
+        },
+        
         confirmerSuppression(l) {
             const montant = this.montantFinalCalcule(l);
             const montantTxt = Number(montant || 0).toLocaleString('fr-FR');

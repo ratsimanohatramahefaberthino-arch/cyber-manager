@@ -163,6 +163,7 @@ Route::middleware('auth')->group(function () {
     Route::post('/wifi/session/{session}/alarme/prolonger',  [WifiController::class, 'prolongerAlarme'])->name('wifi.session.alarme.prolonger');
     Route::post('/wifi/session/{session}/alarme/annuler',    [WifiController::class, 'annulerAlarme'])->name('wifi.session.alarme.annuler');
     Route::post('/wifi/session/{session}/alarme/acquitter',  [WifiController::class, 'acquitterAlarme'])->name('wifi.session.alarme.acquitter');
+    Route::post('/wifi/session/{session}/alarme/declencher', [WifiController::class, 'marquerAlarmeDeclenchee'])->name('wifi.session.alarme.declencher');
 
     // Réglages alarme
     Route::get('/wifi/alarme',              [WifiAlarmController::class, 'index'])->name('wifi.alarme.index');

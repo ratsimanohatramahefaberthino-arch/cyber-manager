@@ -29,8 +29,8 @@ class Session extends Model
         'etat_wifi', 'deconnecte_at', 'reconnecte_at', 'duree_hors_ligne_secondes',
         'pause_at', 'duree_pause_secondes',
         'alarme_active', 'alarme_type', 'alarme_duree_minutes', 'alarme_montant',
-        'alarme_fin_prevue', 'alarme_declenchee_at', 'alarme_message',
-        'alarme_historique', 'alarme_secondes_restantes',
+        'alarme_fin_prevue', 'alarme_derniere_fin_at', 'alarme_declenchee_at',
+        'alarme_message', 'alarme_historique', 'alarme_secondes_restantes',
         'remarque',
     ];
 
@@ -45,6 +45,7 @@ class Session extends Model
         'reconnecte_at' => 'datetime',
         'pause_at' => 'datetime',
         'alarme_fin_prevue' => 'datetime',
+        'alarme_derniere_fin_at' => 'datetime',
         'alarme_declenchee_at' => 'datetime',
         'alarme_active' => 'boolean',
         'duree_hors_ligne_secondes' => 'integer',
@@ -55,10 +56,6 @@ class Session extends Model
         'alarme_secondes_restantes' => 'integer',
     ];
 
-    // -----------------------------------------------------------------
-    // Relations
-    // -----------------------------------------------------------------
-
     public function poste(): BelongsTo { return $this->belongsTo(Poste::class); }
     public function recharges(): HasMany { return $this->hasMany(Recharge::class); }
     public function restitutions(): HasMany { return $this->hasMany(Restitution::class); }
@@ -66,56 +63,24 @@ class Session extends Model
     public function voucher(): BelongsTo { return $this->belongsTo(Voucher::class); }
     public function appareilWifi(): BelongsTo { return $this->belongsTo(AppareilWifi::class, 'appareil_wifi_id'); }
 
-    // -----------------------------------------------------------------
-    // Helpers
-    // -----------------------------------------------------------------
+    public function estConnecte(): bool   { return $this->etat_wifi === self::WIFI_CONNECTE; }
+    public function estDeconnecte(): bool { return $this->etat_wifi === self::WIFI_DECONNECTE; }
+    public function estEnPause(): bool    { return $this->etat_wifi === self::WIFI_EN_PAUSE; }
+    public function estTermine(): bool    { return $this->etat_wifi === self::WIFI_TERMINE; }
 
-    public function estConnecte(): bool
-    {
-        return $this->etat_wifi === self::WIFI_CONNECTE;
-    }
-
-    public function estDeconnecte(): bool
-    {
-        return $this->etat_wifi === self::WIFI_DECONNECTE;
-    }
-
-    public function estEnPause(): bool
-    {
-        return $this->etat_wifi === self::WIFI_EN_PAUSE;
-    }
-
-    public function estTermine(): bool
-    {
-        return $this->etat_wifi === self::WIFI_TERMINE;
-    }
-
-    /**
-     * Vrai si le compteur doit tourner maintenant.
-     */
     public function compteurActif(): bool
     {
         return $this->etat_wifi === self::WIFI_CONNECTE;
     }
 
-    /**
-     * Secondes consommées au moment présent.
-     *
-     * Décrémente du temps de :
-     *   - duree_hors_ligne_secondes (déconnexions)
-     *   - duree_pause_secondes (mises en pause manuelles)
-     *   - du temps depuis pause_at si en pause actuellement
-     */
     public function secondesConsommees(): int
     {
         if (!$this->date_heure_debut) return 0;
 
-        // Terminé = figé
         if ($this->estTermine()) {
             return max(0, (int) $this->duree_consommee * 60);
         }
 
-        // Fin virtuelle : maintenant, ou pause_at, ou deconnecte_at
         if ($this->estEnPause() && $this->pause_at) {
             $fin = $this->pause_at;
         } elseif ($this->estDeconnecte() && $this->deconnecte_at) {

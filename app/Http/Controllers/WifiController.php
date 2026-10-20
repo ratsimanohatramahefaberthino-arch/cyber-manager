@@ -49,11 +49,6 @@ class WifiController extends Controller
     // Arrêter / Continuer / Supprimer
     // -----------------------------------------------------------------
 
-    /**
-     * "Arrêter" : FIGE la durée et le montant (arrondi appliqué).
-     * Le client RESTE connecté au Wi-Fi : aucune déconnexion MikroTik ici.
-     * La déconnexion réelle se fait uniquement via "Supprimer".
-     */
     public function arreter(Session $session): JsonResponse
     {
         if ($session->type_session !== 'wifi') {
@@ -101,12 +96,6 @@ class WifiController extends Controller
         ]);
     }
 
-    /**
-     * "Continuer" : reprend une session TERMINÉE, QUE le client soit encore
-     * connecté ou non. La même ligne est réutilisée (pas de nouvelle ligne,
-     * pas de doublon). Le temps passé entre l'arrêt et maintenant est
-     * comptabilisé comme "hors ligne" : il ne sera PAS facturé.
-     */
     public function continuer(Session $session): JsonResponse
     {
         if ($session->type_session !== 'wifi') {
@@ -144,12 +133,6 @@ class WifiController extends Controller
         ]);
     }
 
-    /**
-     * Suppression définitive : déconnecte, efface le voucher du MikroTik,
-     * supprime la session. Si le voucher est encore utilisé par une AUTRE
-     * connexion active, on demande confirmation (force=1) avant de tout
-     * couper. Sinon, suppression immédiate.
-     */
     public function supprimer(Request $request, Session $session): JsonResponse
     {
         if ($session->type_session !== 'wifi') {
@@ -205,11 +188,6 @@ class WifiController extends Controller
         ]);
     }
 
-    /**
-     * Autres sessions Wi-Fi actives qui utilisent le même voucher que $session.
-     *
-     * @return array<int, array{mac:?string, appareil:?string}>
-     */
     private function sessionsActivesDuMemeVoucher(Session $session): array
     {
         if (!$session->voucher) return [];
@@ -244,7 +222,6 @@ class WifiController extends Controller
         }
     }
 
-    /** Suppression en masse. */
     public function supprimerMasse(Request $request): JsonResponse
     {
         $data = $request->validate([
@@ -350,15 +327,18 @@ class WifiController extends Controller
             $secondesRestantes = $secondesTotal;
         }
 
+        $finPrevue = now()->addSeconds($secondesRestantes);
+
         $session->update([
-            'alarme_active'        => true,
-            'alarme_type'          => $data['type'],
-            'alarme_duree_minutes' => $minutes,
-            'alarme_montant'       => $montant,
-            'alarme_fin_prevue'    => now()->addSeconds($secondesRestantes),
-            'alarme_declenchee_at' => null,
-            'alarme_message'       => null,
-            'alarme_historique'    => array_merge($session->alarme_historique ?? [], [[
+            'alarme_active'           => true,
+            'alarme_type'             => $data['type'],
+            'alarme_duree_minutes'    => $minutes,
+            'alarme_montant'          => $montant,
+            'alarme_fin_prevue'       => $finPrevue,
+            'alarme_derniere_fin_at'  => $finPrevue,
+            'alarme_declenchee_at'    => null,
+            'alarme_message'          => null,
+            'alarme_historique'       => array_merge($session->alarme_historique ?? [], [[
                 'action' => 'pose',
                 'type'   => $data['type'],
                 'valeur' => (int) $data['valeur'],
@@ -386,8 +366,10 @@ class WifiController extends Controller
         $data = $request->validate([
             'type'   => ['required', 'in:duree,montant'],
             'valeur' => ['required', 'integer', 'min:1', 'max:1000000'],
+            'depart' => ['nullable', 'in:debut,maintenant,apres'],
         ]);
 
+        $mode  = $data['depart'] ?? 'apres';
         $tarif = $session->tarif ?: $this->tarifService->tarifWifi();
 
         if ($data['type'] === 'duree') {
@@ -400,27 +382,45 @@ class WifiController extends Controller
                 : (int) floor($montantAjoute / 20);
         }
 
-        $nouvelleDuree = (int) $session->alarme_duree_minutes + $minutesAjoutees;
+        $maintenant = now();
+        $debut      = $session->date_heure_debut ?: $maintenant;
+
+        if ($mode === 'debut') {
+            $minutesTotales = (int) $session->alarme_duree_minutes + $minutesAjoutees;
+            $nouvelleFin = $debut->copy()->addMinutes($minutesTotales);
+        } elseif ($mode === 'maintenant') {
+            $nouvelleFin = $maintenant->copy()->addMinutes($minutesAjoutees);
+        } else {
+            $base = $session->alarme_derniere_fin_at
+                ?: $session->alarme_fin_prevue
+                ?: $maintenant;
+            $nouvelleFin = $base->copy()->addMinutes($minutesAjoutees);
+        }
+
+        if ($nouvelleFin->lte($maintenant)) {
+            $nouvelleFin = $maintenant->copy()->addSecond();
+        }
+
+        $nouvelleDuree = max(1, (int) ceil(($nouvelleFin->getTimestamp() - $debut->getTimestamp()) / 60));
+
         $nouveauMontant = $session->alarme_type === 'montant'
             ? (int) $session->alarme_montant + ($data['type'] === 'montant' ? $montantAjoute : 0)
             : null;
 
-        // Toujours strictement dans le futur (au moins 1 s) pour que la jauge
-        // s'affiche et que l'utilisateur voie la prolongation prendre effet.
-        $secondesRestantes = $nouvelleDuree * 60 - $session->secondesConsommees();
-        $nouvelleFin = now()->addSeconds(max(1, $secondesRestantes));
-
         $session->update([
-            'alarme_duree_minutes' => $nouvelleDuree,
-            'alarme_montant'       => $nouveauMontant,
-            'alarme_fin_prevue'    => $nouvelleFin,
-            'alarme_declenchee_at' => null,
-            'alarme_message'       => null,
-            'alarme_historique'    => array_merge($session->alarme_historique ?? [], [[
+            'alarme_duree_minutes'   => $nouvelleDuree,
+            'alarme_montant'         => $nouveauMontant,
+            'alarme_fin_prevue'      => $nouvelleFin,
+            'alarme_derniere_fin_at' => $nouvelleFin,
+            'alarme_declenchee_at'   => null,
+            'alarme_message'         => null,
+            'alarme_historique'      => array_merge($session->alarme_historique ?? [], [[
                 'action'           => 'prolongation',
+                'mode'             => $mode,
                 'type'             => $data['type'],
                 'valeur'           => (int) $data['valeur'],
                 'minutes_ajoutees' => $minutesAjoutees,
+                'nouvelle_fin'     => $nouvelleFin->toIso8601String(),
                 'at'               => now()->toIso8601String(),
             ]]),
         ]);
@@ -452,13 +452,6 @@ class WifiController extends Controller
         ]);
     }
 
-    /**
-     * Arrêt de l'alarme par l'utilisateur :
-     *  - libère l'alarme (alarme_active=false) → on pourra en poser une nouvelle
-     *  - conserve alarme_declenchee_at et alarme_message pour l'historique
-     *  - NE TOUCHE PAS à la session (elle reste connectée, montant/durée
-     *    continuent). Seul « Arrêter » ou « Supprimer » fige la session.
-     */
     public function acquitterAlarme(Session $session): JsonResponse
     {
         $session->update([
@@ -477,6 +470,15 @@ class WifiController extends Controller
             'lignes'  => $this->lignesSerialisees(),
             'stats'   => $this->stats(),
         ]);
+    }
+
+    public function marquerAlarmeDeclenchee(Session $session): JsonResponse
+    {
+        if (!$session->alarme_declenchee_at) {
+            $session->update(['alarme_declenchee_at' => now()]);
+        }
+
+        return response()->json(['ok' => true]);
     }
 
     // -----------------------------------------------------------------
@@ -700,6 +702,7 @@ class WifiController extends Controller
                 'minutes'     => $s->alarme_duree_minutes,
                 'montant'     => $s->alarme_montant,
                 'fin'         => $s->alarme_fin_prevue?->toIso8601String(),
+                'derniere_fin'=> $s->alarme_derniere_fin_at?->toIso8601String(),
                 'declenchee'  => (bool) $s->alarme_declenchee_at,
                 'acquittee'   => ($s->alarme_message === 'acquittee'),
             ],
