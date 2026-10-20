@@ -31,6 +31,7 @@ class Session extends Model
         'alarme_active', 'alarme_type', 'alarme_duree_minutes', 'alarme_montant',
         'alarme_fin_prevue', 'alarme_derniere_fin_at', 'alarme_declenchee_at',
         'alarme_message', 'alarme_historique', 'alarme_secondes_restantes',
+        'alarme_total_secondes',
         'remarque',
     ];
 
@@ -54,6 +55,7 @@ class Session extends Model
         'alarme_montant' => 'integer',
         'alarme_historique' => 'array',
         'alarme_secondes_restantes' => 'integer',
+        'alarme_total_secondes' => 'integer',
     ];
 
     public function poste(): BelongsTo { return $this->belongsTo(Poste::class); }
@@ -73,6 +75,13 @@ class Session extends Model
         return $this->etat_wifi === self::WIFI_CONNECTE;
     }
 
+    /**
+     * Secondes facturables écoulées (hors périodes déconnecté / en pause).
+     *
+     * On travaille sur des timestamps entiers : avec Carbon 3, diffInSeconds()
+     * renvoie un float signé, ce qui provoquait des conversions implicites
+     * float → int (dépréciées en PHP 8.1+).
+     */
     public function secondesConsommees(): int
     {
         if (!$this->date_heure_debut) return 0;
@@ -89,10 +98,10 @@ class Session extends Model
             $fin = now();
         }
 
-        $total = $this->date_heure_debut->diffInSeconds($fin);
+        $total = $fin->getTimestamp() - $this->date_heure_debut->getTimestamp();
         $total -= (int) $this->duree_hors_ligne_secondes;
         $total -= (int) $this->duree_pause_secondes;
 
-        return max(0, $total);
+        return max(0, (int) $total);
     }
 }

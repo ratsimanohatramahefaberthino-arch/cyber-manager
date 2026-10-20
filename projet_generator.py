@@ -48,6 +48,9 @@ SECTIONS = {
     "WI-FI — Vues": [
         "resources/views/wifi/index.blade.php",
         "resources/views/wifi/comptes.blade.php",
+        # NOUVEAU : vues HotSpot (référencées par HotspotController)
+        "resources/views/hotspot/index.blade.php",
+        "resources/views/hotspot/print-lot.blade.php",
     ],
 
     # ═══════════════════════════════════════════════════════════════
@@ -90,6 +93,13 @@ SECTIONS = {
     ],
 
     # ═══════════════════════════════════════════════════════════════
+    # 7bis. SERVICES DE SESSIONS (liés aux commandes artisan)
+    # ═══════════════════════════════════════════════════════════════
+    "SERVICES SESSIONS": [
+        "app/Services/SessionExpirationService.php",
+    ],
+
+    # ═══════════════════════════════════════════════════════════════
     # 8. LAYOUT + COMPOSANTS BLADE
     # ═══════════════════════════════════════════════════════════════
     "LAYOUT et COMPOSANTS BLADE": [
@@ -108,6 +118,7 @@ SECTIONS = {
         "routes/web.php",
         "routes/console.php",
         "config/mikrotik.php",
+        "routes/auth.php",
     ],
 
     # ═══════════════════════════════════════════════════════════════
