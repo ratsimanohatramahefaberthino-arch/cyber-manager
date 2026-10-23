@@ -1,0 +1,1321 @@
+==================================================
+           CODE SOURCE DU MODULE TARIFS           
+==================================================
+
+
+================================================================================
+📄 app/Models/Tarif.php
+================================================================================
+
+<?php
+
+namespace App\Models;
+
+use Illuminate\Database\Eloquent\Model;
+use Illuminate\Database\Eloquent\Relations\HasMany;
+
+class Tarif extends Model
+{
+    public const CIBLE_UNIFIE   = 'unifie';
+    public const CIBLE_ETHERNET = 'ethernet';
+    public const CIBLE_WIFI     = 'wifi';
+
+    protected $fillable = [
+        'cible',
+        'montant_par_minute',
+        'montant_minimum',
+        'arrondi_actif',
+        'unite_arrondi',
+        'seuil_arrondi',
+        'description',
+    ];
+
+    protected $casts = [
+        'montant_par_minute' => 'integer',
+        'montant_minimum'    => 'integer',
+        'unite_arrondi'      => 'integer',
+        'seuil_arrondi'      => 'integer',
+        'arrondi_actif'      => 'boolean',
+    ];
+
+    public function sessions(): HasMany
+    {
+        return $this->hasMany(Session::class);
+    }
+
+    public function raccourcis(): HasMany
+    {
+        return $this->hasMany(TarifRaccourci::class)
+            ->orderBy('ordre')
+            ->orderBy('montant');
+    }
+
+    // -----------------------------------------------------------------
+
+    public function libelle(): string
+    {
+        return match ($this->cible) {
+            self::CIBLE_UNIFIE   => 'Poste client + Wi-Fi',
+            self::CIBLE_ETHERNET => 'Poste client',
+            self::CIBLE_WIFI     => 'Wi-Fi',
+            default              => ucfirst((string) $this->cible),
+        };
+    }
+
+    public function couleur(): string
+    {
+        return match ($this->cible) {
+            self::CIBLE_UNIFIE   => 'slate',
+            self::CIBLE_ETHERNET => 'sky',
+            self::CIBLE_WIFI     => 'violet',
+            default              => 'slate',
+        };
+    }
+
+    public function icone(): string
+    {
+        return match ($this->cible) {
+            self::CIBLE_UNIFIE   => 'tag',
+            self::CIBLE_ETHERNET => 'desktop',
+            self::CIBLE_WIFI     => 'wifi',
+            default              => 'tag',
+        };
+    }
+}
+
+
+================================================================================
+📄 app/Models/TarifRaccourci.php
+================================================================================
+
+<?php
+
+namespace App\Models;
+
+use Illuminate\Database\Eloquent\Model;
+use Illuminate\Database\Eloquent\Relations\BelongsTo;
+
+class TarifRaccourci extends Model
+{
+    protected $table = 'tarif_raccourcis';
+
+    protected $fillable = ['tarif_id', 'montant', 'duree', 'libelle', 'ordre'];
+
+    protected $casts = [
+        'montant' => 'integer',
+        'duree'   => 'integer',
+        'ordre'   => 'integer',
+    ];
+
+    public function tarif(): BelongsTo
+    {
+        return $this->belongsTo(Tarif::class);
+    }
+
+    /** Durée formatée "1 h 15 min" + minutes entre parenthèses. */
+    public function dureeLisible(): string
+    {
+        $m = (int) $this->duree;
+
+        if ($m < 60) {
+            return "{$m} min";
+        }
+
+        $h = intdiv($m, 60);
+        $r = $m % 60;
+
+        return $r === 0
+            ? "{$h} h"
+            : "{$h} h " . str_pad((string) $r, 2, '0', STR_PAD_LEFT) . " min";
+    }
+}
+
+
+================================================================================
+📄 app/Services/TarifService.php
+================================================================================
+
+<?php
+
+namespace App\Services;
+
+use App\Models\Tarif;
+use InvalidArgumentException;
+
+class TarifService
+{
+    // -----------------------------------------------------------------
+    // Résolution de la configuration active
+    // -----------------------------------------------------------------
+
+    /** Y a-t-il un tarif unifié ou deux tarifs séparés ? */
+    public function mode(): string
+    {
+        return Tarif::where('cible', Tarif::CIBLE_UNIFIE)->exists()
+            ? 'unifie'
+            : 'separe';
+    }
+
+    /** Tarif unique (mode unifié). Null si mode séparé. */
+    public function tarifUnifie(): ?Tarif
+    {
+        return Tarif::where('cible', Tarif::CIBLE_UNIFIE)->first();
+    }
+
+    public function tarifEthernet(): ?Tarif
+    {
+        if ($u = $this->tarifUnifie()) {
+            return $u;
+        }
+
+        return Tarif::where('cible', Tarif::CIBLE_ETHERNET)->first();
+    }
+
+    public function tarifWifi(): ?Tarif
+    {
+        if ($u = $this->tarifUnifie()) {
+            return $u;
+        }
+
+        return Tarif::where('cible', Tarif::CIBLE_WIFI)->first();
+    }
+
+    /** Compatibilité avec l'ancien code (SessionService). */
+    public function tarifStandard(): Tarif
+    {
+        return $this->tarifPour(Tarif::CIBLE_ETHERNET);
+    }
+
+    public function tarifPour(string $cible): Tarif
+    {
+        if ($cible === Tarif::CIBLE_ETHERNET) {
+            $t = $this->tarifEthernet();
+        } elseif ($cible === Tarif::CIBLE_WIFI) {
+            $t = $this->tarifWifi();
+        } else {
+            $t = $this->tarifUnifie() ?? $this->tarifEthernet() ?? $this->tarifWifi();
+        }
+
+        if (!$t) {
+            throw new InvalidArgumentException("Aucun tarif configuré pour « {$cible} ».");
+        }
+
+        return $t;
+    }
+
+    // -----------------------------------------------------------------
+    // Arrondi et minimum
+    // -----------------------------------------------------------------
+
+    public function appliquerArrondi(int $montant, Tarif $tarif): int
+    {
+        if (!$tarif->arrondi_actif || $tarif->unite_arrondi <= 0) {
+            return $montant;
+        }
+
+        $unite = max(1, (int) $tarif->unite_arrondi);
+        $seuil = max(0, min($unite - 1, (int) $tarif->seuil_arrondi));
+        $reste = $montant % $unite;
+
+        if ($reste === 0) {
+            return $montant;
+        }
+
+        return $reste < $seuil
+            ? $montant - $reste
+            : $montant + ($unite - $reste);
+    }
+
+    public function appliquerMinimum(int $montant, Tarif $tarif): int
+    {
+        if ($tarif->montant_minimum > 0 && $montant < $tarif->montant_minimum) {
+            return $tarif->montant_minimum;
+        }
+
+        return $montant;
+    }
+
+    // -----------------------------------------------------------------
+    // Conversions
+    // -----------------------------------------------------------------
+
+    public function calculerDuree(int $montant, ?Tarif $tarif = null): int
+    {
+        $tarif ??= $this->tarifStandard();
+
+        if ($tarif->montant_par_minute <= 0) {
+            throw new InvalidArgumentException("Prix/minute invalide.");
+        }
+
+        $montant = $this->appliquerMinimum($montant, $tarif);
+        $montant = $this->appliquerArrondi($montant, $tarif);
+
+        return intdiv($montant, $tarif->montant_par_minute);
+    }
+
+    public function montantPourMinutes(int $minutes, ?Tarif $tarif = null): int
+    {
+        $tarif ??= $this->tarifStandard();
+
+        $brut = max(0, $minutes) * $tarif->montant_par_minute;
+
+        $brut = $this->appliquerMinimum($brut, $tarif);
+        return $this->appliquerArrondi($brut, $tarif);
+    }
+
+    // -----------------------------------------------------------------
+    // Simulateur
+    // -----------------------------------------------------------------
+
+    /**
+     * @return array{
+     *   entree:int, mode:string, tarif:array, etapes:array, resultat:array
+     * }
+     */
+    public function simuler(int $entree, Tarif $tarif, string $mode = 'montant'): array
+    {
+        $etapes = [];
+
+        if ($mode === 'montant') {
+            $brut = $entree;
+            $etapes[] = ['label' => 'Montant saisi', 'valeur' => $this->formatAr($brut)];
+
+            $min = $this->appliquerMinimum($brut, $tarif);
+            if ($min !== $brut) {
+                $etapes[] = ['label' => 'Minimum appliqué', 'valeur' => $this->formatAr($min)];
+                $brut = $min;
+            }
+
+            $arr = $this->appliquerArrondi($brut, $tarif);
+            if ($arr !== $brut) {
+                $etapes[] = ['label' => 'Arrondi appliqué', 'valeur' => $this->formatAr($arr)];
+                $brut = $arr;
+            }
+
+            $minutes = $tarif->montant_par_minute > 0
+                ? intdiv($brut, $tarif->montant_par_minute)
+                : 0;
+
+            $etapes[] = [
+                'label' => "Durée = {$brut} ÷ {$tarif->montant_par_minute} Ar/min",
+                'valeur' => $this->formatDuree($minutes),
+            ];
+
+            $resultat = [
+                'minutes'  => $minutes,
+                'lisible'  => $this->formatDuree($minutes),
+                'montant'  => $brut,
+            ];
+        } else {
+            $minutes = max(0, $entree);
+            $etapes[] = ['label' => 'Durée saisie', 'valeur' => $this->formatDuree($minutes)];
+
+            $brut = $minutes * $tarif->montant_par_minute;
+            $etapes[] = [
+                'label' => "Montant brut = {$minutes} × {$tarif->montant_par_minute} Ar",
+                'valeur' => $this->formatAr($brut),
+            ];
+
+            $min = $this->appliquerMinimum($brut, $tarif);
+            if ($min !== $brut) {
+                $etapes[] = ['label' => 'Minimum appliqué', 'valeur' => $this->formatAr($min)];
+                $brut = $min;
+            }
+
+            $arr = $this->appliquerArrondi($brut, $tarif);
+            if ($arr !== $brut) {
+                $etapes[] = ['label' => 'Arrondi appliqué', 'valeur' => $this->formatAr($arr)];
+                $brut = $arr;
+            }
+
+            $resultat = [
+                'minutes' => $minutes,
+                'lisible' => $this->formatDuree($minutes),
+                'montant' => $brut,
+            ];
+        }
+
+        return [
+            'entree'   => $entree,
+            'mode'     => $mode,
+            'tarif'    => [
+                'id'                 => $tarif->id,
+                'cible'              => $tarif->cible,
+                'libelle'            => $tarif->libelle(),
+                'montant_par_minute' => $tarif->montant_par_minute,
+                'montant_minimum'    => $tarif->montant_minimum,
+                'arrondi_actif'      => (bool) $tarif->arrondi_actif,
+                'unite_arrondi'      => $tarif->unite_arrondi,
+                'seuil_arrondi'      => $tarif->seuil_arrondi,
+            ],
+            'etapes'   => $etapes,
+            'resultat' => $resultat,
+        ];
+    }
+
+    // -----------------------------------------------------------------
+
+    public function formatAr(int $n): string
+    {
+        return number_format($n, 0, ',', ' ') . ' Ar';
+    }
+
+    public function formatDuree(int $minutes): string
+    {
+        $minutes = max(0, $minutes);
+
+        if ($minutes < 60) {
+            return "{$minutes} min";
+        }
+
+        $h = intdiv($minutes, 60);
+        $r = $minutes % 60;
+
+        return $r === 0
+            ? "{$h} h ({$minutes} min)"
+            : "{$h} h " . str_pad((string) $r, 2, '0', STR_PAD_LEFT) . " min ({$minutes} min)";
+    }
+
+        /**
+     * Recalcule les durées des raccourcis d'un tarif selon le prix/minute.
+     * Appelé après tout changement de tarif.
+     * Le MONTANT est la référence (fixe) ; la DURÉE s'adapte.
+     */
+    public function resynchroniserRaccourcis(Tarif $tarif): void
+    {
+        if ($tarif->montant_par_minute <= 0) {
+            return;
+        }
+
+        foreach ($tarif->raccourcis()->get() as $r) {
+            $montant = (int) $r->montant;
+
+            // Applique minimum puis arrondi, puis divise par le prix/minute
+            $montantNet = $this->appliquerMinimum($montant, $tarif);
+            $montantNet = $this->appliquerArrondi($montantNet, $tarif);
+
+            $nouvelleDuree = intdiv($montantNet, $tarif->montant_par_minute);
+
+            if ($nouvelleDuree !== (int) $r->duree) {
+                $r->update(['duree' => $nouvelleDuree]);
+            }
+        }
+    }
+}
+
+
+================================================================================
+📄 app/Http/Controllers/TarifController.php
+================================================================================
+
+<?php
+
+namespace App\Http\Controllers;
+
+use App\Models\Tarif;
+use App\Models\TarifRaccourci;
+use App\Services\TarifService;
+use Illuminate\Http\JsonResponse;
+use Illuminate\Http\RedirectResponse;
+use Illuminate\Http\Request;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Validation\Rule;
+
+class TarifController extends Controller
+{
+    public function __construct(private TarifService $tarifService) {}
+
+    // -----------------------------------------------------------------
+    // Page principale
+    // -----------------------------------------------------------------
+
+    public function index()
+    {
+        $mode = $this->tarifService->mode();
+
+        $unifie   = $mode === 'unifie'   ? $this->tarifService->tarifUnifie() : null;
+        $ethernet = $mode === 'separe'   ? $this->tarifService->tarifEthernet() : null;
+        $wifi     = $mode === 'separe'   ? $this->tarifService->tarifWifi() : null;
+
+        // S'assurer qu'on a au moins une config, sinon on la crée
+        if (!$unifie && !$ethernet && !$wifi) {
+            $unifie = Tarif::create([
+                'cible'              => Tarif::CIBLE_UNIFIE,
+                'montant_par_minute' => 20,
+                'montant_minimum'    => 300,
+                'arrondi_actif'      => true,
+                'unite_arrondi'      => 100,
+                'seuil_arrondi'      => 50,
+            ]);
+            $mode = 'unifie';
+        }
+
+        return view('tarifs.index', compact('mode', 'unifie', 'ethernet', 'wifi'));
+    }
+
+    // -----------------------------------------------------------------
+    // Modification d'un tarif existant
+    // -----------------------------------------------------------------
+
+    public function update(Request $request, Tarif $tarif): RedirectResponse
+    {
+        $data = $request->validate([
+            'montant_par_minute' => ['required', 'integer', 'min:1', 'max:100000'],
+            'montant_minimum'    => ['required', 'integer', 'min:0', 'max:1000000'],
+            'arrondi_actif'      => ['nullable', 'boolean'],
+            'unite_arrondi'      => ['nullable', 'integer', 'min:1', 'max:10000'],
+            'seuil_arrondi'      => ['nullable', 'integer', 'min:0', 'max:10000'],
+            'description'        => ['nullable', 'string', 'max:500'],
+        ]);
+
+        $tarif->update([
+            'montant_par_minute' => $data['montant_par_minute'],
+            'montant_minimum'    => $data['montant_minimum'],
+            'arrondi_actif'      => $request->boolean('arrondi_actif'),
+            'unite_arrondi'      => (int) ($data['unite_arrondi'] ?? 100),
+            'seuil_arrondi'      => (int) ($data['seuil_arrondi'] ?? 50),
+            'description'        => $data['description'] ?? null,
+        ]);
+
+        // Recalcule les durées des raccourcis selon le nouveau prix/minute
+        $this->tarifService->resynchroniserRaccourcis($tarif->fresh());
+
+        return redirect()
+            ->route('tarifs.index')
+            ->with('success', "Tarif « {$tarif->libelle()} » mis à jour. Les raccourcis ont été recalculés.");
+    }
+
+    // -----------------------------------------------------------------
+    // Passage unifié ⇄ séparé
+    // -----------------------------------------------------------------
+
+    public function passerSepare(Request $request): RedirectResponse
+    {
+        $request->validate([
+            'confirmation' => ['required', Rule::in(['SEPARER'])],
+        ], [
+            'confirmation.in' => 'Tapez exactement « SEPARER » pour confirmer.',
+        ]);
+
+        $unifie = $this->tarifService->tarifUnifie();
+
+        if (!$unifie) {
+            return back()->with('error', 'Le mode est déjà séparé.');
+        }
+
+        DB::transaction(function () use ($unifie) {
+            // On duplique la config unifiée en deux lignes distinctes
+            Tarif::create([
+                'cible'              => Tarif::CIBLE_ETHERNET,
+                'montant_par_minute' => $unifie->montant_par_minute,
+                'montant_minimum'    => $unifie->montant_minimum,
+                'arrondi_actif'      => $unifie->arrondi_actif,
+                'unite_arrondi'      => $unifie->unite_arrondi,
+                'seuil_arrondi'      => $unifie->seuil_arrondi,
+                'description'        => $unifie->description,
+            ]);
+
+            Tarif::create([
+                'cible'              => Tarif::CIBLE_WIFI,
+                'montant_par_minute' => $unifie->montant_par_minute,
+                'montant_minimum'    => $unifie->montant_minimum,
+                'arrondi_actif'      => $unifie->arrondi_actif,
+                'unite_arrondi'      => $unifie->unite_arrondi,
+                'seuil_arrondi'      => $unifie->seuil_arrondi,
+                'description'        => $unifie->description,
+            ]);
+
+            // Raccourcis du tarif unifié → dupliqués aussi
+            foreach ($unifie->raccourcis as $r) {
+                Tarif::where('cible', Tarif::CIBLE_ETHERNET)->first()->raccourcis()->create([
+                    'montant' => $r->montant, 'duree' => $r->duree,
+                    'libelle' => $r->libelle, 'ordre' => $r->ordre,
+                ]);
+                Tarif::where('cible', Tarif::CIBLE_WIFI)->first()->raccourcis()->create([
+                    'montant' => $r->montant, 'duree' => $r->duree,
+                    'libelle' => $r->libelle, 'ordre' => $r->ordre,
+                ]);
+            }
+
+            $unifie->delete();
+        });
+
+        return redirect()
+            ->route('tarifs.index')
+            ->with('success', 'Mode séparé activé : configurez maintenant Ethernet et Wi-Fi indépendamment.');
+    }
+
+    public function passerUnifie(Request $request): RedirectResponse
+    {
+        $request->validate([
+            'confirmation' => ['required', Rule::in(['UNIFIER'])],
+            'base'         => ['required', Rule::in(['ethernet', 'wifi'])],
+        ], [
+            'confirmation.in' => 'Tapez exactement « UNIFIER » pour confirmer.',
+        ]);
+
+        $base = $request->input('base'); // laquelle garder comme source
+        $source = $base === 'wifi'
+            ? $this->tarifService->tarifWifi()
+            : $this->tarifService->tarifEthernet();
+
+        if (!$source) {
+            return back()->with('error', "Le tarif « {$base} » n'existe pas.");
+        }
+
+        DB::transaction(function () use ($source) {
+            // Supprimer toutes les lignes existantes
+            TarifRaccourci::query()->delete();
+            Tarif::query()->delete();
+
+            $nouveau = Tarif::create([
+                'cible'              => Tarif::CIBLE_UNIFIE,
+                'montant_par_minute' => $source->montant_par_minute,
+                'montant_minimum'    => $source->montant_minimum,
+                'arrondi_actif'      => $source->arrondi_actif,
+                'unite_arrondi'      => $source->unite_arrondi,
+                'seuil_arrondi'      => $source->seuil_arrondi,
+                'description'        => $source->description,
+            ]);
+
+            foreach ($source->raccourcis as $r) {
+                $nouveau->raccourcis()->create([
+                    'montant' => $r->montant, 'duree' => $r->duree,
+                    'libelle' => $r->libelle, 'ordre' => $r->ordre,
+                ]);
+            }
+        });
+
+        return redirect()
+            ->route('tarifs.index')
+            ->with('success', 'Mode unifié activé : un seul tarif pour Ethernet et Wi-Fi.');
+    }
+
+    // -----------------------------------------------------------------
+    // Réinitialisation (avec confirmation textuelle)
+    // -----------------------------------------------------------------
+
+    public function reinitialiser(Request $request): RedirectResponse
+    {
+        $request->validate([
+            'confirmation' => ['required', Rule::in(['REINITIALISER'])],
+        ], [
+            'confirmation.in' => 'Tapez exactement « REINITIALISER » pour confirmer.',
+        ]);
+
+        DB::transaction(function () {
+            TarifRaccourci::query()->delete();
+            Tarif::query()->delete();
+
+            $t = Tarif::create([
+                'cible'              => Tarif::CIBLE_UNIFIE,
+                'montant_par_minute' => 20,
+                'montant_minimum'    => 300,
+                'arrondi_actif'      => true,
+                'unite_arrondi'      => 100,
+                'seuil_arrondi'      => 50,
+                'description'        => 'Tarif par défaut (20 Ar/min, minimum 300 Ar).',
+            ]);
+
+            $t->raccourcis()->createMany([
+                ['montant' => 300,  'duree' => 15, 'libelle' => '15 min',  'ordre' => 10],
+                ['montant' => 500,  'duree' => 25, 'libelle' => '25 min',  'ordre' => 20],
+                ['montant' => 600,  'duree' => 30, 'libelle' => '30 min',  'ordre' => 30],
+                ['montant' => 1000, 'duree' => 50, 'libelle' => '50 min',  'ordre' => 40],
+            ]);
+        });
+
+        return redirect()
+            ->route('tarifs.index')
+            ->with('success', 'Tarifs réinitialisés aux valeurs par défaut.');
+    }
+
+    // -----------------------------------------------------------------
+    // Raccourcis
+    // -----------------------------------------------------------------
+
+    public function storeRaccourci(Request $request, Tarif $tarif): RedirectResponse
+    {
+        $data = $request->validate([
+            'mode'    => ['nullable', Rule::in(['montant', 'duree'])],
+            'montant' => ['nullable', 'integer', 'min:1', 'max:1000000'],
+            'h'       => ['nullable', 'integer', 'min:0', 'max:999'],
+            'm'       => ['nullable', 'integer', 'min:0', 'max:59'],
+            's'       => ['nullable', 'integer', 'min:0', 'max:59'],
+            'libelle' => ['nullable', 'string', 'max:100'],
+        ]);
+
+        $data['mode'] = $data['mode'] ?? 'montant';
+
+        if ($data['mode'] === 'montant') {
+            if (empty($data['montant'])) {
+                return back()->withErrors(['montant' => 'Indiquez un montant.']);
+            }
+
+            $montant = (int) $data['montant'];
+            $duree   = $this->tarifService->calculerDuree($montant, $tarif);
+        } else {
+            $h = (int) ($data['h'] ?? 0);
+            $m = (int) ($data['m'] ?? 0);
+            $s = (int) ($data['s'] ?? 0);
+            $minutes = $h * 60 + $m + ($s > 0 ? 1 : 0); // arrondi à la minute sup.
+
+            if ($minutes < 1) {
+                return back()->withErrors(['h' => 'Indiquez une durée supérieure à 0.']);
+            }
+
+            $montant = $this->tarifService->montantPourMinutes($minutes, $tarif);
+            $duree   = $minutes;
+        }
+
+        if ($tarif->raccourcis()->where('montant', $montant)->exists()) {
+            return back()
+                ->withInput()
+                ->withErrors([
+                    "raccourci_tarif_{$tarif->id}" => "Un raccourci à " . number_format($montant, 0, ',', ' ') . " Ar existe déjà.",
+                ]);
+        }
+
+        $tarif->raccourcis()->create([
+            'montant' => $montant,
+            'duree'   => $duree,
+            'libelle' => $data['libelle'] ?? null,
+            'ordre'   => ($tarif->raccourcis()->max('ordre') ?? 0) + 10,
+        ]);
+
+        return redirect()
+            ->route('tarifs.index')
+            ->with('success', "Raccourci ajouté : {$montant} Ar → {$duree} min.");
+    }
+
+    public function destroyRaccourci(Tarif $tarif, TarifRaccourci $raccourci): RedirectResponse
+    {
+        if ($raccourci->tarif_id !== $tarif->id) {
+            abort(404);
+        }
+
+        $raccourci->delete();
+
+        return redirect()
+            ->route('tarifs.index')
+            ->with('success', 'Raccourci supprimé.');
+    }
+
+    // -----------------------------------------------------------------
+    // Simulateur
+    // -----------------------------------------------------------------
+
+    public function simuler(Request $request): JsonResponse
+    {
+        $data = $request->validate([
+            'cible'  => ['required', Rule::in(['unifie', 'ethernet', 'wifi'])],
+            'mode'   => ['required', Rule::in(['montant', 'duree'])],
+            'entree' => ['required', 'integer', 'min:0', 'max:10000000'],
+        ]);
+
+        $tarif = $this->tarifService->tarifPour($data['cible']);
+
+        return response()->json(
+            $this->tarifService->simuler((int) $data['entree'], $tarif, $data['mode'])
+        );
+    }
+}
+
+
+================================================================================
+📄 resources/views/tarifs/index.blade.php
+================================================================================
+
+@extends('layouts.cyber-manager', ['title' => 'Tarifs — Cyber Manager'])
+
+@section('content')
+@php
+    $fmtAr = fn ($n) => number_format((int) $n, 0, ',', ' ') . ' Ar';
+    $tarifActifEth  = $mode === 'unifie' ? $unifie : $ethernet;
+    $tarifActifWifi = $mode === 'unifie' ? $unifie : $wifi;
+@endphp
+
+<x-flash />
+
+<div x-data="tarifsPage({
+        mode: '{{ $mode }}',
+        urlSimuler: '{{ route('tarifs.simuler') }}',
+        csrf: '{{ csrf_token() }}',
+    })"
+    @editer-tarif.window="ouvrirEdition($event.detail)">
+
+    {{-- EN-TÊTE --}}
+    <div class="mb-6 flex flex-wrap items-center justify-between gap-3">
+        <div>
+            <h1 class="text-2xl font-semibold tracking-tight text-slate-900">Tarifs</h1>
+            <p class="text-sm text-slate-500">
+                Règles de facturation appliquées aux sessions Postes Clients et Wi-Fi.
+            </p>
+        </div>
+        <button type="button" @click="ouvrirReinitialisation()"
+                class="inline-flex h-9 items-center gap-1.5 rounded-lg border border-rose-200 bg-white px-3 text-xs font-medium text-rose-700 shadow-sm hover:bg-rose-50">
+            <x-icone nom="refresh" class="h-4 w-4" /> Réinitialiser
+        </button>
+    </div>
+
+    {{-- LAYOUT 2 COLONNES --}}
+    <div class="grid gap-6 lg:grid-cols-3">
+
+        {{-- ══════════════ COLONNE GAUCHE (infos + raccourcis) ══════════════ --}}
+        <div class="space-y-6 lg:col-span-2">
+
+            {{-- Sélecteur de mode --}}
+            <div class="rounded-xl border border-slate-200 bg-white p-5 shadow-sm">
+                <p class="mb-3 text-xs font-semibold uppercase tracking-wide text-slate-400">Mode de tarification</p>
+                <div class="inline-flex w-full rounded-lg border border-slate-200 bg-slate-100 p-1 text-sm">
+                    <button type="button" @click="demanderMode('unifie')"
+                            @class([
+                                'flex-1 rounded-md px-3 py-2.5 font-medium transition',
+                                'bg-slate-900 text-white shadow-sm' => $mode === 'unifie',
+                                'text-slate-600 hover:bg-white hover:text-slate-900' => $mode !== 'unifie',
+                            ])>
+                        Tarif unique
+                    </button>
+                    <button type="button" @click="demanderMode('separe')"
+                            @class([
+                                'flex-1 rounded-md px-3 py-2.5 font-medium transition',
+                                'bg-slate-900 text-white shadow-sm' => $mode === 'separe',
+                                'text-slate-600 hover:bg-white hover:text-slate-900' => $mode !== 'separe',
+                            ])>
+                        Tarifs séparés
+                    </button>
+                </div>
+                <p class="mt-2 text-xs text-slate-500">
+                    @if($mode === 'unifie')
+                        Une seule règle s'applique aux accès <strong>Postes clients</strong> et <strong>Wi-Fi</strong>.
+                    @else
+                        Deux règles distinctes : l'une pour <strong>Postes clients</strong>, l'autre pour <strong>Wi-Fi</strong>.
+                    @endif
+                </p>
+            </div>
+
+            {{-- Cards des tarifs --}}
+            @if($mode === 'unifie' && $unifie)
+                @include('tarifs.partials.card', ['tarif' => $unifie, 'titre' => 'Poste client + Wi-Fi'])
+            @endif
+
+            @if($mode === 'separe' && $ethernet)
+                @include('tarifs.partials.card', ['tarif' => $ethernet, 'titre' => 'Poste client'])
+            @endif
+
+            @if($mode === 'separe' && $wifi)
+                @include('tarifs.partials.card', ['tarif' => $wifi, 'titre' => 'Tarif Wi-Fi'])
+            @endif
+
+            {{-- Raccourcis --}}
+            <div class="space-y-4">
+                @if($mode === 'unifie' && $unifie)
+                    @include('tarifs.partials.raccourcis', ['tarif' => $unifie, 'titre' => 'Raccourcis Poste client + Wi-Fi'])
+                @endif
+
+                @if($mode === 'separe' && $ethernet)
+                    @include('tarifs.partials.raccourcis', ['tarif' => $ethernet, 'titre' => 'Raccourcis Poste client'])
+                @endif
+
+                @if($mode === 'separe' && $wifi)
+                    @include('tarifs.partials.raccourcis', ['tarif' => $wifi, 'titre' => 'Raccourcis Wi-Fi'])
+                @endif
+            </div>
+        </div>
+
+        {{-- ══════════════ COLONNE DROITE (simulateur) ══════════════ --}}
+        <div class="lg:col-span-1">
+            <div class="sticky top-20">
+                @include('tarifs.partials.simulateur', [
+                    'mode' => $mode,
+                    'unifie' => $unifie,
+                    'ethernet' => $ethernet,
+                    'wifi' => $wifi,
+                ])
+            </div>
+        </div>
+    </div>
+
+    {{-- ═══ Modale Modifier un tarif ═══ --}}
+    <div x-show="editionOuverte" x-cloak class="fixed inset-0 z-50 flex items-center justify-center p-4">
+        <div class="absolute inset-0 bg-slate-900/50" @click="editionOuverte = false" x-transition.opacity></div>
+        <div x-show="editionOuverte" x-transition
+             class="relative w-full max-w-lg overflow-hidden rounded-2xl bg-white shadow-xl">
+            <div class="flex items-center justify-between border-b border-slate-100 px-5 py-4">
+                <h2 class="text-base font-semibold text-slate-900" x-text="'Modifier — ' + (edition?.titre ?? '')"></h2>
+                <button type="button" @click="editionOuverte = false" class="rounded p-1 text-slate-400 hover:bg-slate-100">
+                    <x-icone nom="x" class="h-5 w-5" />
+                </button>
+            </div>
+
+            <form :action="edition?.update_url" method="POST" class="space-y-4 p-5">
+                @csrf
+                <input type="hidden" name="_method" value="PATCH">
+
+                <div class="grid gap-4 sm:grid-cols-2">
+                    <div>
+                        <label class="mb-1.5 block text-sm font-medium text-slate-700">Prix par minute (Ar)</label>
+                        <input type="number" name="montant_par_minute" x-model.number="edition.montant_par_minute"
+                               required min="1" max="100000"
+                               class="w-full rounded-lg border border-slate-300 bg-white px-3 py-2.5 font-mono text-sm">
+                    </div>
+                    <div>
+                        <label class="mb-1.5 block text-sm font-medium text-slate-700">Minimum facturable (Ar)</label>
+                        <input type="number" name="montant_minimum" x-model.number="edition.montant_minimum"
+                               required min="0" max="1000000"
+                               class="w-full rounded-lg border border-slate-300 bg-white px-3 py-2.5 font-mono text-sm">
+                        <p class="mt-1 text-xs text-slate-500">Montant plancher, ex. 300 Ar.</p>
+                    </div>
+                </div>
+
+                <div class="rounded-lg border border-slate-200 bg-slate-50/60 p-3">
+                    <label class="flex items-center gap-2 text-sm font-medium text-slate-700">
+                        <input type="checkbox" name="arrondi_actif" value="1" x-model="edition.arrondi_actif"
+                               class="rounded border-slate-300">
+                        Appliquer un arrondi
+                    </label>
+
+                    <div class="mt-3 grid gap-4 sm:grid-cols-2" x-show="edition.arrondi_actif">
+                        <div>
+                            <label class="mb-1.5 block text-sm font-medium text-slate-700">Unité (Ar)</label>
+                            <input type="number" name="unite_arrondi" x-model.number="edition.unite_arrondi"
+                                   min="1" max="10000"
+                                   class="w-full rounded-lg border border-slate-300 bg-white px-3 py-2.5 font-mono text-sm">
+                        </div>
+                        <div>
+                            <label class="mb-1.5 block text-sm font-medium text-slate-700">Seuil (Ar)</label>
+                            <input type="number" name="seuil_arrondi" x-model.number="edition.seuil_arrondi"
+                                   min="0" max="10000"
+                                   class="w-full rounded-lg border border-slate-300 bg-white px-3 py-2.5 font-mono text-sm">
+                        </div>
+                    </div>
+                    <p class="mt-2 text-xs text-slate-500">
+                        Ex. unité 100 / seuil 50 : 545 → 500, 550 → 600.
+                    </p>
+                </div>
+
+                <div>
+                    <label class="mb-1.5 block text-sm font-medium text-slate-700">Description (optionnel)</label>
+                    <textarea name="description" x-model="edition.description" rows="2" maxlength="500"
+                              class="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm"></textarea>
+                </div>
+
+                <div class="flex items-center justify-end gap-3 border-t border-slate-100 pt-4">
+                    <button type="button" @click="editionOuverte = false"
+                            class="inline-flex h-10 items-center rounded-lg px-4 text-sm font-medium text-slate-600 hover:bg-slate-100">
+                        Annuler
+                    </button>
+                    <button type="submit"
+                            class="inline-flex h-10 items-center rounded-lg bg-slate-900 px-5 text-sm font-medium text-white hover:bg-slate-700">
+                        Enregistrer
+                    </button>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    {{-- ═══ Modale Confirmation de changement de mode ═══ --}}
+    <div x-show="modeModal.ouvert" x-cloak class="fixed inset-0 z-50 flex items-center justify-center p-4">
+        <div class="absolute inset-0 bg-slate-900/50" @click="modeModal.ouvert = false" x-transition.opacity></div>
+        <div x-show="modeModal.ouvert" x-transition
+             class="relative w-full max-w-md overflow-hidden rounded-2xl bg-white shadow-xl">
+            <div class="border-b border-slate-100 px-5 py-4">
+                <h2 class="text-base font-semibold text-slate-900" x-text="modeModal.titre"></h2>
+                <p class="mt-1 text-sm text-slate-500" x-text="modeModal.description"></p>
+            </div>
+
+            <form :action="modeModal.action" method="POST" class="space-y-4 p-5">
+                @csrf
+
+                <template x-if="modeModal.vers === 'unifie'">
+                    <div>
+                        <label class="mb-1.5 block text-sm font-medium text-slate-700">Tarif à conserver comme base</label>
+                        <select name="base" class="w-full rounded-lg border border-slate-300 bg-white px-3 py-2.5 text-sm">
+                            <option value="ethernet">Tarif Ethernet actuel</option>
+                            <option value="wifi">Tarif Wi-Fi actuel</option>
+                        </select>
+                    </div>
+                </template>
+
+                <div>
+                    <label class="mb-1.5 block text-sm font-medium text-slate-700">
+                        Pour confirmer, tapez
+                        <code class="ml-1 rounded bg-slate-100 px-1.5 py-0.5 font-mono text-xs text-slate-700"
+                              x-text="modeModal.mot"></code>
+                    </label>
+                    <input type="text" name="confirmation" x-model="modeModal.saisie" autocomplete="off"
+                           class="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 font-mono text-sm focus:border-slate-800 focus:outline-none">
+                </div>
+
+                <div class="flex items-center justify-end gap-3 border-t border-slate-100 pt-4">
+                    <button type="button" @click="modeModal.ouvert = false"
+                            class="inline-flex h-10 items-center rounded-lg px-4 text-sm font-medium text-slate-600 hover:bg-slate-100">
+                        Annuler
+                    </button>
+                    <button type="submit" :disabled="modeModal.saisie !== modeModal.mot"
+                            class="inline-flex h-10 items-center rounded-lg bg-amber-600 px-5 text-sm font-medium text-white hover:bg-amber-500 disabled:cursor-not-allowed disabled:opacity-40">
+                        Confirmer
+                    </button>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    {{-- ═══ Modale Réinitialisation ═══ --}}
+    <div x-show="resetModal.ouvert" x-cloak class="fixed inset-0 z-50 flex items-center justify-center p-4">
+        <div class="absolute inset-0 bg-slate-900/50" @click="resetModal.ouvert = false" x-transition.opacity></div>
+        <div x-show="resetModal.ouvert" x-transition
+             class="relative w-full max-w-md overflow-hidden rounded-2xl bg-white shadow-xl">
+            <div class="border-b border-slate-100 px-5 py-4">
+                <h2 class="text-base font-semibold text-slate-900">Réinitialiser les tarifs ?</h2>
+                <p class="mt-1 text-sm text-slate-500">
+                    Toutes les règles et tous les raccourcis seront remplacés par les valeurs par défaut (20 Ar/min, minimum 300 Ar). Cette action ne touche pas aux sessions existantes.
+                </p>
+            </div>
+
+            <form method="POST" action="{{ route('tarifs.reinitialiser') }}" class="space-y-4 p-5">
+                @csrf
+
+                <div>
+                    <label class="mb-1.5 block text-sm font-medium text-slate-700">
+                        Pour confirmer, tapez
+                        <code class="ml-1 rounded bg-slate-100 px-1.5 py-0.5 font-mono text-xs text-slate-700">REINITIALISER</code>
+                    </label>
+                    <input type="text" name="confirmation" x-model="resetModal.saisie" autocomplete="off"
+                           class="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 font-mono text-sm focus:border-slate-800 focus:outline-none">
+                </div>
+
+                <div class="flex items-center justify-end gap-3 border-t border-slate-100 pt-4">
+                    <button type="button" @click="resetModal.ouvert = false"
+                            class="inline-flex h-10 items-center rounded-lg px-4 text-sm font-medium text-slate-600 hover:bg-slate-100">
+                        Annuler
+                    </button>
+                    <button type="submit" :disabled="resetModal.saisie !== 'REINITIALISER'"
+                            class="inline-flex h-10 items-center rounded-lg bg-rose-600 px-5 text-sm font-medium text-white hover:bg-rose-500 disabled:cursor-not-allowed disabled:opacity-40">
+                        Réinitialiser
+                    </button>
+                </div>
+            </form>
+        </div>
+    </div>
+
+</div>
+
+<script>
+function tarifsPage(cfg) {
+    return {
+        editionOuverte: false,
+        edition: {
+            titre: '', update_url: '',
+            montant_par_minute: 0, montant_minimum: 0,
+            arrondi_actif: true, unite_arrondi: 100, seuil_arrondi: 50,
+            description: '',
+        },
+
+        modeModal: { ouvert: false, vers: '', titre: '', description: '', action: '', mot: '', saisie: '' },
+        resetModal: { ouvert: false, saisie: '' },
+
+        ouvrirEdition(data) {
+            this.edition = { ...data };
+            this.editionOuverte = true;
+        },
+
+        demanderMode(vers) {
+            if (vers === cfg.mode) return;
+            if (vers === 'separe') {
+                this.modeModal = {
+                    ouvert: true, vers: 'separe',
+                    titre: 'Passer en tarifs séparés',
+                    description: 'Deux tarifs distincts (Poste client et Wi-Fi) vont être créés à partir du tarif unifié actuel. Vous pourrez ensuite les ajuster indépendamment.',
+                    action: '{{ route('tarifs.passer-separe') }}',
+                    mot: 'SEPARER', saisie: '',
+                };
+            } else {
+                this.modeModal = {
+                    ouvert: true, vers: 'unifie',
+                    titre: 'Passer en tarif unique',
+                    description: 'Un seul tarif sera appliqué aux accès Poste client et Wi-Fi. Les tarifs séparés actuels seront supprimés (les sessions en cours gardent leur ancien tarif).',
+                    action: '{{ route('tarifs.passer-unifie') }}',
+                    mot: 'UNIFIER', saisie: '',
+                };
+            }
+        },
+
+        ouvrirReinitialisation() {
+            this.resetModal = { ouvert: true, saisie: '' };
+        },
+    };
+}
+</script>
+
+@endsection
+
+
+================================================================================
+📄 database/migrations\2026_09_25_090141_create_tarifs_table.php
+================================================================================
+
+<?php
+
+use Illuminate\Database\Migrations\Migration;
+use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Support\Facades\Schema;
+
+return new class extends Migration
+{
+    /**
+     * Run the migrations.
+     */
+    public function up(): void
+    {
+        Schema::create('tarifs', function (Blueprint $table) {
+            $table->id();
+            $table->timestamps();
+        });
+    }
+
+    /**
+     * Reverse the migrations.
+     */
+    public function down(): void
+    {
+        Schema::dropIfExists('tarifs');
+    }
+};
+
+
+
+================================================================================
+📄 database/migrations\2026_09_25_090317_add_tarif_id_to_cyber_sessions_table.php
+================================================================================
+
+<?php
+
+use Illuminate\Database\Migrations\Migration;
+use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Support\Facades\Schema;
+
+return new class extends Migration
+{
+    public function up(): void
+    {
+        Schema::table('cyber_sessions', function (Blueprint $table) {
+            $table->foreignId('tarif_id')
+                ->nullable()
+                ->after('poste_id')
+                ->constrained('tarifs')
+                ->nullOnDelete();
+        });
+    }
+
+    public function down(): void
+    {
+        Schema::table('cyber_sessions', function (Blueprint $table) {
+            $table->dropForeign(['tarif_id']);
+            $table->dropColumn('tarif_id');
+        });
+    }
+};
+
+
+================================================================================
+📄 database/migrations\2026_09_25_090551_add_details_to_tarifs_table.php
+================================================================================
+
+<?php
+
+use Illuminate\Database\Migrations\Migration;
+use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Support\Facades\Schema;
+
+return new class extends Migration
+{
+    public function up(): void
+    {
+        Schema::table('tarifs', function (Blueprint $table) {
+            $table->string('nom')->after('id');
+            $table->unsignedInteger('montant_par_minute')->default(20);
+            $table->unsignedInteger('montant_minimum')->default(300);
+            $table->boolean('actif')->default(true);
+            $table->boolean('personnalise')->default(false);
+            $table->text('description')->nullable();
+        });
+    }
+
+    public function down(): void
+    {
+        Schema::table('tarifs', function (Blueprint $table) {
+            $table->dropColumn([
+                'nom',
+                'montant_par_minute',
+                'montant_minimum',
+                'actif',
+                'personnalise',
+                'description',
+            ]);
+        });
+    }
+};
+
+
+================================================================================
+📄 database/migrations\2026_10_07_100000_extend_tarifs_for_rules.php
+================================================================================
+
+<?php
+
+use Illuminate\Database\Migrations\Migration;
+use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Support\Facades\Schema;
+use Illuminate\Support\Facades\DB;
+
+return new class extends Migration
+{
+    public function up(): void
+    {
+        // 1. Retirer les anciennes colonnes, ajouter les nouvelles SANS unique
+        Schema::table('tarifs', function (Blueprint $table) {
+            $table->dropColumn(['nom', 'actif', 'personnalise', 'description']);
+
+            $table->enum('cible', ['unifie', 'ethernet', 'wifi'])
+                ->default('unifie')
+                ->after('id');
+
+            $table->boolean('arrondi_actif')->default(true)->after('montant_minimum');
+            $table->unsignedInteger('unite_arrondi')->default(100)->after('arrondi_actif');
+            $table->unsignedInteger('seuil_arrondi')->default(50)->after('unite_arrondi');
+            $table->string('description', 500)->nullable()->after('seuil_arrondi');
+        });
+
+        // 2. Vider la table (delete plutôt que truncate pour ne pas casser les FK)
+        DB::table('tarifs')->delete();
+
+        // 3. Insérer UNE seule ligne unifiée par défaut
+        DB::table('tarifs')->insert([
+            'cible'              => 'unifie',
+            'montant_par_minute' => 20,
+            'montant_minimum'    => 300,
+            'arrondi_actif'      => 1,
+            'unite_arrondi'      => 100,
+            'seuil_arrondi'      => 50,
+            'description'        => 'Tarif initial du cybercafé (20 Ar/minute, minimum 300 Ar).',
+            'created_at'         => now(),
+            'updated_at'         => now(),
+        ]);
+
+        // 4. Ajouter l'index UNIQUE maintenant qu'il n'y a qu'une ligne
+        Schema::table('tarifs', function (Blueprint $table) {
+            $table->unique('cible', 'tarifs_cible_unique');
+        });
+    }
+
+    public function down(): void
+    {
+        Schema::table('tarifs', function (Blueprint $table) {
+            $table->dropUnique('tarifs_cible_unique');
+            $table->dropColumn([
+                'cible',
+                'arrondi_actif',
+                'unite_arrondi',
+                'seuil_arrondi',
+                'description',
+            ]);
+
+            $table->string('nom')->nullable()->after('id');
+            $table->boolean('actif')->default(true);
+            $table->boolean('personnalise')->default(false);
+            $table->text('description')->nullable();
+        });
+    }
+};
+
+
+================================================================================
+📄 database/migrations\2026_10_07_100100_create_tarif_raccourcis_table.php
+================================================================================
+
+<?php
+
+use Illuminate\Database\Migrations\Migration;
+use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Support\Facades\Schema;
+
+return new class extends Migration
+{
+    public function up(): void
+    {
+        Schema::create('tarif_raccourcis', function (Blueprint $table) {
+            $table->id();
+
+            $table->foreignId('tarif_id')
+                ->constrained('tarifs')
+                ->cascadeOnDelete();
+
+            $table->unsignedInteger('montant');       // ex. 500
+            $table->unsignedInteger('duree');         // minutes, ex. 25
+            $table->string('libelle', 100)->nullable();
+            $table->unsignedSmallInteger('ordre')->default(0);
+
+            $table->timestamps();
+
+            $table->unique(['tarif_id', 'montant']);
+            $table->index(['tarif_id', 'ordre']);
+        });
+    }
+
+    public function down(): void
+    {
+        Schema::dropIfExists('tarif_raccourcis');
+    }
+};
+
+
+================================================================================
+🗄️ STRUCTURE ET DONNÉES DE LA TABLE 'tarifs' (SQL)
+================================================================================
+
+-- MariaDB dump 10.19  Distrib 10.4.32-MariaDB, for Win64 (AMD64)
+--
+-- Host: localhost    Database: cyber_manager
+-- ------------------------------------------------------
+-- Server version	10.4.32-MariaDB
+
+/*!40101 SET @OLD_CHARACTER_SET_CLIENT=@@CHARACTER_SET_CLIENT */;
+/*!40101 SET @OLD_CHARACTER_SET_RESULTS=@@CHARACTER_SET_RESULTS */;
+/*!40101 SET @OLD_COLLATION_CONNECTION=@@COLLATION_CONNECTION */;
+/*!40101 SET NAMES utf8mb4 */;
+/*!40103 SET @OLD_TIME_ZONE=@@TIME_ZONE */;
+/*!40103 SET TIME_ZONE='+00:00' */;
+/*!40014 SET @OLD_FOREIGN_KEY_CHECKS=@@FOREIGN_KEY_CHECKS, FOREIGN_KEY_CHECKS=0 */;
+/*!40101 SET @OLD_SQL_MODE=@@SQL_MODE, SQL_MODE='NO_AUTO_VALUE_ON_ZERO' */;
+/*!40111 SET @OLD_SQL_NOTES=@@SQL_NOTES, SQL_NOTES=0 */;
+
+--
+-- Dumping data for table `tarifs`
+--
+
+LOCK TABLES `tarifs` WRITE;
+/*!40000 ALTER TABLE `tarifs` DISABLE KEYS */;
+INSERT  IGNORE INTO `tarifs` VALUES (15,'unifie','2026-10-06 14:19:46','2026-10-13 16:09:22',20,300,1,100,50,'Tarif initial : 20 Ar/min, minimum 300 Ar.');
+/*!40000 ALTER TABLE `tarifs` ENABLE KEYS */;
+UNLOCK TABLES;
+
+--
+-- Dumping data for table `tarif_raccourcis`
+--
+
+LOCK TABLES `tarif_raccourcis` WRITE;
+/*!40000 ALTER TABLE `tarif_raccourcis` DISABLE KEYS */;
+INSERT  IGNORE INTO `tarif_raccourcis` VALUES (46,15,300,15,NULL,10,'2026-10-06 14:19:58','2026-10-13 16:09:22'),(47,15,600,30,NULL,20,'2026-10-06 14:20:04','2026-10-13 16:09:22'),(48,15,1000,50,NULL,30,'2026-10-06 14:20:11','2026-10-13 16:09:22'),(49,15,500,25,NULL,40,'2026-10-06 14:20:17','2026-10-13 16:09:22');
+/*!40000 ALTER TABLE `tarif_raccourcis` ENABLE KEYS */;
+UNLOCK TABLES;
+/*!40103 SET TIME_ZONE=@OLD_TIME_ZONE */;
+
+/*!40101 SET SQL_MODE=@OLD_SQL_MODE */;
+/*!40014 SET FOREIGN_KEY_CHECKS=@OLD_FOREIGN_KEY_CHECKS */;
+/*!40101 SET CHARACTER_SET_CLIENT=@OLD_CHARACTER_SET_CLIENT */;
+/*!40101 SET CHARACTER_SET_RESULTS=@OLD_CHARACTER_SET_RESULTS */;
+/*!40101 SET COLLATION_CONNECTION=@OLD_COLLATION_CONNECTION */;
+/*!40111 SET SQL_NOTES=@OLD_SQL_NOTES */;
+
+-- Dump completed on 2026-10-20 17:48:39

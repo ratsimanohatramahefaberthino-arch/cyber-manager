@@ -136,7 +136,7 @@
     {{-- ═══ Tableau ═══ --}}
     <div class="overflow-hidden rounded-xl border border-slate-200 bg-white shadow-sm">
         <div class="max-h-[62vh] overflow-auto">
-            <table class="w-full table-fixed text-sm">
+            <table class="w-full min-w-[900px] text-sm">
                 <colgroup>
                     @for($i = 0; $i < 10; $i++)
                         <col :style="'width: ' + colWidths.c{{ $i }} + 'px'">

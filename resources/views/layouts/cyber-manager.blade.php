@@ -70,6 +70,7 @@
         ['route' => 'wifi.index',     'motif' => 'wifi.*',      'label' => 'Wi-Fi',     'icone' => 'wifi'],
         ['route' => 'hotspot.index',  'motif' => 'hotspot.*',   'label' => 'HotSpot',   'icone' => 'key'],
         ['route' => 'tarifs.index',   'motif' => 'tarifs.*',    'label' => 'Tarifs',    'icone' => 'tag'],
+        ['route' => 'portail.admin',  'motif' => 'portail.*',   'label' => 'Portail Captif', 'icone' => 'link'],
     ];
     $bientot = [['Historique', 'archive'], ['Statistiques', 'chart']];
 @endphp

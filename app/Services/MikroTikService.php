@@ -403,4 +403,66 @@ class MikroTikService
         }
         return null;
     }
+
+        /**
+     * Autorise l'adresse IP de ce serveur à être vue par les clients non connectés.
+     */
+    public function configurerWalledGarden(string $ip, string $port = '80'): void
+    {
+        // On vérifie si la règle exacte (IP + Port) existe déjà
+        $existantes = $this->queryFiltered('/ip/hotspot/walled-garden/ip/print', [
+            'dst-address' => $ip,
+            'dst-port'    => $port
+        ]);
+        
+        if (empty($existantes)) {
+            $this->query('/ip/hotspot/walled-garden/ip/add', [
+                'dst-address' => $ip,
+                'dst-port'    => $port,
+                'protocol'    => 'tcp',
+                'action'      => 'accept',
+                'comment'     => 'Portail Captif Laravel (Auto)'
+            ]);
+        }
+    }
+
+    /**
+     * Ajoute ou met à jour un nom de domaine local sur le routeur.
+     * Ex: portail.cyber pointe vers l'IP de Laravel.
+     */
+    public function configurerDnsLocal(string $domaine, string $ip): void
+    {
+        $ip = trim($ip);
+        $existantes = $this->queryFiltered('/ip/dns/static/print', ['name' => $domaine]);
+
+        if (!empty($existantes)) {
+            $id = $existantes[0]['.id'];
+            $this->queryWithId('/ip/dns/static/set', $id, ['address' => $ip]);
+        } else {
+            $this->query('/ip/dns/static/add', [
+                'name'    => $domaine,
+                'address' => $ip,
+                'comment' => 'Portail Captif Laravel (Auto)'
+            ]);
+        }
+    }
+
+        /**
+     * Configure le nom de domaine (DNS Name) dans le profil HotSpot.
+     */
+    public function configurerDnsNameHotspot(string $nomDeDomaine): void
+    {
+        $profils = $this->query('/ip/hotspot/profile/print');
+        
+        if (empty($profils)) {
+            throw new \RuntimeException("Aucun profil HotSpot trouvé sur le routeur.");
+        }
+
+        // On boucle sur TOUS les profils pour être sûr que le bon soit configuré
+        foreach ($profils as $profil) {
+            $this->queryWithId('/ip/hotspot/profile/set', $profil['.id'], [
+                'dns-name' => $nomDeDomaine,
+            ]);
+        }
+    }
 }

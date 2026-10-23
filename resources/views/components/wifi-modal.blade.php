@@ -1,41 +1,37 @@
 @props([
-    'show',                     // expression Alpine : ex. "prolongerModal.ouvert"
-    'close'     => null,        // expression Alpine de fermeture (défaut : "<show> = false")
+    'show',                     
+    'close'     => null,        
     'z'         => 9300,
     'maxw'      => 'max-w-lg',
-    'titre'     => null,        // titre statique
-    'titreJs'   => null,        // OU expression Alpine pour un titre dynamique
-    'sousJs'    => null,        // sous-titre : expression Alpine
-    'fermable'  => true,        // false = ni clic sur le fond ni Échap (alerte à traiter)
+    'titre'     => null,        
+    'titreJs'   => null,        
+    'sousJs'    => null,        
+    'fermable'  => true,        
 ])
 
 @php $fermer = $close ?? ($show . ' = false'); @endphp
 
-{{--
-    Structure : [en-tête fixe] [corps scrollable] [pied fixe]
-    → le bouton d'action reste toujours visible, quelle que soit la hauteur du contenu.
-    Slots : header (remplace l'en-tête standard), default (corps), footer (actions).
---}}
 <template x-teleport="body">
     <div x-show="{{ $show }}" x-cloak role="dialog" aria-modal="true"
-         class="fixed inset-0 flex items-center justify-center p-4 sm:p-8"
+         class="fixed inset-0 flex items-center justify-center p-2 sm:p-4"
          style="z-index: {{ (int) $z }}"
          @if($fermable) @keydown.escape.window="if ({{ $show }}) { {{ $fermer }} }" @endif>
 
-        <div class="absolute inset-0 bg-slate-900/60 backdrop-blur-[2px]"
+        <div class="absolute inset-0 bg-slate-900/60 backdrop-blur-sm"
              x-show="{{ $show }}" x-transition.opacity.duration.150ms
              @if($fermable) @click="{{ $fermer }}" @endif></div>
 
+        {{-- Ajout d'un contour visible (ring + border) et d'une limite de hauteur stricte --}}
         <div x-show="{{ $show }}"
              x-transition:enter="transition ease-out duration-150"
-             x-transition:enter-start="opacity-0 translate-y-2 scale-95"
+             x-transition:enter-start="opacity-0 translate-y-4 scale-95"
              x-transition:enter-end="opacity-100 translate-y-0 scale-100"
-             class="relative flex max-h-[85vh] w-full {{ $maxw }} flex-col overflow-hidden rounded-2xl bg-white shadow-2xl ring-1 ring-slate-900/10">
+             class="relative flex max-h-[90vh] w-full {{ $maxw }} flex-col overflow-hidden rounded-2xl bg-white shadow-2xl ring-1 ring-slate-900/20 border border-slate-200">
 
             @if(isset($header))
-                {{ $header }}
+                <div class="shrink-0">{{ $header }}</div>
             @elseif($titre || $titreJs)
-                <div class="flex shrink-0 items-start justify-between gap-4 border-b border-slate-100 px-6 py-4">
+                <div class="flex shrink-0 items-start justify-between gap-4 border-b border-slate-100 px-4 py-3 sm:px-6 sm:py-4">
                     <div class="min-w-0">
                         <h2 class="text-lg font-semibold text-slate-900"
                             @if($titreJs) x-text="{{ $titreJs }}" @endif>{{ $titre }}</h2>
@@ -52,12 +48,13 @@
                 </div>
             @endif
 
-            <div class="min-h-0 flex-1 overflow-y-auto px-6 py-5">
+            {{-- Le coeur du correctif : min-h-0 + overflow-y-auto permet au contenu de scroller indépendamment --}}
+            <div class="min-h-0 flex-1 overflow-y-auto px-4 py-4 sm:px-6 sm:py-5">
                 {{ $slot }}
             </div>
 
             @if(isset($footer))
-                <div class="shrink-0 border-t border-slate-100 bg-slate-50 px-6 py-4">
+                <div class="shrink-0 border-t border-slate-200 bg-slate-50 px-4 py-3 sm:px-6 sm:py-4">
                     {{ $footer }}
                 </div>
             @endif

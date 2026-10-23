@@ -1,75 +1,67 @@
 {{-- ═══════════════════════════════════════════════════════════════════
-     1. ALERTE « TEMPS ÉCOULÉ » — affichée tant qu'au moins une alarme sonne.
-        Non fermable par Échap/clic dehors : l'opérateur doit agir.
-        La fenêtre est DÉDUITE de l'état des lignes : elle ne peut plus rester
-        ouverte (ni se rouvrir) après « Arrêter l'alarme » ou une prolongation.
+     1. ALERTE « TEMPS ÉCOULÉ » - Style Onglets Navigateur
      ═══════════════════════════════════════════════════════════════════ --}}
-<x-wifi-modal show="fenetresAlarme.length > 0" z="9100" maxw="max-w-md" :fermable="false">
+<x-wifi-modal show="fenetresAlarme.length > 0" z="9100" maxw="max-w-xl" :fermable="false">
     <x-slot name="header">
-        <div class="shrink-0">
-            <div class="flex items-center gap-4 bg-rose-600 px-6 py-4">
-                <span class="relative flex h-12 w-12 shrink-0 items-center justify-center rounded-full bg-white/20">
-                    <span class="absolute inset-0 animate-ping rounded-full bg-white/20"></span>
-                    <x-icone nom="bell" class="relative h-6 w-6 text-white" />
-                </span>
-                <div class="min-w-0">
-                    <h2 class="text-xl font-bold text-white">Temps écoulé</h2>
-                    <p class="text-sm text-rose-100"
-                       x-text="fenetresAlarme.length > 1 ? fenetresAlarme.length + ' alarmes sonnent en ce moment' : 'Le forfait de cet appareil est terminé'"></p>
-                </div>
-            </div>
-            <div x-show="fenetresAlarme.length > 1" x-cloak class="flex gap-1.5 overflow-x-auto border-b border-rose-100 bg-rose-50 px-4 py-2">
-                <template x-for="f in fenetresAlarme" :key="f.id">
-                    <button type="button" @click="ongletAlarmeActif = f.id"
-                            :class="ongletAlarme && ongletAlarme.id === f.id ? 'bg-rose-600 text-white' : 'bg-white text-rose-700 ring-1 ring-inset ring-rose-200 hover:bg-rose-100'"
-                            class="shrink-0 rounded-full px-3 py-1 text-sm font-semibold transition" x-text="f.appareil"></button>
-                </template>
+        {{-- Barre d'onglets style Chrome --}}
+        <div class="flex items-end gap-1 px-4 pt-3 bg-slate-100 rounded-t-2xl overflow-x-auto border-b border-slate-200">
+            <template x-for="f in fenetresAlarme" :key="f.id">
+                <button type="button" @click="ongletAlarmeActif = f.id"
+                        class="relative flex items-center gap-2 px-4 py-2 text-sm font-semibold rounded-t-lg transition-colors whitespace-nowrap focus:outline-none -mb-px border border-b-0"
+                        :class="ongletAlarme && ongletAlarme.id === f.id 
+                            ? 'bg-white text-rose-600 border-slate-200 shadow-[0_-2px_10px_rgba(0,0,0,0.05)] z-10' 
+                            : 'bg-slate-200/50 text-slate-500 border-transparent hover:bg-slate-200/80'">
+                    <x-icone nom="bell" class="h-4 w-4" />
+                    <span x-text="f.appareil" class="truncate max-w-[150px]"></span>
+                </button>
+            </template>
+        </div>
+        
+        {{-- En-tête de l'alerte --}}
+        <div class="bg-rose-600 px-4 py-3 sm:px-6 sm:py-4 flex items-center gap-3">
+            <span class="relative flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-white/20">
+                <span class="absolute inset-0 animate-ping rounded-full bg-white/20"></span>
+                <x-icone nom="bell" class="relative h-5 w-5 text-white" />
+            </span>
+            <div class="min-w-0">
+                <h2 class="text-xl font-bold text-white">Temps écoulé</h2>
+                <p class="text-sm text-rose-100">Le forfait de cet appareil est terminé.</p>
             </div>
         </div>
     </x-slot>
 
     <template x-if="ongletAlarme">
-        <div class="space-y-5">
-            <div class="flex items-center gap-3">
-                <span class="flex h-11 w-11 shrink-0 items-center justify-center rounded-xl bg-slate-100 text-slate-500">
-                    <x-icone nom="desktop" class="h-6 w-6" />
-                </span>
-                <div class="min-w-0">
-                    <div class="truncate text-lg font-bold text-slate-900" x-text="ongletAlarme.appareil"></div>
-                    <div class="truncate font-mono text-xs text-slate-500" x-text="ongletAlarme.ip || ongletAlarme.mac || ''"></div>
+        <div class="space-y-4">
+            <div class="grid grid-cols-2 gap-2 sm:gap-4">
+                <div class="rounded-xl bg-slate-50 px-3 py-2.5 border border-slate-100">
+                    <dt class="text-xs text-slate-500 uppercase tracking-wide">Appareil</dt>
+                    <dd class="truncate font-semibold text-slate-900" x-text="ongletAlarme.appareil"></dd>
                 </div>
-            </div>
-
-            <dl class="grid grid-cols-2 gap-3 text-sm">
-                <div class="rounded-xl bg-slate-50 px-3 py-2.5">
-                    <dt class="text-slate-500">Identifiant</dt>
+                <div class="rounded-xl bg-slate-50 px-3 py-2.5 border border-slate-100">
+                    <dt class="text-xs text-slate-500 uppercase tracking-wide">Identifiant</dt>
                     <dd class="truncate font-mono font-semibold text-slate-900" x-text="ongletAlarme.voucher ? ongletAlarme.voucher.username : '—'"></dd>
                 </div>
-                <div class="rounded-xl bg-slate-50 px-3 py-2.5">
-                    <dt class="text-slate-500">Forfait</dt>
-                    <dd class="font-semibold text-slate-900" x-text="formatDuree(ongletAlarme.alarme.minutes)"></dd>
-                </div>
-                <div class="rounded-xl bg-slate-50 px-3 py-2.5">
-                    <dt class="text-slate-500">Fin prévue</dt>
+                <div class="rounded-xl bg-slate-50 px-3 py-2.5 border border-slate-100">
+                    <dt class="text-xs text-slate-500 uppercase tracking-wide">Fin prévue</dt>
                     <dd class="font-mono font-semibold text-slate-900" x-text="heureExacte(ongletAlarme.alarme.fin)"></dd>
                 </div>
-                <div class="rounded-xl bg-rose-50 px-3 py-2.5 ring-1 ring-inset ring-rose-200">
-                    <dt class="text-rose-700">Dépassement</dt>
+                <div class="rounded-xl bg-rose-50 px-3 py-2.5 border border-rose-200">
+                    <dt class="text-xs text-rose-700 uppercase tracking-wide">Dépassement</dt>
                     <dd class="font-mono font-bold text-rose-700"
                         x-text="'+' + formatDureeSec(depassementSecondes(ongletAlarme)) + ' (≈ ' + formatAr(depassementMontant(ongletAlarme)) + ')'"></dd>
                 </div>
-            </dl>
+            </div>
 
-            <div>
+            <div class="pt-2">
                 <div class="mb-2 text-sm font-semibold text-slate-700">Le client continue ?</div>
                 <div class="grid grid-cols-2 gap-2">
                     <template x-for="p in prolongationsRapides" :key="p.label">
                         <button type="button" @click="prolongerRapide(ongletAlarme, p)" :disabled="actionEnCours"
-                                class="rounded-lg bg-emerald-600 px-3 py-2.5 text-base font-semibold text-white hover:bg-emerald-500 disabled:opacity-50"
+                                class="rounded-lg bg-emerald-600 px-2 py-2 text-sm sm:text-base font-semibold text-white hover:bg-emerald-500 disabled:opacity-50"
                                 x-text="p.label"></button>
                     </template>
                     <button type="button" @click="ouvrirProlonger(ongletAlarme)"
-                            class="col-span-2 rounded-lg border border-slate-300 bg-white px-3 py-2.5 text-base font-medium text-slate-700 hover:bg-slate-50">
+                            class="col-span-2 rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm sm:text-base font-medium text-slate-700 hover:bg-slate-50">
                         Autre durée ou montant…
                     </button>
                 </div>
@@ -79,13 +71,12 @@
 
     <x-slot name="footer">
         <button type="button" @click="acquitter(ongletAlarme)" :disabled="!ongletAlarme"
-                class="flex w-full items-center justify-center gap-2 rounded-xl bg-rose-600 px-6 py-3.5 text-lg font-bold text-white shadow-lg transition hover:bg-rose-500 active:scale-[0.98] disabled:opacity-50">
-            <x-icone nom="bell-off" class="h-6 w-6" />
+                class="flex w-full items-center justify-center gap-2 rounded-xl bg-rose-600 px-4 py-3 text-base sm:text-lg font-bold text-white shadow-lg transition hover:bg-rose-500 active:scale-[0.98] disabled:opacity-50">
+            <x-icone nom="bell-off" class="h-5 w-5" />
             Arrêter l'alarme
         </button>
-        <p class="mt-2 text-center text-sm text-slate-500">Le son s'arrête. La session continue et reste dans le tableau.</p>
     </x-slot>
-</x-modal>
+</x-wifi-modal>
 
 
 {{-- ═══════════════════════════════════════════════════════════════════

@@ -10,6 +10,7 @@ use App\Http\Controllers\TarifController;
 use App\Http\Controllers\WifiController;
 use App\Http\Controllers\MikroTikStatusController;
 use App\Http\Controllers\WifiAlarmController;
+use App\Http\Controllers\PortailController;
 
 /*
 |--------------------------------------------------------------------------
@@ -172,12 +173,27 @@ Route::middleware('auth')->group(function () {
     Route::post('/wifi/alarme/son/choisir', [WifiAlarmController::class, 'choisirSon'])->name('wifi.alarme.son.choisir');
     Route::delete('/wifi/alarme/son',       [WifiAlarmController::class, 'supprimerSon'])->name('wifi.alarme.son.supprimer');
     Route::post('/wifi/alarme/reinitialiser', [WifiAlarmController::class, 'reinitialiser'])->name('wifi.alarme.reinitialiser');
+
+
+    // --- Portail Captif (Admin) ---
+    Route::middleware('auth')->group(function () {
+        Route::get('/admin/portail', [PortailController::class, 'adminIndex'])->name('portail.admin');
+        Route::post('/admin/portail', [PortailController::class, 'adminSave'])->name('portail.admin.save');
+        Route::post('/admin/portail/configurer', [PortailController::class, 'configurerRouteur'])->name('portail.admin.configurer');
+    });
+
 });
+
+    // --- Portail Captif (Client - Pas de Auth) ---
+    Route::get('/portail', [PortailController::class, 'login'])->name('portail.login');
+    Route::get('/portail/dashboard', [PortailController::class, 'dashboard'])->name('portail.dashboard');
+    Route::get('/api/portail/stats', [PortailController::class, 'apiStats'])->name('portail.api');
 
 /*
 |--------------------------------------------------------------------------
 | Authentification (Breeze)
 |--------------------------------------------------------------------------
 */
+
 
 require __DIR__.'/auth.php';
