@@ -22,3 +22,10 @@
 Homestead.json
 Homestead.yaml
 Thumbs.db
+
+# Fichiers de travail et générateurs
+projet_generator.py
+GENERE_*.txt
+GENERATOR.txt
+IMPLEMENTED*.md
+structure.txt

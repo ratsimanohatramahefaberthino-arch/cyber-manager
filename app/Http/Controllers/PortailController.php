@@ -5,6 +5,7 @@ namespace App\Http\Controllers;
 use App\Models\PortailParametre;
 use App\Services\MikroTikService;
 use App\Services\TarifService;
+use App\Models\Session;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Storage;
 
@@ -172,44 +173,54 @@ class PortailController extends Controller
         ])->header('Cache-Control', 'no-store, max-age=0');
     }
 
-    public function apiStats(Request $request)
-    {
-        $mac    = $this->macValide($request->query('mac'));
-        $filtre = $mac ? ['mac-address' => $mac] : ['address' => $request->ip()];
+public function apiStats(Request $request)
+{
+    $mac = $this->macValide($request->query('mac'));
+    $ip  = $request->ip();
 
-        try {
-            $session = $this->mikroTik->queryFiltered('/ip/hotspot/active/print', $filtre)[0] ?? null;
+    try {
+        // Interrogation directe de MikroTik (temps réel, aucune lecture en base pour la session)
+        $filtre  = $mac ? ['mac-address' => $mac] : ['address' => $ip];
+        $session = $this->mikroTik->queryFiltered('/ip/hotspot/active/print', $filtre)[0] ?? null;
 
-            if (!$session) {
-                return response()->json(['connected' => false]);
-            }
-
-            $secondes = $this->parseUptime($session['uptime'] ?? '0s');
-            $minutes  = intdiv($secondes, 60);
-
-            $tarif   = $this->tarifService->tarifWifi();
-            $parMin  = max(1, (int) ($tarif->montant_par_minute ?? 20));
-            $minimum = (int) ($tarif->montant_minimum ?? 300);
-
-            $montant = $tarif
-                ? $this->tarifService->montantPourMinutes($minutes, $tarif)
-                : max($minutes * $parMin, $minimum);
-
-            return response()->json([
-                'connected'        => true,
-                'uptime'           => $secondes,
-                'bytes_down'       => (int) ($session['bytes-out'] ?? 0), // Download
-                'bytes_up'         => (int) ($session['bytes-in'] ?? 0),  // Upload
-                'montant'          => $montant,
-                'minimum_applique' => $minutes * $parMin < $minimum,
-                'tarif_minute'     => $parMin,
-                'tarif_minimum'    => $minimum,
-            ])->header('Cache-Control', 'no-store');
-
-        } catch (\Throwable $e) {
-            return response()->json(['error' => 'Routeur injoignable'], 503);
+        if (!$session) {
+            return response()->json(['connected' => false])
+                ->header('Cache-Control', 'no-store');
         }
+
+        // Uptime RouterOS ("1h2m3s") → secondes, puis minutes entières
+        $secondes = $this->parseUptime($session['uptime'] ?? '0s');
+        $minutes  = intdiv($secondes, 60);
+
+        // Tarif Wi-Fi courant (unifié ou séparé, géré par TarifService)
+        $tarif   = $this->tarifService->tarifWifi();
+        $parMin  = max(1, (int) ($tarif->montant_par_minute ?? 20));
+        $minimum = (int) ($tarif->montant_minimum ?? 300);
+
+        // Même logique que la caisse : minimum puis arrondi
+        $montant = $tarif
+            ? $this->tarifService->montantPourMinutes($minutes, $tarif)
+            : max($minutes * $parMin, $minimum);
+
+        return response()->json([
+            'connected'        => true,
+            'uptime'           => $secondes,
+            // Vue du routeur : bytes-out = ce que le routeur envoie AU client = téléchargement
+            'bytes_down'       => (int) ($session['bytes-out'] ?? 0),
+            // bytes-in = ce que le client envoie au routeur = envoi
+            'bytes_up'         => (int) ($session['bytes-in'] ?? 0),
+            'montant'          => $montant,
+            'minimum_applique' => $minimum > 0 && ($minutes * $parMin) < $minimum,
+            'tarif_minute'     => $parMin,
+            'tarif_minimum'    => $minimum,
+        ])->header('Cache-Control', 'no-store');
+
+    } catch (\Throwable $e) {
+        return response()
+            ->json(['error' => 'Routeur injoignable'], 503)
+            ->header('Cache-Control', 'no-store');
     }
+}
 
     private function parseUptime(string $uptime): int
     {
