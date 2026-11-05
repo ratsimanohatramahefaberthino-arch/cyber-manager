@@ -94,6 +94,10 @@ class Session extends Model
             $fin = $this->pause_at;
         } elseif ($this->estDeconnecte() && $this->deconnecte_at) {
             $fin = $this->deconnecte_at;
+        } elseif ($this->etat === 'en_pause' && $this->date_heure_suspension) {
+            $fin = $this->date_heure_suspension;      // postes Ethernet : chrono figé pendant la suspension
+        } elseif ($this->etat === 'terminee' && $this->date_heure_fin_reelle) {
+            $fin = $this->date_heure_fin_reelle;      // postes Ethernet : session clôturée
         } else {
             $fin = now();
         }
@@ -101,6 +105,7 @@ class Session extends Model
         $total = $fin->getTimestamp() - $this->date_heure_debut->getTimestamp();
         $total -= (int) $this->duree_hors_ligne_secondes;
         $total -= (int) $this->duree_pause_secondes;
+        $total -= (int) $this->duree_suspension;      // pauses Ethernet déjà terminées
 
         return max(0, (int) $total);
     }

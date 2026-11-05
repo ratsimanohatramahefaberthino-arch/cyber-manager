@@ -328,6 +328,128 @@ class MikroTikService
         return true;
     }
 
+        /**
+     * Normalise une adresse MAC au format RouterOS (AA:BB:CC:DD:EE:FF).
+     */
+    private function normaliserMac(string $mac): string
+    {
+        return strtoupper(str_replace('-', ':', trim($mac)));
+    }
+
+    /**
+     * Retire toutes les sessions HotSpot actives correspondant aux filtres.
+     *
+     * @param  array<string, scalar>  $filtres
+     * @return int Nombre de sessions retirées
+     */
+    private function retirerSessionsActives(array $filtres): int
+    {
+        $retirees = 0;
+
+        foreach ($this->queryFiltered('/ip/hotspot/active/print', $filtres) as $ligne) {
+            if (isset($ligne['.id'])) {
+                $this->queryWithId('/ip/hotspot/active/remove', $ligne['.id']);
+                $retirees++;
+            }
+        }
+
+        return $retirees;
+    }
+
+    /**
+     * Retrouve l'IP actuelle d'un appareil à partir de sa MAC (table des hôtes HotSpot,
+     * puis baux DHCP). Source de vérité : le routeur lui-même.
+     */
+    public function trouverIpParMac(string $mac): ?string
+    {
+        $mac = $this->normaliserMac($mac);
+
+        foreach ($this->queryFiltered('/ip/hotspot/host/print', ['mac-address' => $mac]) as $hote) {
+            if (!empty($hote['address'])) {
+                return $hote['address'];
+            }
+        }
+
+        foreach ($this->queryFiltered('/ip/dhcp-server/lease/print', ['mac-address' => $mac]) as $bail) {
+            $ip = $bail['active-address'] ?? $bail['address'] ?? null;
+            if (!empty($ip)) {
+                return $ip;
+            }
+        }
+
+        return null;
+    }
+
+    /**
+     * Connecte un poste à Internet : ouvre une session HotSpot pour le compte du poste.
+     * Idempotent : si le poste est déjà connecté avec ce compte et la bonne IP, ne fait rien.
+     *
+     * @param  string|null $ipIndice IP connue côté Laravel, utilisée seulement si le routeur ne la trouve pas
+     * @return bool true = poste connecté
+     *
+     * @throws RuntimeException si le routeur est injoignable ou refuse la connexion
+     */
+    public function connecterPosteHotspot(string $username, string $password, string $mac, ?string $ipIndice = null): bool
+    {
+        $mac = $this->normaliserMac($mac);
+        $ip  = $this->trouverIpParMac($mac) ?? ($ipIndice !== '' ? $ipIndice : null);
+
+        $actives = $this->queryFiltered('/ip/hotspot/active/print', ['mac-address' => $mac]);
+        foreach ($actives as $ligne) {
+            $memeCompte = ($ligne['user'] ?? null) === $username;
+            $memeIp     = $ip === null || ($ligne['address'] ?? null) === $ip;
+            if ($memeCompte && $memeIp) {
+                return true;   // déjà connecté
+            }
+        }
+
+        // Autre compte / ancienne IP sur cette MAC, ou ce compte déjà utilisé ailleurs (shared-users) : on libère
+        $this->retirerSessionsActives(['mac-address' => $mac]);
+        $this->retirerSessionsActives(['user' => $username]);
+
+        if ($ip === null) {
+            throw new RuntimeException("Adresse IP introuvable sur MikroTik pour la MAC {$mac}.");
+        }
+
+        $this->query('/ip/hotspot/active/login', [
+            'user'        => $username,
+            'password'    => $password,
+            'ip'          => $ip,
+            'mac-address' => $mac,
+        ]);
+
+        return true;
+    }
+
+    /**
+     * Coupe Internet pour un poste : retire ses sessions HotSpot actives (par MAC et par compte)
+     * et purge ses cookies HotSpot pour empêcher une reconnexion automatique.
+     *
+     * @return bool true si au moins une session active a été retirée
+     */
+    public function deconnecterPosteHotspot(string $mac, ?string $username = null): bool
+    {
+        $mac = $this->normaliserMac($mac);
+
+        $retirees = $this->retirerSessionsActives(['mac-address' => $mac]);
+        if ($username !== null && $username !== '') {
+            $retirees += $this->retirerSessionsActives(['user' => $username]);
+        }
+
+        // Cookies HotSpot : sans eux, le navigateur ne peut pas se reconnecter tout seul
+        try {
+            foreach ($this->queryFiltered('/ip/hotspot/cookie/print', ['mac-address' => $mac]) as $cookie) {
+                if (isset($cookie['.id'])) {
+                    $this->queryWithId('/ip/hotspot/cookie/remove', $cookie['.id']);
+                }
+            }
+        } catch (\Throwable) {
+            // non bloquant : la session active est déjà coupée
+        }
+
+        return $retirees > 0;
+    }
+
     /**
      * Active ou désactive un compte HotSpot.
      */

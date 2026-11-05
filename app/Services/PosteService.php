@@ -3,89 +3,78 @@
 namespace App\Services;
 
 use App\Models\Poste;
-use InvalidArgumentException;
+use App\Models\Session;
+use App\Models\Tarif;
+use Carbon\Carbon;
+use Illuminate\Support\Facades\Http;
 
 class PosteService
 {
-    public function __construct(
-        private AgentWindowsService $agentWindowsService
-    ) {
-    }
+    // ... (tes méthodes existantes testerAgent, verrouillerPoste, etc.)
 
-    public function verifierDisponibilite(Poste $poste): bool
+    public function creerSession(Poste $poste, int $dureeMinutes, string $type): Session
     {
-        return $poste->actif
-            && $poste->etat === 'disponible';
+        $tarif = Tarif::where('cible', 'ethernet')->orWhere('cible', 'unifie')->first();
+
+        return Session::create([
+            'poste_id' => $poste->id,
+            'type_session' => 'ethernet',
+            'date_heure_debut' => now(),
+            'date_heure_fin_prevue' => now()->addMinutes($dureeMinutes),
+            'duree_prevue' => $dureeMinutes,
+            'etat' => 'en_cours',
+            'montant_initial' => 0,
+            'montant_total' => 0,
+            'tarif_id' => $tarif?->id,
+            'description' => "Session {$type} de {$dureeMinutes} minutes.",
+        ]);
     }
 
-    public function testerAgent(Poste $poste): array
+    /**
+     * Envoie une commande à l'agent C#.
+     */
+    private function envoyerCommande(Poste $poste, string $commande): array
     {
         if (empty($poste->agent_url)) {
-            throw new InvalidArgumentException(
-                "Aucun agent Windows n'est configuré pour {$poste->nom_poste}."
-            );
+            throw new \Exception("Aucun agent configuré pour ce poste.");
         }
 
-        $resultat = $this->agentWindowsService->status($poste);
-
-        if ($resultat['succes']) {
-            $poste->update([
-                'derniere_communication' => now(),
+        try {
+            $response = Http::withHeaders([
+                'X-Agent-Token' => config('mikrotik.agent_token', 'CyberManagerAgent2026_Secret'),
+                'Content-Type' => 'application/json'
+            ])->timeout(5)->post($poste->agent_url . '/api/commande', [
+                'commande' => $commande
             ]);
+
+            if ($response->successful()) {
+                return ['succes' => true, 'message' => $response->json('message')];
+            }
+
+            return ['succes' => false, 'message' => 'Réponse invalide de l\'agent.'];
+        } catch (\Throwable $e) {
+            return ['succes' => false, 'message' => $e->getMessage()];
         }
-
-        return $resultat;
-    }
-
-    public function actualiserEtatAgent(Poste $poste): array
-    {
-        return $this->testerAgent($poste);
     }
 
     public function verrouillerPoste(Poste $poste): array
     {
-        if (empty($poste->agent_url)) {
-            throw new InvalidArgumentException(
-                "Aucun agent Windows n'est configuré pour {$poste->nom_poste}."
-            );
-        }
-
-        $resultat = $this->agentWindowsService->lockTest($poste);
-
-        if ($resultat['succes']) {
-            $poste->update([
-                'derniere_communication' => now(),
-            ]);
-        }
-
-        return $resultat;
+        return $this->envoyerCommande($poste, 'LOCK');
     }
 
     public function deverrouillerPoste(Poste $poste): array
     {
-        if (empty($poste->agent_url)) {
-            throw new InvalidArgumentException(
-                "Aucun agent Windows n'est configuré pour {$poste->nom_poste}."
-            );
-        }
-
-        $resultat = $this->agentWindowsService->unlockTest($poste);
-
-        if ($resultat['succes']) {
-            $poste->update([
-                'derniere_communication' => now(),
-            ]);
-        }
-
-        return $resultat;
+        return $this->envoyerCommande($poste, 'UNLOCK');
     }
 
-    public function liberer(Poste $poste): Poste
+    public function pausePoste(Poste $poste): array
     {
-        $poste->update([
-            'etat' => 'disponible',
-        ]);
+        // Pour l'instant, on utilise LOCK comme pause. On pourra ajouter PAUSE plus tard.
+        return $this->envoyerCommande($poste, 'LOCK');
+    }
 
-        return $poste->fresh();
+    public function arreterPoste(Poste $poste): array
+    {
+        return $this->envoyerCommande($poste, 'LOCK');
     }
 }

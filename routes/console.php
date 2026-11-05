@@ -21,3 +21,8 @@ Schedule::command('wifi:sync-sessions')
 Schedule::command('vouchers:reapprovisionner')
     ->everyFiveMinutes()
     ->withoutOverlapping();
+
+
+// Étape 4 — maintenance des postes (expiration des forfaits, postes injoignables) et réconciliation MikroTik
+Schedule::command('postes:maintenance')->everyTenSeconds();
+Schedule::command('postes:maintenance --reseau')->everyThirtySeconds();

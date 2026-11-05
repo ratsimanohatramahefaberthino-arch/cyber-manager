@@ -11,6 +11,7 @@ use App\Http\Controllers\WifiController;
 use App\Http\Controllers\MikroTikStatusController;
 use App\Http\Controllers\WifiAlarmController;
 use App\Http\Controllers\PortailController;
+use App\Http\Controllers\Api\AgentController;
 
 /*
 |--------------------------------------------------------------------------
@@ -42,7 +43,6 @@ Route::middleware('auth')->group(function () {
     Route::get('/tarifs', [TarifController::class, 'index'])
         ->name('tarifs.index');
 
-    // Routes fixes AVANT les routes avec {tarif}
     Route::post('/tarifs/passer-separe', [TarifController::class, 'passerSepare'])
         ->name('tarifs.passer-separe');
 
@@ -73,20 +73,27 @@ Route::middleware('auth')->group(function () {
     Route::post('/sessions', [SessionController::class, 'store'])
         ->name('sessions.store');
 
+// -----------------------------------------------------------------
+    // Postes — REMPLACER l'ancien bloc "Postes Ethernet" par celui-ci
+    // (les routes fixes /postes/etat doivent rester AVANT les routes {poste})
     // -----------------------------------------------------------------
-    // Postes Ethernet
-    // -----------------------------------------------------------------
-    Route::get('/postes', [PosteController::class, 'index'])
-        ->name('postes.index');
+    Route::get('/postes',       [PosteController::class, 'index'])->name('postes.index');
+    Route::get('/postes/etat',  [PosteController::class, 'etat'])->name('postes.etat');
 
-    Route::post('/postes/{poste}/tester-agent', [PosteController::class, 'testerAgent'])
-        ->name('postes.tester-agent');
+    Route::get('/postes/{poste}/chat',         [PosteController::class, 'chat'])->name('postes.chat');
+    Route::post('/postes/{poste}/message',     [PosteController::class, 'envoyerMessage'])->name('postes.message');
 
-    Route::post('/postes/{poste}/verrouiller', [PosteController::class, 'verrouiller'])
-        ->name('postes.verrouiller');
-
-    Route::post('/postes/{poste}/deverrouiller', [PosteController::class, 'deverrouiller'])
-        ->name('postes.deverrouiller');
+    Route::post('/postes/{poste}/demarrer',    [PosteController::class, 'demarrer'])->name('postes.demarrer');
+    Route::post('/postes/{poste}/fermer',      [PosteController::class, 'fermer'])->name('postes.fermer');
+    Route::post('/postes/{poste}/suspendre',   [PosteController::class, 'suspendre'])->name('postes.suspendre');
+    Route::post('/postes/{poste}/reprendre',   [PosteController::class, 'reprendre'])->name('postes.reprendre');
+    Route::post('/postes/{poste}/verrouiller', [PosteController::class, 'verrouiller'])->name('postes.verrouiller');
+    Route::post('/postes/{poste}/debloquer',   [PosteController::class, 'debloquer'])->name('postes.debloquer');
+    Route::post('/postes/{poste}/desactiver',  [PosteController::class, 'desactiver'])->name('postes.desactiver');
+    Route::post('/postes/{poste}/activer',     [PosteController::class, 'activer'])->name('postes.activer');
+    Route::post('/postes/{poste}/arreter',     [PosteController::class, 'arreter'])->name('postes.arreter');
+    Route::post('/postes/{poste}/recharger',   [PosteController::class, 'recharger'])->name('postes.recharger');
+    Route::post('/postes/{poste}/hotspot',     [PosteController::class, 'enregistrerHotspot'])->name('postes.hotspot');
 
     // -----------------------------------------------------------------
     // Profil utilisateur
@@ -152,21 +159,18 @@ Route::middleware('auth')->group(function () {
     Route::post('/wifi/comptes/{username}/toggle', [WifiController::class, 'toggleCompte'])->name('wifi.comptes.toggle');
     Route::delete('/wifi/comptes/{username}', [WifiController::class, 'supprimerCompte'])->name('wifi.comptes.supprimer');
 
-    // Actions Wi-Fi session (jamais de "démarrer" : c'est MikroTik qui détecte les connexions)
     Route::post('/wifi/session/{session}/arreter',  [WifiController::class, 'arreter'])->name('wifi.session.arreter');
     Route::post('/wifi/session/{session}/continuer', [WifiController::class, 'continuer'])->name('wifi.session.continuer');
     Route::delete('/wifi/session/{session}',         [WifiController::class, 'supprimer'])->name('wifi.session.supprimer');
     Route::post('/wifi/session/supprimer-masse',     [WifiController::class, 'supprimerMasse'])->name('wifi.session.supprimer-masse');
     Route::post('/wifi/session/{session}/remarque', [WifiController::class, 'enregistrerRemarque'])->name('wifi.session.remarque');
 
-    // Alarmes par appareil
     Route::post('/wifi/session/{session}/alarme',            [WifiController::class, 'definirAlarme'])->name('wifi.session.alarme');
     Route::post('/wifi/session/{session}/alarme/prolonger',  [WifiController::class, 'prolongerAlarme'])->name('wifi.session.alarme.prolonger');
     Route::post('/wifi/session/{session}/alarme/annuler',    [WifiController::class, 'annulerAlarme'])->name('wifi.session.alarme.annuler');
     Route::post('/wifi/session/{session}/alarme/acquitter',  [WifiController::class, 'acquitterAlarme'])->name('wifi.session.alarme.acquitter');
     Route::post('/wifi/session/{session}/alarme/declencher', [WifiController::class, 'marquerAlarmeDeclenchee'])->name('wifi.session.alarme.declencher');
 
-    // Réglages alarme
     Route::get('/wifi/alarme',              [WifiAlarmController::class, 'index'])->name('wifi.alarme.index');
     Route::post('/wifi/alarme/reglages',    [WifiAlarmController::class, 'reglages'])->name('wifi.alarme.reglages');
     Route::post('/wifi/alarme/son',         [WifiAlarmController::class, 'uploader'])->name('wifi.alarme.son');
@@ -174,26 +178,47 @@ Route::middleware('auth')->group(function () {
     Route::delete('/wifi/alarme/son',       [WifiAlarmController::class, 'supprimerSon'])->name('wifi.alarme.son.supprimer');
     Route::post('/wifi/alarme/reinitialiser', [WifiAlarmController::class, 'reinitialiser'])->name('wifi.alarme.reinitialiser');
 
-
-    // --- Portail Captif (Admin) ---
-    Route::middleware('auth')->group(function () {
-        Route::get('/admin/portail', [PortailController::class, 'adminIndex'])->name('portail.admin');
-        Route::post('/admin/portail', [PortailController::class, 'adminSave'])->name('portail.admin.save');
-        Route::post('/admin/portail/configurer', [PortailController::class, 'configurerRouteur'])->name('portail.admin.configurer');
-    });
+    // -----------------------------------------------------------------
+    // Portail Captif (Admin)
+    // -----------------------------------------------------------------
+    Route::get('/admin/portail', [PortailController::class, 'adminIndex'])->name('portail.admin');
+    Route::post('/admin/portail', [PortailController::class, 'adminSave'])->name('portail.admin.save');
+    Route::post('/admin/portail/reset', [PortailController::class, 'adminResetDefaults'])->name('portail.admin.reset');
+    Route::post('/admin/portail/configurer', [PortailController::class, 'configurerRouteur'])->name('portail.admin.configurer');
 
 });
 
-    // --- Portail Captif (Client - Pas de Auth) ---
-    Route::get('/portail', [PortailController::class, 'login'])->name('portail.login');
-    Route::get('/portail/dashboard', [PortailController::class, 'dashboard'])->name('portail.dashboard');
-    Route::get('/api/portail/stats', [PortailController::class, 'apiStats'])->name('portail.api');
+/*
+|--------------------------------------------------------------------------
+| Portail Captif (Client - Pas de Auth)
+|--------------------------------------------------------------------------
+*/
+
+Route::get('/portail', [PortailController::class, 'login'])->name('portail.login');
+Route::get('/portail/dashboard', [PortailController::class, 'dashboard'])->name('portail.dashboard');
+Route::get('/api/portail/stats', [PortailController::class, 'apiStats'])->name('portail.api');
+
+/*
+|--------------------------------------------------------------------------
+| API pour les Agents Windows — REMPLACER le bloc Route::prefix('api/agent')
+|--------------------------------------------------------------------------
+*/
+
+Route::prefix('api/agent')->group(function () {
+    Route::post('/handshake', [AgentController::class, 'handshake']);
+    Route::post('/heartbeat', [AgentController::class, 'heartbeat']);
+    Route::post('/activer',   [AgentController::class, 'activer']);
+    Route::post('/message',   [AgentController::class, 'message']);                    // ÉTAPE 5 (chat client → admin)
+    Route::post('/session/suspendre', [AgentController::class, 'suspendreSession']);
+    Route::post('/session/fermer',    [AgentController::class, 'fermerSession']);
+    Route::get('/commandes',  [AgentController::class, 'commandes']);
+    Route::post('/commandes/{commande}/confirmer', [AgentController::class, 'confirmerCommande']);
+});
 
 /*
 |--------------------------------------------------------------------------
 | Authentification (Breeze)
 |--------------------------------------------------------------------------
 */
-
 
 require __DIR__.'/auth.php';

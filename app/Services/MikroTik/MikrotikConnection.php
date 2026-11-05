@@ -242,4 +242,59 @@ class MikrotikConnection
             $words[] = $this->readBytes($length);
         }
     }
+
+
+        /**
+     * Connecte un poste à Internet via HotSpot MikroTik.
+     * Retourne true si la connexion est établie, false sinon.
+     */
+    public function connecterPosteHotspot(string $username, string $password, string $mac): bool
+    {
+        try {
+            // Vérifier qu'il n'est pas déjà connecté
+            $existantes = $this->queryFiltered('/ip/hotspot/active/print', ['mac-address' => $mac]);
+            if (!empty($existantes)) {
+                return true; // Déjà connecté
+            }
+
+            $this->query('/ip/hotspot/active/login', [
+                'user'         => $username,
+                'password'     => $password,
+                'mac-address'  => $mac,
+            ]);
+
+            return true;
+        } catch (\Throwable $e) {
+            \Log::warning('MikroTik : connexion poste échouée', [
+                'username' => $username,
+                'mac'      => $mac,
+                'error'    => $e->getMessage(),
+            ]);
+            return false;
+        }
+    }
+
+    /**
+     * Déconnecte un poste du HotSpot MikroTik (coupe l'accès Internet).
+     */
+    public function deconnecterPosteHotspot(string $mac): bool
+    {
+        try {
+            $rows = $this->queryFiltered('/ip/hotspot/active/print', ['mac-address' => $mac]);
+            if (empty($rows)) return true;
+
+            foreach ($rows as $row) {
+                if (!empty($row['.id'])) {
+                    $this->queryWithId('/ip/hotspot/active/remove', $row['.id']);
+                }
+            }
+            return true;
+        } catch (\Throwable $e) {
+            \Log::warning('MikroTik : déconnexion poste échouée', [
+                'mac'   => $mac,
+                'error' => $e->getMessage(),
+            ]);
+            return false;
+        }
+    }
 }

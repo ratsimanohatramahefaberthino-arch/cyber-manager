@@ -20,6 +20,10 @@ return [
     'ssl'      => filter_var(env('MIKROTIK_SSL', false), FILTER_VALIDATE_BOOLEAN),
     'timeout'  => (float) env('MIKROTIK_TIMEOUT', 5.0),
 
+    // Interrupteur global. false = mode développement : aucun appel à MikroTik n'est tenté,
+    // les sessions s'ouvrent et se ferment normalement, sans toucher au routeur.
+    'enabled'  => filter_var(env('MIKROTIK_ENABLED', true), FILTER_VALIDATE_BOOLEAN),
+
     // Profil HotSpot par défaut pour les utilisateurs créés par Cyber Manager.
     // À adapter selon les profils réels du routeur (default, LIBRE, ...).
     'hotspot_profile'     => env('MIKROTIK_HOTSPOT_PROFILE', 'default'),

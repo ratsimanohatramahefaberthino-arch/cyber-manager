@@ -3,47 +3,69 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
-<meta name="theme-color" content="#0b1f24">
+<meta name="theme-color" content="{{ $config['fond_couleur_1'] ?? '#0b1f24' }}">
 <title>Mon espace Wi-Fi</title>
 <style>
-:root{--nuit:#0b1f24;--onde:#3dd6d0;--ambre:#ffb020;--violet:#a99bff;--txt:#e8f3f3;--sub:#8fb0b3}
+:root{
+    --bg-1: {{ $config['fond_couleur_1'] ?? '#0b1f24' }};
+    --bg-2: {{ $config['fond_couleur_2'] ?? '#1b5c63' }};
+    --onde: {{ $config['accent_couleur'] ?? '#3dd6d0' }};
+    --ambre: {{ $config['bouton_fond'] ?? '#ffb020' }};
+    --txt: #ffffff;
+    --sub: #94a3b8;
+    --card-bg: rgba(255, 255, 255, 0.07);
+    --card-border: rgba(255, 255, 255, 0.12);
+    --font-family: {{ $config['police'] ?? 'system-ui, sans-serif' }};
+}
 *{box-sizing:border-box;margin:0}
-body{font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;color:var(--txt);min-height:100vh;background:radial-gradient(90% 50% at 50% -5%,#1b5c63 0,transparent 70%),var(--nuit);padding:1.5rem 1rem}
+body{
+    font-family: var(--font-family);
+    color: var(--txt);
+    min-height: 100vh;
+    min-height: 100dvh;
+    background: radial-gradient(100% 60% at 50% 0, var(--bg-2) 0, transparent 75%), var(--bg-1);
+    padding: 1.5rem 1rem;
+}
 .wrap{max-width:440px;margin:0 auto;display:grid;gap:.9rem}
-.top{display:flex;align-items:center;gap:.7rem}
-.top img{width:42px;height:42px;border-radius:12px;background:#fff;object-fit:contain;padding:4px}
-.top b{font-size:1.05rem;font-weight:700;flex:1}
-.pill{display:flex;align-items:center;gap:.4rem;font-size:.8rem;font-weight:600;padding:.35rem .75rem;border-radius:999px;background:rgba(61,214,208,.12);color:var(--onde);border:1px solid rgba(61,214,208,.3)}
-.pill.off{background:rgba(255,255,255,.06);color:var(--sub);border-color:rgba(255,255,255,.12)}
-.card{background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.11);border-radius:24px;padding:1.3rem}
+.top{display:flex;align-items:center;gap:.8rem}
+.top img{width:44px;height:44px;border-radius:12px;background:#fff;object-fit:contain;padding:4px;box-shadow:0 4px 12px rgba(0,0,0,.25)}
+.top b{font-size:1.1rem;font-weight:700;flex:1}
+.pill{display:inline-flex;align-items:center;gap:.45rem;font-size:.8rem;font-weight:600;padding:.4rem .85rem;border-radius:999px;transition:all .2s ease}
+.pill.on{background:rgba(61,214,208,.15);color:var(--onde);border:1px solid rgba(61,214,208,.4)}
+.pill.pause{background:rgba(255,176,32,.15);color:var(--ambre);border:1px solid rgba(255,176,32,.4)}
+.pill.off{background:rgba(255,255,255,.08);color:var(--sub);border:1px solid rgba(255,255,255,.15)}
+.pill i{width:7px;height:7px;border-radius:50%;background:currentColor;display:inline-block}
+
+.card{background:var(--card-bg);border:1px solid var(--card-border);border-radius:24px;padding:1.3rem;backdrop-filter:blur(8px)}
 .lbl{font-size:.85rem;color:var(--sub);font-weight:500}
-.temps{font-size:clamp(2.8rem,15vw,3.6rem);font-weight:700;font-variant-numeric:tabular-nums;line-height:1.1;margin-top:.25rem;font-family:monospace}
-.montant{font-size:clamp(2rem,10vw,2.5rem);font-weight:750;color:var(--ambre);font-variant-numeric:tabular-nums;line-height:1.1}
+.temps{font-size:clamp(2.8rem,14vw,3.6rem);font-weight:750;font-variant-numeric:tabular-nums;line-height:1.1;margin-top:.25rem;font-family:monospace}
+.montant{font-size:clamp(2rem,10vw,2.5rem);font-weight:800;color:var(--ambre);font-variant-numeric:tabular-nums;line-height:1.1}
 .note{font-size:.78rem;color:var(--sub);margin-top:.35rem}
 .row{display:flex;justify-content:space-between;align-items:baseline;margin-bottom:.45rem;font-size:.88rem}
 .bar{height:8px;border-radius:99px;background:rgba(255,255,255,.1);overflow:hidden}
-.bar i{display:block;height:100%;width:0;border-radius:99px;transition:width .8s ease}
+.bar i{display:block;height:100%;width:0;border-radius:99px;transition:width .6s ease}
 .down{color:var(--onde)}.down+.bar i{background:var(--onde)}
-.up{color:var(--violet)}.up+.bar i{background:var(--violet)}
-.total{display:flex;justify-content:space-between;margin-top:1.2rem;padding-top:.9rem;border-top:1px solid rgba(255,255,255,.1);font-size:.85rem;color:var(--sub)}
-.warn{background:rgba(255,176,32,.14);border:1px solid rgba(255,176,32,.35);color:#ffd88a;border-radius:14px;padding:.7rem;font-size:.85rem;display:none}
-.fin{position:fixed;inset:0;display:none;place-items:center;background:rgba(11,31,36,.95);text-align:center;z-index:5}
-[hidden]{display:none!important}
+.up{color:#a78bfa}.up+.bar i{background:#a78bfa}
+.total{display:flex;justify-content:space-between;margin-top:1.1rem;padding-top:.85rem;border-top:1px solid rgba(255,255,255,.1);font-size:.85rem;color:var(--sub)}
+
+.warn{background:rgba(255,176,32,.15);border:1px solid rgba(255,176,32,.35);color:#ffd88a;border-radius:14px;padding:.75rem 1rem;font-size:.85rem;display:none;text-align:center}
+.fin{position:fixed;inset:0;display:none;place-items:center;background:rgba(11,31,36,.96);text-align:center;z-index:50;padding:1.5rem}
+.fin-box{background:rgba(255,255,255,.05);border:1px solid rgba(255,255,255,.12);border-radius:24px;padding:2rem;max-width:360px;width:100%}
 </style>
 </head>
 <body>
 <div class="wrap">
     <div class="top">
-        @if($logo)<img src="{{ $logo }}" alt="">@endif
-        <b>{{ $titre ?? 'Mon espace Wi-Fi' }}</b>
+        @if($logo)<img src="{{ $logo }}" alt="Logo">@endif
+        <b>{{ $config['titre'] ?? 'Mon espace Wi-Fi' }}</b>
         <span class="pill off" id="pill"><i></i><span id="pilltxt">Connexion…</span></span>
     </div>
 
-    <div class="warn" id="warn">Connexion au serveur perdue. Nouvelle tentative…</div>
+    <div class="warn" id="warn">Synchronisation temporairement ralentie…</div>
 
     <section class="card">
-        <div class="lbl">Temps de connexion</div>
-        <div class="temps" id="temps">--:--:--</div>
+        <div class="lbl" id="lbl-temps">Temps de connexion</div>
+        <div class="temps" id="temps">00:00:00</div>
     </section>
 
     <section class="card">
@@ -57,15 +79,15 @@ body{font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;color:var(
         <div class="bar"><i id="bdown"></i></div>
         <div class="row" style="margin-top:1rem"><span class="lbl">Envoyé (↑)</span><b class="up" id="vup">0 o/s</b></div>
         <div class="bar"><i id="bup"></i></div>
-        <div class="total"><span>Données utilisées</span><b id="total">0 o</b></div>
+        <div class="total"><span>Volume total utilisé</span><b id="total">0 o</b></div>
     </section>
 </div>
 
 <div class="fin" id="fin">
-    <div>
-        <h2>Session terminée</h2>
-        <p style="margin: 1rem 0;">Vous n'êtes plus connecté au Wi-Fi.</p>
-        <a href="/portail" style="background:var(--ambre);color:#000;padding:.8rem 1.5rem;text-decoration:none;border-radius:12px;font-weight:bold;">Se reconnecter</a>
+    <div class="fin-box">
+        <h2 style="font-size:1.4rem;font-weight:700;margin-bottom:.5rem">Session terminée</h2>
+        <p style="color:var(--sub);margin-bottom:1.5rem;font-size:.92rem">Votre session est arrêtée. Veuillez régler votre solde au comptoir.</p>
+        <a href="/portail" style="display:inline-block;background:var(--ambre);color:#2b1c00;padding:.85rem 1.6rem;text-decoration:none;border-radius:14px;font-weight:750;">Se reconnecter</a>
     </div>
 </div>
 
@@ -73,166 +95,155 @@ body{font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;color:var(
 (function(){
     var MAC = @json($mac);
 
-    var POLL_MS      = 2000;  // cadence normale
-    var FAST_MS      = 1000;  // 2e requête rapide pour afficher le débit tout de suite
-    var ENDED_MS     = 5000;  // cadence quand la session est terminée (détecte une reconnexion)
-    var TIMEOUT_MS   = 5000;  // délai max d'une requête
-    var MAX_FAILS    = 2;     // l'alerte apparaît au-delà de 2 échecs consécutifs
-    var SMOOTH       = 0.3;   // poids de l'ancienne valeur (0 = instantané, 1 = figé)
+    var POLL_MS    = 2500;
+    var TIMEOUT_MS = 6000;
+    var SMOOTH     = 0.35;
 
-    var $ = function(i){ return document.getElementById(i); };
+    var $ = function(id){ return document.getElementById(id); };
     var p2 = function(n){ return n < 10 ? '0' + n : '' + n; };
 
     var S = {
-        up: 0,        // uptime (s) renvoyé par le routeur
-        at: 0,        // moment local de réception
-        on: false,    // le chrono doit tourner
-        ended: false, // overlay "Session terminée" affiché
-        prev: null,   // dernier échantillon {t, d, u}
-        vd: 0, vu: 0, // débits lissés (octets/s)
+        uptime: 0,
+        recuAt: 0,
+        running: false, // Vrai UNIQUEMENT si le chrono doit avancer
+        prevDown: 0,
+        prevUp: 0,
+        prevT: 0,
+        vDown: 0,
+        vUp: 0,
         fails: 0,
-        timer: null,
         busy: false
     };
 
-    function fmtT(s){
+    function fmtTemps(s){
         s = Math.max(0, Math.floor(s));
-        return p2(Math.floor(s / 3600)) + ':' + p2(Math.floor(s % 3600 / 60)) + ':' + p2(s % 60);
+        var h = Math.floor(s / 3600);
+        var m = Math.floor((s % 3600) / 60);
+        var sec = s % 60;
+        return p2(h) + ':' + p2(m) + ':' + p2(sec);
     }
-    function fmtB(b){
+
+    function fmtOctets(b){
         if (b < 1024) return Math.round(b) + ' o';
         var u = ['Ko', 'Mo', 'Go'], i = -1;
         do { b /= 1024; i++; } while (b >= 1024 && i < 2);
         return b.toFixed(1) + ' ' + u[i];
     }
-    function gauge(v){ return Math.min(100, Math.log10(1 + v) / 7 * 100); }
 
-    function pill(on, txt){
-        $('pill').className = 'pill' + (on ? '' : ' off');
-        $('pilltxt').textContent = txt;
+    function setStatut(type, texte){
+        var el = $('pill');
+        el.className = 'pill ' + type;
+        $('pilltxt').textContent = texte;
     }
 
-    function resetDebit(){
-        S.prev = null; S.vd = 0; S.vu = 0;
-        $('vdown').textContent = '0 o/s';
-        $('vup').textContent = '0 o/s';
-        $('bdown').style.width = '0%';
-        $('bup').style.width = '0%';
-    }
-
-    // Chrono local (fluide entre deux requêtes) : s'arrête dès que S.on est faux
+    // Le chrono avance localement SEULEMENT si running === true
     function tick(){
-        if (!S.on) return;
-        $('temps').textContent = fmtT(S.up + (Date.now() - S.at) / 1000);
+        if (!S.running) return;
+        var diff = Math.floor((Date.now() - S.recuAt) / 1000);
+        $('temps').textContent = fmtTemps(S.uptime + diff);
     }
 
-    function showEnded(){
-        S.on = false;
-        S.ended = true;
-        resetDebit();
-        pill(false, 'Hors ligne');
-        $('warn').style.display = 'none';
-        $('fin').style.display = 'grid';
-    }
-
-    function hideEnded(){
-        S.ended = false;
-        $('fin').style.display = 'none';
-    }
-
-    // Traite une réponse valide de l'API. Retourne le délai avant la prochaine requête.
-    function onData(d){
+    function updateData(d){
         S.fails = 0;
         $('warn').style.display = 'none';
 
-        if (!d || !d.connected) {
-            showEnded();
-            return ENDED_MS;
+        // 1. Session définitivement clôturée
+        if (d.terminee) {
+            S.running = false;
+            $('fin').style.display = 'grid';
+            setStatut('off', 'Terminée');
+            return;
         }
 
-        // La session est revenue (reconnexion) : on repart proprement
-        if (S.ended) hideEnded();
+        // 2. Client déconnecté ou en pause -> LE CHRONO SE FIGE
+        if (!d.connected || d.en_pause) {
+            S.running = false;
+            S.uptime = d.uptime || S.uptime;
+            $('temps').textContent = fmtTemps(S.uptime);
+            $('lbl-temps').textContent = 'Temps (En pause / Déconnecté)';
+            setStatut('pause', 'En pause');
+            $('montant').textContent = (d.montant || 0).toLocaleString('fr-FR') + ' Ar';
+            $('vdown').textContent = '0 o/s';
+            $('vup').textContent = '0 o/s';
+            $('bdown').style.width = '0%';
+            $('bup').style.width = '0%';
+            return;
+        }
+
+        // 3. Client actif en ligne
+        $('lbl-temps').textContent = 'Temps de connexion';
+        setStatut('on', 'En ligne');
 
         var now = Date.now();
-        var premier = !S.prev;
-
-        if (S.prev) {
-            var dt = (now - S.prev.t) / 1000;
-            var dd = d.bytes_down - S.prev.d;
-            var du = d.bytes_up - S.prev.u;
-
-            // Compteur remis à zéro côté routeur (nouvelle session) : on repart de 0
-            if (dd < 0 || du < 0) {
-                S.vd = 0; S.vu = 0;
-            } else if (dt > 0.2) {
-                S.vd = SMOOTH * S.vd + (1 - SMOOTH) * (dd / dt);
-                S.vu = SMOOTH * S.vu + (1 - SMOOTH) * (du / dt);
+        if (S.prevT > 0 && d.bytes_down >= S.prevDown && d.bytes_up >= S.prevUp) {
+            var dt = (now - S.prevT) / 1000;
+            if (dt > 0.3) {
+                var instDown = (d.bytes_down - S.prevDown) / dt;
+                var instUp = (d.bytes_up - S.prevUp) / dt;
+                S.vDown = SMOOTH * S.vDown + (1 - SMOOTH) * instDown;
+                S.vUp = SMOOTH * S.vUp + (1 - SMOOTH) * instUp;
             }
         }
-        S.prev = { t: now, d: d.bytes_down, u: d.bytes_up };
 
-        S.up = d.uptime;
-        S.at = now;
-        S.on = true;
+        S.prevDown = d.bytes_down;
+        S.prevUp = d.bytes_up;
+        S.prevT = now;
 
-        pill(true, 'En ligne');
+        S.uptime = d.uptime;
+        S.recuAt = now;
+        S.running = true;
+
+        $('temps').textContent = fmtTemps(S.uptime);
         $('montant').textContent = d.montant.toLocaleString('fr-FR') + ' Ar';
         $('note').textContent = d.minimum_applique
             ? 'Minimum de ' + d.tarif_minimum + ' Ar, puis ' + d.tarif_minute + ' Ar/min.'
-            : 'Tarif : ' + d.tarif_minute + ' Ar/min.';
-        $('vdown').textContent = fmtB(S.vd) + '/s';
-        $('vup').textContent = fmtB(S.vu) + '/s';
-        $('bdown').style.width = gauge(S.vd) + '%';
-        $('bup').style.width = gauge(S.vu) + '%';
-        $('total').textContent = fmtB(d.bytes_down + d.bytes_up);
-        tick();
+            : 'Tarif calculé : ' + d.tarif_minute + ' Ar/min.';
 
-        // Premier échantillon : on redemande vite pour afficher le débit sans attendre
-        return premier ? FAST_MS : POLL_MS;
+        $('vdown').textContent = fmtOctets(S.vDown) + '/s';
+        $('vup').textContent = fmtOctets(S.vUp) + '/s';
+        $('bdown').style.width = Math.min(100, Math.log10(1 + S.vDown) / 6.5 * 100) + '%';
+        $('bup').style.width = Math.min(100, Math.log10(1 + S.vUp) / 6.5 * 100) + '%';
+        $('total').textContent = fmtOctets(d.bytes_down + d.bytes_up);
     }
 
-    // Erreur réseau / 503 / timeout : on ne conclut rien sur la session
-    function onFail(){
-        S.fails++;
-        if (S.fails > MAX_FAILS) {
-            $('warn').style.display = 'block';
-            if (!S.ended) pill(false, 'Reconnexion…');
-        }
-        // Le chrono local continue : on ne sait pas que la session est finie.
-        // Les échantillons de débit sont invalidés pour éviter un pic faux au retour.
-        S.prev = null;
-        return POLL_MS;
-    }
-
-    function poll(){
+    function sync(){
         if (S.busy) return;
         S.busy = true;
 
-        var ac = new AbortController();
-        var to = setTimeout(function(){ ac.abort(); }, TIMEOUT_MS);
+        var c = new AbortController();
+        var to = setTimeout(function(){ c.abort(); }, TIMEOUT_MS);
         var url = '/api/portail/stats' + (MAC ? '?mac=' + encodeURIComponent(MAC) : '');
 
-        fetch(url, { signal: ac.signal, cache: 'no-store' })
-            .then(function(r){
-                if (!r.ok) throw new Error(r.status);
-                return r.json();
+        fetch(url, { signal: c.signal, cache: 'no-store' })
+            .then(function(res){
+                if (!res.ok) throw new Error('HTTP ' + res.status);
+                return res.json();
             })
-            .then(onData, onFail)
-            .then(function(delay){
+            .then(function(data){
                 clearTimeout(to);
+                updateData(data);
+            })
+            .catch(function(){
+                clearTimeout(to);
+                S.fails++;
+                // Ne fige pas abusivement sur une simple micro-coupure réseau
+                if (S.fails >= 3) {
+                    $('warn').style.display = 'block';
+                    setStatut('off', 'Reconnexion…');
+                }
+            })
+            .finally(function(){
                 S.busy = false;
-                clearTimeout(S.timer);
-                S.timer = setTimeout(poll, delay);
+                setTimeout(sync, POLL_MS);
             });
     }
 
-    // Retour sur l'onglet (mobile en veille) : on rafraîchit immédiatement
     document.addEventListener('visibilitychange', function(){
-        if (!document.hidden) { clearTimeout(S.timer); poll(); }
+        if (!document.hidden) { S.fails = 0; sync(); }
     });
 
     setInterval(tick, 1000);
-    poll();
+    sync();
 })();
 </script>
 </body>
