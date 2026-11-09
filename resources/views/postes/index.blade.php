@@ -80,7 +80,6 @@ function postesApp() {
             const n = e => this.postes.filter(p => p.etat === e).length;
             return `${this.postes.length} poste(s) — ${n('occupe') + n('suspendu') + n('verrouille')} utilisé(s), ${n('hors_ligne')} non communiqué(s)`;
         },
-        // Messages non lus des postes autres que celui affiché
         get totalNonLus() {
             return this.postes.filter(p => p.id !== this.selId).reduce((t, p) => t + (p.non_lus || 0), 0);
         },
@@ -95,7 +94,6 @@ function postesApp() {
             return (t[this.modal] || '') + (this.sel?.nom ?? '');
         },
 
-        // Le chrono avance localement entre deux polls
         decalage(p) {
             if (!p.session || !['occupe', 'verrouille'].includes(p.etat)) return 0;
             return Math.floor((this.maintenant - this.recuLe) / 1000);
@@ -114,7 +112,6 @@ function postesApp() {
             try {
                 const r = await cmFetch(POSTES_URL + '/etat');
                 const d = await r.json();
-                // Nouveau message d'un client sur un poste non affiché → notification
                 for (const p of d.postes) {
                     const avant = this.nonLusVus[p.id] ?? 0;
                     if ((p.non_lus || 0) > avant && p.id !== this.selId) {
@@ -170,13 +167,19 @@ function postesApp() {
             if (this.modal === 'demarrer') {
                 this.envoyer(id, 'demarrer', { type: this.form.type, duree_minutes: this.form.type === 'forfait' ? Number(this.form.duree) : null });
             } else if (this.modal === 'recharger') {
+                this.modal = null;
+                const p = this.postes.find(x => x.id === id);
+                if (p && p.session && p.session.restant_s !== null) {
+                    p.session.restant_s += (Number(this.form.minutes) * 60);
+                    p.session.duree_min += Number(this.form.minutes);
+                }
+                this.afficher("Rechargement en cours...", true);
                 this.envoyer(id, 'recharger', { minutes: Number(this.form.minutes) });
             } else if (this.modal === 'hotspot') {
                 this.enregistrerHotspot();
             }
         },
 
-        // --- Identifiants HotSpot ---
         ouvrirHotspot() {
             if (!this.sel) return;
             this.hs = { username: this.sel.hotspot_username || '', password: '', voir: false, erreur: '' };
@@ -242,6 +245,7 @@ function postesApp() {
 }
 </script>
 
+{{-- LE CONTENEUR PRINCIPAL EST EN FLEX-ROW : 2 COLONNES INDEPENDAMMENT DE LA LARGEUR --}}
 <div x-data="postesApp()" x-init="init()" class="mx-auto flex h-[calc(100vh-7.5rem)] max-w-[1500px] flex-col">
 
     <div class="mb-3 flex items-center justify-between">
@@ -259,10 +263,11 @@ function postesApp() {
         </div>
     </div>
 
-    <div class="grid min-h-0 flex-1 grid-cols-12 gap-4">
+    {{-- DEBUT DU TABLEAU A 2 COLONNES --}}
+    <div class="flex min-h-0 flex-1 flex-row gap-4">
 
-        {{-- ============ GAUCHE : liste verticale ============ --}}
-        <aside class="col-span-12 flex min-h-0 flex-col overflow-hidden rounded-2xl border border-indigo-950 bg-indigo-950 shadow-sm md:col-span-4 xl:col-span-3">
+        {{-- COLONNE GAUCHE : liste verticale (largeur fixe) --}}
+        <aside class="flex w-80 shrink-0 flex-col overflow-hidden rounded-2xl border border-indigo-950 bg-indigo-950 shadow-sm">
             <div class="border-b border-white/10 px-4 py-3 text-xs font-semibold uppercase tracking-wider text-indigo-300">
                 Postes de travail
             </div>
@@ -298,8 +303,8 @@ function postesApp() {
             </div>
         </aside>
 
-        {{-- ============ DROITE : détails ============ --}}
-        <section class="col-span-12 flex min-h-0 flex-col overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-sm md:col-span-8 xl:col-span-9">
+        {{-- COLONNE DROITE : détails (prend tout l'espace restant) --}}
+        <section class="flex min-h-0 flex-1 flex-col overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-sm">
 
             <template x-if="!sel">
                 <div class="flex flex-1 flex-col items-center justify-center p-10 text-center text-slate-400">
@@ -342,7 +347,6 @@ function postesApp() {
                                 ['Temps restant', restant(sel), true],
                                 ['Montant actuel', sel.session ? fmtAr(sel.session.montant) : '—', true],
                                 ['Compte HotSpot', sel.hotspot_configure ? sel.hotspot_username : 'Non configuré', !sel.hotspot_configure],
-                                ['Dernier signe de vie', sel.vu_il_y_a ?? '—', false],
                             ]" :key="nom">
                                 <div class="flex items-center gap-3">
                                     <span class="w-40 shrink-0 text-right text-sm text-slate-500" x-text="nom"></span>

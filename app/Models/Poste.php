@@ -15,7 +15,7 @@ class Poste extends Model
     public const ETAT_HORS_LIGNE  = 'hors_ligne';
 
     /** Délai (secondes) sans heartbeat avant de considérer le poste hors ligne. */
-    public const DELAI_HORS_LIGNE = 15;
+    public const DELAI_HORS_LIGNE = 30;
 
     protected $fillable = [
         'nom_poste', 'nom_windows', 'adresse_mac', 'adresse_ip',
@@ -48,7 +48,6 @@ class Poste extends Model
         return $this->hasMany(PosteMessage::class);
     }
 
-    /** Session active (en_cours ou en_pause) */
     public function sessionActive(): ?Session
     {
         return $this->sessions()
@@ -70,10 +69,6 @@ class Poste extends Model
             && $this->etat !== self::ETAT_DESACTIVE;
     }
 
-    /**
-     * État à afficher : calculé, jamais écrasé en base, afin de ne pas perdre
-     * l'état logique (occupé, suspendu...) quand l'agent coupe temporairement.
-     */
     public function etatAffiche(): string
     {
         if ($this->etat === self::ETAT_DESACTIVE) {
@@ -82,7 +77,6 @@ class Poste extends Model
         if (!$this->estEnLigne()) {
             return self::ETAT_HORS_LIGNE;
         }
-        // Anciennes lignes où "hors_ligne" a été persisté
         if ($this->etat === self::ETAT_HORS_LIGNE) {
             return $this->sessionActive() ? self::ETAT_OCCUPE : self::ETAT_DISPONIBLE;
         }

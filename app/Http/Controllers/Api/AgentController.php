@@ -17,12 +17,6 @@ class AgentController extends Controller
 {
     private const REGEX_MAC = '/^([0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}$/';
 
-    /**
-     * Handshake : l'agent s'annonce. Crée le poste s'il est inconnu.
-     * Le nom d'un poste existant n'est PAS écrasé (l'admin garde la main).
-     * Si le poste revient après une panne / un redémarrage avec une session ouverte,
-     * le temps de panne est déduit et Internet est rétabli ; la réponse contient la session en cours.
-     */
     public function handshake(Request $request, PosteSessionService $sessions): JsonResponse
     {
         $data = $request->validate([
@@ -37,7 +31,12 @@ class AgentController extends Controller
             ? strtoupper(str_replace('-', ':', $data['adresse_mac']))
             : null;
 
-        $poste = Poste::where('identifiant_unique', $data['identifiant_unique'])->first();
+        // On cherche d'abord par l'ID unique, sinon par le nom du poste pour éviter les doublons
+        $poste = Poste::where('identifiant_unique', $data['identifiant_unique'])
+            ->orWhere(function($q) use ($data) {
+                $q->where('nom_poste', $data['nom_poste'])
+                  ->whereNotNull('identifiant_unique');
+            })->first();
 
         $retourApresPanne = false;
         $ancienSigne      = null;
@@ -60,7 +59,9 @@ class AgentController extends Controller
             $retourApresPanne = !$poste->estEnLigne();
             $ancienSigne      = $poste->dernier_heartbeat;
 
+            // Mise à jour de l'identifiant unique si trouvé par le nom
             $poste->update([
+                'identifiant_unique'     => $data['identifiant_unique'],
                 'adresse_ip'             => $data['adresse_ip'] ?? $poste->adresse_ip,
                 'adresse_mac'            => $mac ?? $poste->adresse_mac,
                 'agent_version'          => $data['agent_version'] ?? $poste->agent_version,
@@ -74,7 +75,6 @@ class AgentController extends Controller
             $nouveau = false;
         }
 
-        // Redémarrage du PC en pleine session : déduction de la panne + Internet rétabli
         if ($retourApresPanne) {
             $sessions->traiterRetourEnLigne($poste, $ancienSigne);
             $poste->refresh();
@@ -96,10 +96,6 @@ class AgentController extends Controller
         ]);
     }
 
-    /**
-     * Heartbeat : « je suis vivant » + l'agent récupère l'état à appliquer.
-     * C'est aussi ici que l'on constate l'expiration d'un forfait (réactivité de ~5 s).
-     */
     public function heartbeat(Request $request, PosteSessionService $sessions): JsonResponse
     {
         $poste = $this->authentifier($request);
@@ -109,7 +105,6 @@ class AgentController extends Controller
 
         $data = $request->validate(['adresse_ip' => ['nullable', 'ip']]);
 
-        // À lire AVANT la mise à jour du heartbeat
         $etaitEnLigne = $poste->estEnLigne();
         $ancienSigne  = $poste->dernier_heartbeat;
 
@@ -141,10 +136,6 @@ class AgentController extends Controller
         ]);
     }
 
-    /**
-     * Activation demandée par le client (bouton ACTIVER de l'écran de verrouillage).
-     * Crée une session postpayée (libre-service), connecte le poste au réseau.
-     */
     public function activer(Request $request, PosteSessionService $sessions): JsonResponse
     {
         $poste = $this->authentifier($request);
@@ -152,7 +143,6 @@ class AgentController extends Controller
             return response()->json(['ok' => false, 'message' => 'Token invalide.'], 401);
         }
 
-        // 1) Transaction courte : verrou de ligne pour éviter un double clic / une double session
         [$code, $corps, $posteFinal] = DB::transaction(function () use ($poste, $sessions) {
             $p = Poste::whereKey($poste->id)->lockForUpdate()->first();
             $p->update(['dernier_heartbeat' => now(), 'derniere_communication' => now()]);
@@ -160,16 +150,12 @@ class AgentController extends Controller
             switch ($p->etatAffiche()) {
                 case Poste::ETAT_DESACTIVE:
                     return [403, ['ok' => false, 'message' => 'Poste désactivé, contactez le gérant.'], null];
-
                 case Poste::ETAT_SUSPENDU:
                     return [409, ['ok' => false, 'message' => "Votre session est en pause. Adressez-vous à l'accueil."], null];
-
                 case Poste::ETAT_VERROUILLE:
                     return [409, ['ok' => false, 'message' => "Ce poste est verrouillé par l'administrateur."], null];
-
                 case Poste::ETAT_OCCUPE:
                     $s = $p->sessionActive();
-                    // On renvoie aussi le poste : connecterReseau() est idempotent et ré-assure Internet
                     return [200, [
                         'ok'      => true,
                         'message' => 'Session déjà active.',
@@ -177,13 +163,8 @@ class AgentController extends Controller
                     ], $s ? $p : null];
             }
 
-            // Disponible → on démarre une session libre-service
             $session = $sessions->creerSession($p, 'postpaye', null);
-
-            // Trace d'audit : commande « demarrer » déjà exécutée (l'agent se déverrouille via la réponse)
-            $this->tracer($p, 'demarrer', 'Activation depuis le poste client',
-                ['session_id' => $session->id, 'type' => 'postpaye']);
-
+            $this->tracer($p, 'demarrer', 'Activation depuis le poste client', ['session_id' => $session->id, 'type' => 'postpaye']);
             $p->update(['etat' => Poste::ETAT_OCCUPE]);
 
             return [200, [
@@ -193,7 +174,6 @@ class AgentController extends Controller
             ], $p];
         });
 
-        // 2) Hors transaction : l'appel MikroTik peut être lent, il ne doit pas bloquer la base
         if ($posteFinal !== null) {
             $reseau = $sessions->connecterReseau($posteFinal);
             if ($reseau === false) {
@@ -204,7 +184,6 @@ class AgentController extends Controller
         return response()->json($corps, $code);
     }
 
-    /** Widget client : bouton « Suspendre ». Chrono figé, poste « suspendu », Internet coupé. */
     public function suspendreSession(Request $request, PosteSessionService $sessions): JsonResponse
     {
         $poste = $this->authentifier($request);
@@ -229,7 +208,6 @@ class AgentController extends Controller
             return response()->json(['ok' => false, 'message' => 'Aucune session active à suspendre.'], 409);
         }
 
-        // Hors transaction : coupure Internet (mode dégradé si MikroTik injoignable)
         $corps = ['ok' => true, 'message' => 'Session suspendue.'];
         if ($sessions->deconnecterReseau($poste) === false) {
             $corps['avertissement'] = "Coupure Internet non confirmée. Prévenez l'accueil.";
@@ -238,7 +216,6 @@ class AgentController extends Controller
         return response()->json($corps);
     }
 
-    /** L'écran doit-il être verrouillé pour cet état ? (source unique handshake / heartbeat) */
     private function doitEtreVerrouille(string $etat): bool
     {
         return in_array($etat, [
@@ -249,7 +226,6 @@ class AgentController extends Controller
         ], true);
     }
 
-    /** Widget client : bouton « Quitter ». Clôture la session, calcule le montant, coupe Internet. */
     public function fermerSession(Request $request, PosteSessionService $sessions): JsonResponse
     {
         $poste = $this->authentifier($request);
@@ -257,7 +233,6 @@ class AgentController extends Controller
             return response()->json(['ok' => false, 'message' => 'Token invalide.'], 401);
         }
 
-        // 1) Transaction courte
         $resultat = DB::transaction(function () use ($poste, $sessions) {
             $p = Poste::whereKey($poste->id)->lockForUpdate()->first();
             $p->update(['dernier_heartbeat' => now(), 'derniere_communication' => now()]);
@@ -266,6 +241,12 @@ class AgentController extends Controller
             if ($session === null) {
                 return null;
             }
+
+            // Force le statut à VERROUILLE (empêche de recliquer ACTIVER sans l'admin)
+            $p->update(['etat' => Poste::ETAT_VERROUILLE]);
+            
+            // On envoie une commande pour que l'agent se verrouille
+            PosteCommande::create(['poste_id' => $p->id, 'type' => 'verrouiller']);
 
             $this->tracer($p, 'fermer', 'Fermeture depuis le widget client', ['session_id' => $session->id]);
             return [$p, (int) $session->montant_total];
@@ -277,7 +258,6 @@ class AgentController extends Controller
 
         [$posteFinal, $montant] = $resultat;
 
-        // 2) Hors transaction : coupure Internet (mode dégradé si MikroTik injoignable)
         $corps = ['ok' => true, 'message' => 'Session terminée.', 'montant' => $montant];
         if ($sessions->deconnecterReseau($posteFinal) === false) {
             $corps['avertissement'] = "Coupure Internet non confirmée. Prévenez l'accueil.";
@@ -286,11 +266,6 @@ class AgentController extends Controller
         return response()->json($corps);
     }
 
-        /**
-     * Chat client → admin : l'agent envoie le texte saisi par le client.
-     * Stocké dans poste_messages (sens « client », non lu) ; l'interface /postes l'affiche
-     * et signale les non-lus. Limité à 20 messages par minute et par poste.
-     */
     public function message(Request $request): JsonResponse
     {
         $poste = $this->authentifier($request);
@@ -321,7 +296,6 @@ class AgentController extends Controller
         return response()->json(['ok' => true, 'message' => 'Message envoyé.', 'id' => $m->id]);
     }
 
-    /** Commandes en attente. */
     public function commandes(Request $request): JsonResponse
     {
         $poste = $this->authentifier($request);
@@ -370,19 +344,13 @@ class AgentController extends Controller
         return response()->json(['ok' => true]);
     }
 
-    // --- Helpers ---
-
     private function authentifier(Request $request): ?Poste
     {
         $token = $request->header('X-Agent-Token');
-        if (!$token) {
-            return null;
-        }
-
+        if (!$token) return null;
         return Poste::where('agent_token', $token)->first();
     }
 
-    /** Trace d'audit : action initiée par le client, déjà exécutée (jamais renvoyée à l'agent par le polling). */
     private function tracer(Poste $poste, string $type, string $resultat, array $payload = []): void
     {
         PosteCommande::create([
@@ -396,7 +364,6 @@ class AgentController extends Controller
         ]);
     }
 
-    /** Instantané de session envoyé à l'agent : le serveur reste la référence du temps et du montant. */
     private function resumeSession(Session $session): array
     {
         $mode    = $session->mode_facturation ?: 'forfait';
