@@ -125,27 +125,31 @@ class MikroTikService
      * @param  string[]  $words
      * @return array<int, array<string,string>>
      */
-    private function send(array $words): array
-    {
-        $this->login();
+private function send(array $words): array
+{
+    $this->login();
 
-        $reply = $this->connection()->sendSentence($words);
+    $reply = $this->connection()->sendSentence($words);
 
-        if ($this->replyHasTrap($reply)) {
-            $msg = $this->extractTrapMessage($reply);
-            throw new RuntimeException(
-                'MikroTik ' . ($words[0] ?? '?') . ' : ' . $msg
-            );
-        }
-
-        $records = [];
-        foreach ($reply as $item) {
-            if ($item['type'] === '!re') {
-                $records[] = $item['attributes'];
-            }
-        }
-        return $records;
+    if ($this->replyHasTrap($reply)) {
+        $msg = $this->extractTrapMessage($reply);
+        $this->disconnect();
+        throw new RuntimeException(
+            'MikroTik ' . ($words[0] ?? '?') . ' : ' . $msg
+        );
     }
+
+    $records = [];
+    foreach ($reply as $item) {
+        if ($item['type'] === '!re') {
+            $records[] = $item['attributes'];
+        }
+    }
+
+    $this->disconnect();   // ← AJOUT : ferme le socket après chaque commande
+
+    return $records;
+}
 
     /**
      * Liste les utilisateurs HotSpot configurés.
