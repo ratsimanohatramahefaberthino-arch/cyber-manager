@@ -208,11 +208,13 @@ Route::prefix('api/agent')->group(function () {
     Route::post('/handshake', [AgentController::class, 'handshake']);
     Route::post('/heartbeat', [AgentController::class, 'heartbeat']);
     Route::post('/activer',   [AgentController::class, 'activer']);
-    Route::post('/message',   [AgentController::class, 'message']);                    // ÉTAPE 5 (chat client → admin)
+    Route::post('/message',   [AgentController::class, 'message']);
     Route::post('/session/suspendre', [AgentController::class, 'suspendreSession']);
+    Route::post('/session/reprendre', [AgentController::class, 'reprendreSession']); // NOUVEAU
     Route::post('/session/fermer',    [AgentController::class, 'fermerSession']);
     Route::get('/commandes',  [AgentController::class, 'commandes']);
     Route::post('/commandes/{commande}/confirmer', [AgentController::class, 'confirmerCommande']);
+    
 });
 
 /*

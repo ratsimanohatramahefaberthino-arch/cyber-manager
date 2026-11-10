@@ -7,6 +7,7 @@ use App\Models\PosteCommande;
 use App\Models\PosteMessage;
 use App\Models\Session;
 use App\Services\PosteSessionService;
+use App\Services\TarifService;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
@@ -15,34 +16,33 @@ use Illuminate\Validation\Rule;
 
 class PosteController extends Controller
 {
-    /** Définition des actions : label, couleur (clé), confirmation, ouvre une modale. */
     private const ACTIONS = [
         'demarrer'    => ['label' => 'Démarrer',     'couleur' => 'vert',  'modal' => true],
         'debloquer'   => ['label' => 'Débloquer',    'couleur' => 'bleu'],
         'fermer'      => ['label' => 'Fermer',       'couleur' => 'rouge', 'confirm' => 'Fermer la session ? Le montant sera calculé.'],
-        'suspendre'   => ['label' => 'Suspendre',    'couleur' => 'violet'],
+        'suspendre'   => ['label' => 'Suspendre',    'couleur' => 'ambre', 'confirm' => 'Suspendre la session ?'], // Couleur ambre
         'reprendre'   => ['label' => 'Reprendre',    'couleur' => 'vert'],
-        'verrouiller' => ['label' => 'Verrouiller',  'couleur' => 'gris'],
+        'verrouiller' => ['label' => 'Verrouiller',  'couleur' => 'gris',  'confirm' => 'Verrouiller le poste ?'],
         'recharger'   => ['label' => 'Recharger',    'couleur' => 'ambre', 'modal' => true],
-        'desactiver'  => ['label' => 'Désactiver',   'couleur' => 'gris',  'confirm' => 'Désactiver ce poste ? La session en cours sera clôturée.'],
-        'activer'     => ['label' => 'Réactiver',    'couleur' => 'vert'],
-        'arreter'     => ['label' => 'Arrêter',      'couleur' => 'rouge', 'confirm' => "Éteindre le PC ? La session en cours sera clôturée."],
+        'desactiver'  => ['label' => 'Désactiver',   'couleur' => 'gris',  'confirm' => 'Désactiver ce poste ?'],
+        'activer'     => ['label' => 'Activer',      'couleur' => 'vert'],
+        'arreter'     => ['label' => 'Arrêter',      'couleur' => 'rouge', 'confirm' => "Éteindre le PC ?"],
     ];
 
     public function __construct(
         private PosteSessionService $sessions
     ) {}
 
-    // ------------------------------------------------------------------
-    // Lecture
-    // ------------------------------------------------------------------
-
     public function index()
     {
-        return view('postes.index', ['postes' => $this->tousLesPostes()]);
+        return view('postes.index', [
+            'postes' => $this->tousLesPostes(),
+            'tarifs' => app(TarifService::class)->tarifStandard()->raccourcis()->get(),
+            'tarif_minute' => app(TarifService::class)->tarifStandard()->montant_par_minute,
+            'tarif_min' => app(TarifService::class)->tarifStandard()->montant_minimum
+        ]);
     }
 
-    /** Endpoint de polling (toutes les 3 s). */
     public function etat(): JsonResponse
     {
         return response()->json([
@@ -54,14 +54,12 @@ class PosteController extends Controller
     public function chat(Request $request, Poste $poste): JsonResponse
     {
         $apres = (int) $request->query('apres', 0);
-
         $messages = $poste->messages()
             ->where('id', '>', $apres)
             ->orderBy('id')
             ->limit(100)
             ->get(['id', 'sens', 'contenu', 'created_at', 'lu_at']);
 
-        // Le gérant consulte la discussion : les messages du client passent à « lu »
         $nonLus = $messages->where('sens', PosteMessage::SENS_CLIENT)->whereNull('lu_at')->pluck('id');
         if ($nonLus->isNotEmpty()) {
             PosteMessage::whereIn('id', $nonLus)->update(['lu_at' => now()]);
@@ -78,10 +76,6 @@ class PosteController extends Controller
         ]);
     }
 
-    // ------------------------------------------------------------------
-    // Actions
-    // ------------------------------------------------------------------
-
     public function demarrer(Request $request, Poste $poste)
     {
         $data = $request->validate([
@@ -89,24 +83,21 @@ class PosteController extends Controller
             'duree_minutes' => ['required_if:type,forfait', 'nullable', 'integer', 'min:1', 'max:1440'],
         ]);
 
-        if ($poste->etatAffiche() !== Poste::ETAT_DISPONIBLE) {
-            return $this->echec($request, "Le poste {$poste->nom_poste} n'est pas disponible.");
+        if ($poste->etatAffiche() !== Poste::ETAT_DISPONIBLE && $poste->etatAffiche() !== Poste::ETAT_DESACTIVE) {
+            return $this->echec($request, "Le poste n'est pas disponible.");
         }
 
         $duree = $data['type'] === 'forfait' ? (int) $data['duree_minutes'] : null;
 
         $session = $this->sessions->creerSession($poste, $data['type'], $duree);
-        $reseau  = $this->sessions->connecterReseau($poste);   // mode dégradé : n'échoue jamais
+        $reseau  = $this->sessions->connecterReseau($poste);
+
+        PosteMessage::where('poste_id', $poste->id)->delete();
 
         PosteCommande::create([
             'poste_id' => $poste->id,
             'type'     => 'demarrer',
-            'payload'  => [
-                'session_id'    => $session->id,
-                'duree_minutes' => $duree,
-                'type'          => $data['type'],
-                'montant'       => 0,
-            ],
+            'payload'  => ['session_id' => $session->id, 'duree_minutes' => $duree, 'type' => $data['type']],
         ]);
 
         $poste->update(['etat' => Poste::ETAT_OCCUPE]);
@@ -117,17 +108,14 @@ class PosteController extends Controller
     public function debloquer(Request $request, Poste $poste)
     {
         if (!$poste->sessionActive()) {
-            // Déblocage sans facturation : session de mode "libre" (montant 0)
             $this->sessions->creerSession($poste, 'libre', null);
         }
-
-        $this->sessions->reprendre($poste);   // reprend si en pause, poste « utilisé »
+        $this->sessions->reprendre($poste);
         $reseau = $this->sessions->connecterReseau($poste);
 
         PosteCommande::create([
             'poste_id' => $poste->id,
             'type'     => 'debloquer',
-            'payload'  => ['session_id' => $poste->sessionActive()?->id],
         ]);
 
         return $this->ok($request, "Poste {$poste->nom_poste} débloqué." . $this->avertissementReseau($reseau));
@@ -141,6 +129,7 @@ class PosteController extends Controller
         }
 
         PosteCommande::create(['poste_id' => $poste->id, 'type' => 'verrouiller']);
+        $poste->update(['etat' => Poste::ETAT_DESACTIVE]);
 
         $montant = ($session->mode_facturation ?? 'forfait') === 'libre'
             ? ''
@@ -156,15 +145,12 @@ class PosteController extends Controller
             return $p !== null && $this->sessions->suspendre($p);
         });
 
-        if (!$ok) {
-            return $this->echec($request, 'Aucune session active.');
-        }
+        if (!$ok) return $this->echec($request, 'Aucune session active.');
 
-        $reseau = $this->sessions->deconnecterReseau($poste);   // la pause coupe Internet
-
+        $reseau = $this->sessions->deconnecterReseau($poste);
         PosteCommande::create(['poste_id' => $poste->id, 'type' => 'suspendre']);
 
-        return $this->ok($request, "Session de {$poste->nom_poste} suspendue." . $this->avertissementReseau($reseau, 'coupé'));
+        return $this->ok($request, "Session suspendue." . $this->avertissementReseau($reseau, 'coupé'));
     }
 
     public function reprendre(Request $request, Poste $poste)
@@ -172,176 +158,99 @@ class PosteController extends Controller
         if (!$this->sessions->reprendre($poste)) {
             return $this->echec($request, 'Aucune session à reprendre.');
         }
-
-        $reseau = $this->sessions->connecterReseau($poste);   // Internet avait été coupé à la suspension
-
+        $reseau = $this->sessions->connecterReseau($poste);
         PosteCommande::create(['poste_id' => $poste->id, 'type' => 'reprendre']);
 
-        return $this->ok($request, "Session de {$poste->nom_poste} reprise." . $this->avertissementReseau($reseau));
+        return $this->ok($request, "Session reprise." . $this->avertissementReseau($reseau));
     }
 
     public function verrouiller(Request $request, Poste $poste)
     {
-        if (!$poste->sessionActive()) {
-            return $this->echec($request, 'Aucune session active à verrouiller.');
-        }
-
+        if (!$poste->sessionActive()) return $this->echec($request, 'Aucune session active.');
         PosteCommande::create(['poste_id' => $poste->id, 'type' => 'verrouiller']);
-        $poste->update(['etat' => Poste::ETAT_VERROUILLE]); // le chrono continue
+        $poste->update(['etat' => Poste::ETAT_VERROUILLE]);
 
-        return $this->ok($request, "Poste {$poste->nom_poste} verrouillé (le chrono continue).");
+        return $this->ok($request, "Poste verrouillé.");
     }
 
     public function desactiver(Request $request, Poste $poste)
     {
+        if ($poste->etatAffiche() === Poste::ETAT_OCCUPE) {
+            return $this->echec($request, "Impossible de désactiver un poste en cours d'utilisation.");
+        }
         $this->terminer($poste, 'desactivation');
+        PosteMessage::where('poste_id', $poste->id)->delete();
         PosteCommande::create(['poste_id' => $poste->id, 'type' => 'desactiver']);
         $poste->update(['etat' => Poste::ETAT_DESACTIVE]);
 
-        return $this->ok($request, "Poste {$poste->nom_poste} désactivé.");
+        return $this->ok($request, "Poste désactivé.");
     }
 
     public function activer(Request $request, Poste $poste)
     {
-        PosteCommande::create(['poste_id' => $poste->id, 'type' => 'verrouiller']);
-        $poste->update(['etat' => Poste::ETAT_DISPONIBLE]);
-
-        return $this->ok($request, "Poste {$poste->nom_poste} réactivé.");
+        if ($poste->etat === Poste::ETAT_DESACTIVE) {
+            $poste->update(['etat' => Poste::ETAT_DISPONIBLE]);
+            PosteCommande::create(['poste_id' => $poste->id, 'type' => 'verrouiller']);
+            return $this->ok($request, "Poste activé.");
+        }
+        return $this->echec($request, "Le poste n'est pas désactivé.");
     }
 
     public function arreter(Request $request, Poste $poste)
     {
         $this->terminer($poste, 'arret');
         PosteCommande::create(['poste_id' => $poste->id, 'type' => 'arreter']);
-        $poste->update(['etat' => Poste::ETAT_DISPONIBLE]);
+        $poste->update(['etat' => Poste::ETAT_DESACTIVE]);
 
-        return $this->ok($request, "Commande d'arrêt envoyée à {$poste->nom_poste}.");
+        return $this->ok($request, "Commande d'arrêt envoyée.");
     }
 
     public function recharger(Request $request, Poste $poste)
     {
         $data = $request->validate(['minutes' => ['required', 'integer', 'min:1', 'max:1440']]);
 
-        // Sous verrou : évite une course avec l'expiration automatique du forfait
         $resultat = DB::transaction(function () use ($poste, $data) {
             $p       = Poste::whereKey($poste->id)->lockForUpdate()->first();
             $session = $p?->sessionActive();
 
-            if ($session === null) {
-                return 'aucune';
-            }
-            if (($session->mode_facturation ?? 'forfait') !== 'forfait') {
-                return 'non_forfait';
-            }
+            if ($session === null) return 'aucune';
+            if (($session->mode_facturation ?? 'forfait') !== 'forfait') return 'non_forfait';
 
             $nouvelleDuree = (int) $session->duree_prevue + $data['minutes'];
             $session->update([
-                'date_heure_fin_prevue' => $session->date_heure_fin_prevue
-                    ? $session->date_heure_fin_prevue->copy()->addMinutes($data['minutes'])
-                    : now()->addMinutes($data['minutes']),
+                'date_heure_fin_prevue' => $session->date_heure_fin_prevue->copy()->addMinutes($data['minutes']),
                 'duree_prevue' => $nouvelleDuree,
             ]);
-
             return $nouvelleDuree;
         });
 
-        if ($resultat === 'aucune') {
-            return $this->echec($request, 'Aucune session active sur ce poste.');
-        }
-        if ($resultat === 'non_forfait') {
-            return $this->echec($request, "Cette session n'est pas un forfait : rien à recharger.");
-        }
+        if ($resultat === 'aucune') return $this->echec($request, 'Aucune session active.');
+        if ($resultat === 'non_forfait') return $this->echec($request, "Seul un forfait peut être rechargé.");
 
         PosteCommande::create([
             'poste_id' => $poste->id,
             'type'     => 'recharger',
-            'payload'  => ['minutes_ajoutees' => (int) $data['minutes'], 'duree_totale_min' => $resultat],
+            'payload'  => ['minutes_ajoutees' => (int) $data['minutes']],
         ]);
 
-        return $this->ok($request, "{$data['minutes']} min ajoutées à {$poste->nom_poste} (forfait : {$resultat} min).");
+        return $this->ok($request, "{$data['minutes']} min ajoutées (forfait : {$resultat} min).");
     }
 
-    /** Chat admin → client. */
     public function envoyerMessage(Request $request, Poste $poste)
     {
         $data = $request->validate(['message' => ['required', 'string', 'max:500']]);
-
         PosteMessage::create([
             'poste_id' => $poste->id,
             'sens'     => PosteMessage::SENS_ADMIN,
             'contenu'  => $data['message'],
         ]);
-
         PosteCommande::create([
             'poste_id' => $poste->id,
             'type'     => 'message',
             'payload'  => ['message' => $data['message']],
         ]);
-
         return $this->ok($request, 'Message envoyé.');
     }
-
-        /**
-     * Identifiants HotSpot du poste (compte MikroTik utilisé pour ouvrir Internet).
-     * Identifiant vide = dissociation. Mot de passe vide = on conserve l'ancien.
-     * Le mot de passe n'est jamais renvoyé ni journalisé.
-     */
-    public function enregistrerHotspot(Request $request, Poste $poste)
-    {
-        $data = $request->validate([
-            'hotspot_username' => ['nullable', 'string', 'min:3', 'max:64', 'regex:/^\S+$/',
-                Rule::unique('postes', 'hotspot_username')->ignore($poste->id)],
-            'hotspot_password' => ['nullable', 'string', 'min:4', 'max:64', 'regex:/^\S+$/'],
-        ], [
-            'hotspot_username.min'    => "L'identifiant doit contenir au moins 3 caractères.",
-            'hotspot_username.max'    => "L'identifiant ne doit pas dépasser 64 caractères.",
-            'hotspot_username.regex'  => "L'identifiant ne doit pas contenir d'espaces.",
-            'hotspot_username.unique' => 'Ce compte HotSpot est déjà utilisé par un autre poste.',
-            'hotspot_password.min'    => 'Le mot de passe doit contenir au moins 4 caractères.',
-            'hotspot_password.max'    => 'Le mot de passe ne doit pas dépasser 64 caractères.',
-            'hotspot_password.regex'  => 'Le mot de passe ne doit pas contenir d\'espaces.',
-        ]);
-
-        $username = trim((string) ($data['hotspot_username'] ?? ''));
-        $password = trim((string) ($data['hotspot_password'] ?? ''));
-
-        if ($username === '') {
-            $poste->update(['hotspot_username' => null, 'hotspot_password' => null]);
-            Log::info("Identifiants HotSpot du poste {$poste->nom_poste} supprimés.");
-
-            return $this->ok($request, "Identifiants HotSpot de {$poste->nom_poste} supprimés : Internet ne sera plus activé pour ce poste.");
-        }
-
-        if ($password === '' && blank($poste->hotspot_password)) {
-            return $this->echec($request, 'Le mot de passe est obligatoire pour un nouveau compte.');
-        }
-
-        $compteChange = $username !== $poste->hotspot_username;
-
-        $poste->update([
-            'hotspot_username' => $username,
-            'hotspot_password' => $password !== '' ? $password : $poste->hotspot_password,
-        ]);
-        Log::info("Identifiants HotSpot du poste {$poste->nom_poste} mis à jour (compte « {$username} »).");
-
-        $message = "Identifiants HotSpot de {$poste->nom_poste} enregistrés.";
-
-        if ($this->sessions->compteHotspotExiste($username) === false) {
-            $message .= " Attention : le compte « {$username} » est introuvable sur MikroTik — créez-le avant d'utiliser ce poste.";
-        }
-
-        // Session en cours avec un autre compte : on rebascule Internet sur le nouveau
-        $session = $poste->sessionActive();
-        if ($compteChange && $session !== null && $session->etat === 'en_cours') {
-            $message .= $this->avertissementReseau($this->sessions->connecterReseau($poste));
-        }
-
-        return $this->ok($request, $message);
-    }
-
-    // ------------------------------------------------------------------
-    // Données pour l'interface
-    // ------------------------------------------------------------------
 
     private function tousLesPostes(): array
     {
@@ -359,8 +268,13 @@ class PosteController extends Controller
     {
         $etat = $p->etatAffiche();
         $s    = $p->sessionActive();
+        if (!$s && $etat === Poste::ETAT_DESACTIVE) {
+            $s = $p->sessions()->latest()->first();
+        }
 
         $session = null;
+        $estChatActif = $etat === Poste::ETAT_OCCUPE || ($etat === Poste::ETAT_DESACTIVE && $s !== null);
+
         if ($s) {
             $mode    = $s->mode_facturation ?: 'forfait';
             $ecoule  = (int) $s->secondesConsommees();
@@ -386,86 +300,58 @@ class PosteController extends Controller
             'ip'       => $p->adresse_ip,
             'mac'      => $p->adresse_mac,
             'version'  => $p->agent_version,
-            'vu_il_y_a' => $p->dernier_heartbeat?->diffForHumans(),
             'session'  => $session,
-            'non_lus'  => (int) ($p->non_lus ?? 0),
+            'non_lus'  => $estChatActif ? (int) ($p->non_lus ?? 0) : 0,
             'hotspot_username'  => $p->hotspot_username,
             'hotspot_configure' => filled($p->hotspot_username) && filled($p->hotspot_password),
             'actions'  => $this->actionsPour($etat, $s !== null, $session['mode'] ?? null),
         ];
     }
 
-    /** Actions autorisées selon l'état — source unique pour le menu et les boutons. */
     private function actionsPour(string $etat, bool $aSession, ?string $modeSession = null): array
     {
         $cles = match ($etat) {
             Poste::ETAT_DISPONIBLE => ['demarrer', 'debloquer', 'desactiver', 'arreter'],
-            Poste::ETAT_OCCUPE     => ['fermer', 'suspendre', 'verrouiller', 'recharger', 'desactiver', 'arreter'],
+            Poste::ETAT_OCCUPE     => ['fermer', 'suspendre', 'verrouiller', 'recharger', 'arreter'],
             Poste::ETAT_SUSPENDU   => ['reprendre', 'fermer', 'desactiver', 'arreter'],
             Poste::ETAT_VERROUILLE => $aSession
                 ? ['debloquer', 'fermer', 'recharger', 'desactiver', 'arreter']
                 : ['debloquer', 'desactiver', 'arreter'],
-            // Poste injoignable avec une session ouverte : le gérant peut la clôturer à la main
-            Poste::ETAT_HORS_LIGNE => $aSession ? ['fermer', 'desactiver'] : ['desactiver'],
+            Poste::ETAT_HORS_LIGNE => ['desactiver'],
             Poste::ETAT_DESACTIVE  => ['activer'],
             default                => [],
         };
 
-        // Recharger n'a de sens que pour un forfait (durée limitée)
         if ($modeSession !== 'forfait') {
             $cles = array_values(array_diff($cles, ['recharger']));
         }
 
-        return array_map(function (string $cle) use ($etat) {
-            $def = self::ACTIONS[$cle];
-            if ($cle === 'debloquer' && $etat === Poste::ETAT_VERROUILLE) {
-                $def['label'] = 'Déverrouiller';
-            }
-            return ['cle' => $cle] + $def;
-        }, $cles);
+        return array_map(fn (string $cle) => ['cle' => $cle] + self::ACTIONS[$cle], $cles);
     }
 
-    // ------------------------------------------------------------------
-    // Helpers
-    // ------------------------------------------------------------------
-
-    /**
-     * Clôture la session active (sous verrou) puis coupe Internet.
-     * Si le poste est injoignable, la session est facturée jusqu'à son dernier signe de vie.
-     */
     private function terminer(Poste $poste, string $motif): ?Session
     {
         $arret = $poste->estEnLigne() ? null : $poste->dernier_heartbeat;
-
         $session = DB::transaction(function () use ($poste, $motif, $arret) {
             $p = Poste::whereKey($poste->id)->lockForUpdate()->first();
             return $p !== null ? $this->sessions->cloturer($p, $motif, $arret) : null;
         });
-
-        $this->sessions->deconnecterReseau($poste);   // mode dégradé : n'échoue jamais
-
+        $this->sessions->deconnecterReseau($poste);
         return $session;
     }
 
-    /** Complément de message quand MikroTik n'a pas répondu (false = échec, null/true = rien à signaler). */
     private function avertissementReseau(?bool $reseau, string $verbe = 'activé'): string
     {
-        return $reseau === false
-            ? " Attention : Internet n'a pas pu être {$verbe} (MikroTik injoignable) — vérifiez le routeur."
-            : '';
+        return $reseau === false ? " Attention : Internet n'a pas pu être {$verbe} (MikroTik injoignable)." : '';
     }
 
     private function ok(Request $request, string $message)
     {
-        return $request->expectsJson()
-            ? response()->json(['ok' => true, 'message' => $message])
-            : back()->with('success', $message);
+        return $request->expectsJson() ? response()->json(['ok' => true, 'message' => $message]) : back()->with('success', $message);
     }
 
     private function echec(Request $request, string $message)
     {
-        return $request->expectsJson()
-            ? response()->json(['ok' => false, 'message' => $message], 422)
-            : back()->with('error', $message);
+        return $request->expectsJson() ? response()->json(['ok' => false, 'message' => $message], 422) : back()->with('error', $message);
     }
 }

@@ -31,7 +31,6 @@ class AgentController extends Controller
             ? strtoupper(str_replace('-', ':', $data['adresse_mac']))
             : null;
 
-        // On cherche d'abord par l'ID unique, sinon par le nom du poste pour éviter les doublons
         $poste = Poste::where('identifiant_unique', $data['identifiant_unique'])
             ->orWhere(function($q) use ($data) {
                 $q->where('nom_poste', $data['nom_poste'])
@@ -49,7 +48,7 @@ class AgentController extends Controller
                 'adresse_mac'            => $mac,
                 'agent_version'          => $data['agent_version'] ?? null,
                 'agent_token'            => Str::random(64),
-                'etat'                   => Poste::ETAT_DISPONIBLE,
+                'etat'                   => Poste::ETAT_DESACTIVE,
                 'actif'                  => true,
                 'dernier_heartbeat'      => now(),
                 'derniere_communication' => now(),
@@ -59,7 +58,6 @@ class AgentController extends Controller
             $retourApresPanne = !$poste->estEnLigne();
             $ancienSigne      = $poste->dernier_heartbeat;
 
-            // Mise à jour de l'identifiant unique si trouvé par le nom
             $poste->update([
                 'identifiant_unique'     => $data['identifiant_unique'],
                 'adresse_ip'             => $data['adresse_ip'] ?? $poste->adresse_ip,
@@ -164,6 +162,7 @@ class AgentController extends Controller
             }
 
             $session = $sessions->creerSession($p, 'postpaye', null);
+            PosteMessage::where('poste_id', $p->id)->delete();
             $this->tracer($p, 'demarrer', 'Activation depuis le poste client', ['session_id' => $session->id, 'type' => 'postpaye']);
             $p->update(['etat' => Poste::ETAT_OCCUPE]);
 
@@ -216,6 +215,34 @@ class AgentController extends Controller
         return response()->json($corps);
     }
 
+    public function reprendreSession(Request $request, PosteSessionService $sessions): JsonResponse
+    {
+        $poste = $this->authentifier($request);
+        if ($poste === null) {
+            return response()->json(['ok' => false, 'message' => 'Token invalide.'], 401);
+        }
+
+        $ok = DB::transaction(function () use ($poste, $sessions) {
+            $p = Poste::whereKey($poste->id)->lockForUpdate()->first();
+            if ($p === null || !$sessions->reprendre($p)) {
+                return false;
+            }
+            $this->tracer($p, 'reprendre', 'Reprise depuis l\'écran de verrouillage client');
+            return true;
+        });
+
+        if (!$ok) {
+            return response()->json(['ok' => false, 'message' => 'Aucune session à reprendre.'], 409);
+        }
+
+        $corps = ['ok' => true, 'message' => 'Session reprise.'];
+        if ($sessions->connecterReseau($poste) === false) {
+            $corps['avertissement'] = "Connexion Internet non confirmée. Prévenez l'accueil.";
+        }
+
+        return response()->json($corps);
+    }
+
     private function doitEtreVerrouille(string $etat): bool
     {
         return in_array($etat, [
@@ -242,10 +269,7 @@ class AgentController extends Controller
                 return null;
             }
 
-            // Force le statut à VERROUILLE (empêche de recliquer ACTIVER sans l'admin)
-            $p->update(['etat' => Poste::ETAT_VERROUILLE]);
-            
-            // On envoie une commande pour que l'agent se verrouille
+            $p->update(['etat' => Poste::ETAT_DESACTIVE]);
             PosteCommande::create(['poste_id' => $p->id, 'type' => 'verrouiller']);
 
             $this->tracer($p, 'fermer', 'Fermeture depuis le widget client', ['session_id' => $session->id]);
@@ -277,14 +301,6 @@ class AgentController extends Controller
         $texte = trim($data['texte']);
         if ($texte === '') {
             return response()->json(['ok' => false, 'message' => 'Message vide.'], 422);
-        }
-
-        $recents = PosteMessage::where('poste_id', $poste->id)
-            ->where('sens', PosteMessage::SENS_CLIENT)
-            ->where('created_at', '>', now()->subMinute())
-            ->count();
-        if ($recents >= 20) {
-            return response()->json(['ok' => false, 'message' => 'Trop de messages envoyés. Patientez une minute.'], 429);
         }
 
         $m = PosteMessage::create([
