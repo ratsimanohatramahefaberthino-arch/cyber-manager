@@ -7,10 +7,13 @@ use App\Models\Poste;
 use App\Models\PosteCommande;
 use App\Models\PosteMessage;
 use App\Models\Session;
+use App\Services\CodeInstallation;
 use App\Services\PosteSessionService;
+use Illuminate\Database\UniqueConstraintViolationException;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Str;
 use App\Models\CyberSetting;
 
@@ -26,39 +29,75 @@ class AgentController extends Controller
             'adresse_ip'         => ['nullable', 'ip'],
             'adresse_mac'        => ['nullable', 'string', 'regex:' . self::REGEX_MAC],
             'agent_version'      => ['nullable', 'string', 'max:32'],
+            'code_installation'  => ['nullable', 'string', 'max:32'],
         ]);
 
-        $mac = isset($data['adresse_mac']) ? strtoupper(str_replace('-', ':', $data['adresse_mac'])) : null;
+        $mac   = isset($data['adresse_mac']) ? strtoupper(str_replace('-', ':', $data['adresse_mac'])) : null;
+        $ipVue = $this->ipVue($request);
 
-        $poste = Poste::where('identifiant_unique', $data['identifiant_unique'])
-            ->orWhere(function($q) use ($data) {
-                $q->where('nom_poste', $data['nom_poste'])->whereNotNull('identifiant_unique');
-            })->first();
+        // Un poste se reconnaît UNIQUEMENT par son identifiant, jamais par son nom.
+        $poste = Poste::where('identifiant_unique', $data['identifiant_unique'])->first();
 
         $retourApresPanne = false;
         $ancienSigne      = null;
 
         if ($poste === null) {
-            $poste = Poste::create([
-                'nom_poste'              => $data['nom_poste'],
-                'identifiant_unique'     => $data['identifiant_unique'],
-                'adresse_ip'             => $data['adresse_ip'] ?? null,
-                'adresse_mac'            => $mac,
-                'agent_version'          => $data['agent_version'] ?? null,
-                'agent_token'            => Str::random(64),
-                'etat'                   => Poste::ETAT_DESACTIVE,
-                'actif'                  => true,
-                'dernier_heartbeat'      => now(),
-                'derniere_communication' => now(),
-            ]);
+            // Identifiant inconnu = nouveau poste : le code d'installation est obligatoire.
+            // On ne renvoie JAMAIS le jeton d'un poste existant à un identifiant inconnu.
+            if (!CodeInstallation::verifier($data['code_installation'] ?? null)) {
+                Log::warning("Enregistrement refusé depuis {$ipVue} : code d'installation absent ou invalide.");
+                return response()->json([
+                    'ok'      => false,
+                    'code'    => 'code_installation_invalide',
+                    'message' => "Code d'installation absent ou invalide. Demandez-le au gérant (page « Enregistrement » de l'interface web).",
+                ], 403);
+            }
+
+            try {
+                $poste = Poste::create([
+                    'nom_poste'              => Poste::nomPourNouveauPoste($data['nom_poste']),
+                    'identifiant_unique'     => $data['identifiant_unique'],
+                    'adresse_ip'             => $data['adresse_ip'] ?? null,
+                    'derniere_ip_vue'        => $ipVue,
+                    'adresse_mac'            => $mac,
+                    'agent_version'          => $data['agent_version'] ?? null,
+                    'agent_token'            => Str::random(64),
+                    'etat'                   => Poste::ETAT_DESACTIVE,
+                    'actif'                  => true,
+                    'dernier_heartbeat'      => now(),
+                    'derniere_communication' => now(),
+                ]);
+            } catch (UniqueConstraintViolationException) {
+                // Deux enregistrements simultanés avec le même identifiant : l'agent réessaiera.
+                return response()->json([
+                    'ok'      => false,
+                    'code'    => 'enregistrement_simultane',
+                    'message' => 'Enregistrement simultané détecté, nouvel essai en cours.',
+                ], 409);
+            }
+
+            Log::info("Nouveau poste enregistré : « {$poste->nom_poste} » (demandé : « {$data['nom_poste']} »).");
             $nouveau = true;
         } else {
+            // Conflit d'identité déjà signalé (PC cloné) : l'ordinateur dont l'adresse MAC n'est pas
+            // celle du poste d'origine doit prendre une nouvelle identité.
+            if ($poste->aConflitIdentite() && $mac !== null && $poste->adresse_mac !== null
+                && $mac !== strtoupper($poste->adresse_mac)) {
+                Log::warning("Poste « {$poste->nom_poste} » : un ordinateur dupliqué (MAC différente) reçoit l'ordre de changer d'identité.");
+                return response()->json([
+                    'ok'                   => false,
+                    'code'                 => 'identifiant_a_regenerer',
+                    'regenerer_identifiant' => true,
+                    'message'              => "Cet ordinateur est un doublon d'un autre poste : il va recevoir une nouvelle identité.",
+                ], 409);
+            }
+
             $retourApresPanne = !$poste->estEnLigne();
             $ancienSigne      = $poste->dernier_heartbeat;
 
-            $poste->update([
-                'identifiant_unique'     => $data['identifiant_unique'],
+            $maj = [
                 'adresse_ip'             => $data['adresse_ip'] ?? $poste->adresse_ip,
+                'derniere_ip_vue'        => $ipVue,
                 'adresse_mac'            => $mac ?? $poste->adresse_mac,
                 'agent_version'          => $data['agent_version'] ?? $poste->agent_version,
                 'agent_token'            => $poste->agent_token ?: Str::random(64),
@@ -67,7 +106,14 @@ class AgentController extends Controller
                 'etat'                   => $poste->etat === Poste::ETAT_HORS_LIGNE
                     ? ($poste->sessionActive() ? Poste::ETAT_OCCUPE : Poste::ETAT_DISPONIBLE)
                     : $poste->etat,
-            ]);
+            ];
+
+            if ($this->conflitProbable($poste, $ipVue)) {
+                $maj['conflit_identite_at'] = now();
+                Log::warning("Poste « {$poste->nom_poste} » : deux ordinateurs semblent utiliser la même identité (PC cloné ?).");
+            }
+
+            $poste->update($maj);
             $nouveau = false;
         }
 
@@ -103,9 +149,23 @@ class AgentController extends Controller
         $etaitEnLigne = $poste->estEnLigne();
         $ancienSigne  = $poste->dernier_heartbeat;
 
-        $maj = ['dernier_heartbeat' => now(), 'derniere_communication' => now()];
+        // Détection d'un PC cloné : le même jeton arrive de deux adresses réseau différentes, coup sur coup.
+        $ipVue   = $this->ipVue($request);
+        $conflit = $this->conflitProbable($poste, $ipVue);
+
+        $maj = ['dernier_heartbeat' => now(), 'derniere_communication' => now(), 'derniere_ip_vue' => $ipVue];
         if (!empty($data['adresse_ip'])) $maj['adresse_ip'] = $data['adresse_ip'];
-        
+
+        if ($conflit) {
+            if ($poste->conflit_identite_at === null || $poste->conflit_identite_at->lt(now()->subMinute())) {
+                Log::warning("Poste « {$poste->nom_poste} » : deux ordinateurs semblent utiliser la même identité (PC cloné ?).");
+            }
+            $maj['conflit_identite_at'] = now();
+        } elseif ($poste->conflit_identite_at !== null
+            && $poste->conflit_identite_at->lt(now()->subMinutes(Poste::DUREE_CONFLIT_MINUTES))) {
+            $maj['conflit_identite_at'] = null;   // plus de signalement depuis 10 min : alerte effacée
+        }
+
         if ($poste->etat === Poste::ETAT_HORS_LIGNE) {
             $maj['etat'] = $poste->sessionActive() ? Poste::ETAT_OCCUPE : Poste::ETAT_DISPONIBLE;
         }
@@ -295,6 +355,29 @@ class AgentController extends Controller
         $token = $request->header('X-Agent-Token');
         if (!$token) return null;
         return Poste::where('agent_token', $token)->first();
+    }
+
+    /** Adresse réseau de l'appelant, telle que le SERVEUR la voit (pas celle que l'agent déclare). */
+    private function ipVue(Request $request): ?string
+    {
+        $ip = $request->ip();
+        if ($ip === null) return null;
+
+        if (str_starts_with($ip, '::ffff:')) $ip = substr($ip, 7);   // IPv4 écrite en IPv6
+        return $ip === '::1' ? '127.0.0.1' : $ip;                    // les deux formes de « cet ordinateur »
+    }
+
+    /**
+     * Deux ordinateurs partagent-ils ce poste ? Oui si le poste vient de donner signe de vie
+     * (moins de 12 s) depuis une AUTRE adresse réseau que celle de cet appel.
+     */
+    private function conflitProbable(Poste $poste, ?string $ipVue): bool
+    {
+        return $ipVue !== null
+            && $poste->derniere_ip_vue !== null
+            && $poste->derniere_ip_vue !== $ipVue
+            && $poste->dernier_heartbeat !== null
+            && $poste->dernier_heartbeat->gt(now()->subSeconds(Poste::DELAI_CONFLIT));
     }
 
     private function tracer(Poste $poste, string $type, string $resultat, array $payload = []): void

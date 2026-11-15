@@ -15,6 +15,7 @@ use App\Http\Controllers\Api\AgentController;
 use App\Http\Controllers\ParametresController;
 use App\Http\Controllers\HistoriqueController;
 use App\Http\Controllers\StatistiqueController;
+use App\Http\Controllers\EnregistrementController;
 
 /*
 |--------------------------------------------------------------------------
@@ -101,6 +102,15 @@ Route::middleware('auth')->group(function () {
     Route::post('/postes/{poste}/arreter',     [PosteController::class, 'arreter'])->name('postes.arreter');
     Route::post('/postes/{poste}/recharger',   [PosteController::class, 'recharger'])->name('postes.recharger');
     Route::post('/postes/{poste}/hotspot',     [PosteController::class, 'enregistrerHotspot'])->name('postes.hotspot');
+
+    // -----------------------------------------------------------------
+    // Enregistrement des postes (code d'installation, renommer, conflits d'identité)
+    // -----------------------------------------------------------------
+    Route::get('/enregistrement',                              [EnregistrementController::class, 'index'])->name('enregistrement.index');
+    Route::post('/enregistrement/code',                        [EnregistrementController::class, 'regenererCode'])->name('enregistrement.code');
+    Route::post('/enregistrement/postes/{poste}/renommer',     [EnregistrementController::class, 'renommer'])->name('enregistrement.renommer');
+    Route::post('/enregistrement/postes/{poste}/separer',      [EnregistrementController::class, 'separer'])->name('enregistrement.separer');
+    Route::post('/enregistrement/postes/{poste}/ignorer',      [EnregistrementController::class, 'ignorerConflit'])->name('enregistrement.ignorer');
 
     // -----------------------------------------------------------------
     // Paramètres (identité du cyber : nom, logo, couleur…)
@@ -230,7 +240,8 @@ Route::get('/api/portail/stats', [PortailController::class, 'apiStats'])->name('
 */
 
 Route::prefix('api/agent')->group(function () {
-    Route::post('/handshake', [AgentController::class, 'handshake']);
+    // Limite : 30 tentatives par minute et par adresse (freine la recherche du code d'installation)
+    Route::post('/handshake', [AgentController::class, 'handshake'])->middleware('throttle:30,1');
     Route::post('/heartbeat', [AgentController::class, 'heartbeat']);
     Route::post('/activer',   [AgentController::class, 'activer']);
     Route::post('/message',   [AgentController::class, 'message']);

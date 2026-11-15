@@ -74,9 +74,17 @@
         ['route' => 'historique.index',   'motif' => 'historique.*',   'label' => 'Historique',   'icone' => 'archive'],
         ['route' => 'statistiques.index', 'motif' => 'statistiques.*', 'label' => 'Statistiques', 'icone' => 'chart'],
         ['route' => 'portail.admin',  'motif' => 'portail.*',   'label' => 'Portail Captif', 'icone' => 'link'],
+        ['route' => 'enregistrement.index', 'motif' => 'enregistrement.*', 'label' => 'Enregistrement', 'icone' => 'key'],
         ['route' => 'parametres.index', 'motif' => 'parametres.*', 'label' => 'Paramètres', 'icone' => 'tag'],
     ];
     $bientot = [];
+
+    // Postes dont l'identité est en conflit (PC cloné) : alerte visible sur toutes les pages
+    try {
+        $nbConflits = \App\Models\Poste::whereNotNull('conflit_identite_at')->count();
+    } catch (\Throwable) {
+        $nbConflits = 0;
+    }
 @endphp
 
 <body x-data="cmSidebar()" class="min-h-screen bg-slate-50 text-slate-900 antialiased">
@@ -160,6 +168,13 @@
                 </button>
                 <div class="hidden sm:block"></div>
                 <div class="flex items-center gap-3">
+                    @if($nbConflits > 0)
+                        <a href="{{ route('enregistrement.index') }}" title="Deux ordinateurs semblent utiliser la même identité de poste"
+                           class="flex items-center gap-1.5 rounded-full border border-rose-200 bg-rose-50 px-3 py-1 text-xs font-medium text-rose-700">
+                            <span>⚠</span>
+                            <span>{{ $nbConflits }} conflit(s) d'identité de poste</span>
+                        </a>
+                    @endif
                     <div x-data="mikrotikStatut('{{ route('mikrotik.statut') }}')" :title="titre"
                          class="hidden items-center gap-1.5 rounded-full border px-3 py-1 text-xs font-medium sm:flex"
                          :class="{ 'border-emerald-200 bg-emerald-50 text-emerald-700': etat === 'ok', 'border-rose-200 bg-rose-50 text-rose-700': etat === 'ko', 'border-slate-200 bg-slate-50 text-slate-500': etat === 'chargement' }">
