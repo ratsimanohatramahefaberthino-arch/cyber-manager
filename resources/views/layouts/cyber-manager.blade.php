@@ -63,6 +63,7 @@
 </head>
 
 @php
+    $cyber = \App\Models\CyberSetting::tous();
     $liens = [
         ['route' => 'dashboard',      'motif' => 'dashboard',   'label' => 'Dashboard', 'icone' => 'home'],
         ['route' => 'postes.index',   'motif' => 'postes.*',    'label' => 'Postes',    'icone' => 'desktop'],
@@ -70,9 +71,12 @@
         ['route' => 'wifi.index',     'motif' => 'wifi.*',      'label' => 'Wi-Fi',     'icone' => 'wifi'],
         ['route' => 'hotspot.index',  'motif' => 'hotspot.*',   'label' => 'HotSpot',   'icone' => 'key'],
         ['route' => 'tarifs.index',   'motif' => 'tarifs.*',    'label' => 'Tarifs',    'icone' => 'tag'],
+        ['route' => 'historique.index',   'motif' => 'historique.*',   'label' => 'Historique',   'icone' => 'archive'],
+        ['route' => 'statistiques.index', 'motif' => 'statistiques.*', 'label' => 'Statistiques', 'icone' => 'chart'],
         ['route' => 'portail.admin',  'motif' => 'portail.*',   'label' => 'Portail Captif', 'icone' => 'link'],
+        ['route' => 'parametres.index', 'motif' => 'parametres.*', 'label' => 'Paramètres', 'icone' => 'tag'],
     ];
-    $bientot = [['Historique', 'archive'], ['Statistiques', 'chart']];
+    $bientot = [];
 @endphp
 
 <body x-data="cmSidebar()" class="min-h-screen bg-slate-50 text-slate-900 antialiased">
@@ -94,7 +98,7 @@
                 <span class="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-white/10">
                     <x-icone nom="wifi" class="h-5 w-5 text-white" />
                 </span>
-                <span x-show="open" x-cloak class="truncate text-base font-semibold tracking-wide text-white">Cyber Manager</span>
+                <span x-show="open" x-cloak class="truncate text-base font-semibold tracking-wide text-white">{{ $cyber['nom_cyber'] ?? 'Cyber Manager' }}</span>
                 <button type="button" @click="toggle()" title="Réduire / agrandir le menu"
                         class="ml-auto flex h-8 w-8 shrink-0 cursor-pointer items-center justify-center rounded-lg text-indigo-300 transition hover:bg-white/10 hover:text-white">
                     <x-icone nom="chevron-left" class="h-5 w-5 transition-transform duration-200" x-bind:class="!open ? 'rotate-180' : ''" />
@@ -135,7 +139,7 @@
                     <span class="flex h-8 w-8 items-center justify-center rounded-lg bg-white/10">
                         <x-icone nom="wifi" class="h-5 w-5 text-white" />
                     </span>
-                    <span class="text-base font-semibold text-white">Cyber Manager</span>
+                    <span class="text-base font-semibold text-white">{{ $cyber['nom_cyber'] ?? 'Cyber Manager' }}</span>
                 </div>
                 <nav class="flex-1 space-y-1 overflow-y-auto p-2">
                     @foreach($liens as $lien)
@@ -163,7 +167,7 @@
                         <span x-text="etat === 'ok' ? 'MikroTik connecté' : (etat === 'ko' ? 'MikroTik déconnecté' : 'MikroTik…')"></span>
                         <span x-show="env" x-cloak x-text="env.toUpperCase()" class="rounded bg-white/70 px-1 text-[10px] tracking-wide"></span>
                     </div>
-                    <span class="text-sm text-slate-600">{{ Auth::user()->name }}</span>
+                    <span class="text-sm text-slate-600">{{ filled($cyber['nom_admin'] ?? null) ? $cyber['nom_admin'] : Auth::user()->name }}</span>
                     <form method="POST" action="{{ route('logout') }}">
                         @csrf
                         <button type="submit" class="text-sm text-rose-600 hover:text-rose-800">Déconnexion</button>

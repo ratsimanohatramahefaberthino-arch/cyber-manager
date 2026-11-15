@@ -75,7 +75,7 @@ class PosteSessionService
             $tarif   = $session->tarif ?: $this->tarifs->tarifStandard();
             $minutes = intdiv($secondes ?? $session->secondesConsommees(), 60);
 
-            return $this->tarifs->montantPourMinutes($minutes, $tarif);
+            return $this->tarifs->montantTempsReel($minutes, $tarif);
         } catch (\Throwable) {
             return 0;
         }
@@ -176,7 +176,9 @@ class PosteSessionService
             'montant_total'         => $montant,
         ]);
 
-        $poste->update(['etat' => Poste::ETAT_DISPONIBLE]);
+        // Fin de session (fermeture, expiration, poste injoignable) : le poste passe en « Désactivé ».
+        // Il ne redevient disponible que lorsque le gérant clique sur « Activer ».
+        $poste->update(['etat' => Poste::ETAT_DESACTIVE]);
 
         return $session;
     }

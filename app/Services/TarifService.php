@@ -116,6 +116,18 @@ class TarifService
         return intdiv($montant, $tarif->montant_par_minute);
     }
 
+        /**
+     * Montant « temps réel » d'une session poste : STRICTEMENT max(minimum, minutes × prix/min).
+     * Le paramètre d'arrondi n'est volontairement PAS appliqué.
+     */
+    public function montantTempsReel(int $minutes, ?Tarif $tarif = null): int
+    {
+        $tarif ??= $this->tarifStandard();
+
+        return max((int) $tarif->montant_minimum, max(0, $minutes) * (int) $tarif->montant_par_minute);
+    }
+    
+
     public function montantPourMinutes(int $minutes, ?Tarif $tarif = null): int
     {
         $tarif ??= $this->tarifStandard();

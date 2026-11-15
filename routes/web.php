@@ -12,6 +12,9 @@ use App\Http\Controllers\MikroTikStatusController;
 use App\Http\Controllers\WifiAlarmController;
 use App\Http\Controllers\PortailController;
 use App\Http\Controllers\Api\AgentController;
+use App\Http\Controllers\ParametresController;
+use App\Http\Controllers\HistoriqueController;
+use App\Http\Controllers\StatistiqueController;
 
 /*
 |--------------------------------------------------------------------------
@@ -80,6 +83,10 @@ Route::middleware('auth')->group(function () {
     Route::get('/postes',       [PosteController::class, 'index'])->name('postes.index');
     Route::get('/postes/etat',  [PosteController::class, 'etat'])->name('postes.etat');
 
+    // Recharges rapides persistées (doivent rester AVANT les routes {poste})
+    Route::post('/postes/raccourcis',                [PosteController::class, 'ajouterRaccourci'])->name('postes.raccourcis.store');
+    Route::post('/postes/raccourcis/{id}/supprimer', [PosteController::class, 'supprimerRaccourci'])->name('postes.raccourcis.destroy');
+
     Route::get('/postes/{poste}/chat',         [PosteController::class, 'chat'])->name('postes.chat');
     Route::post('/postes/{poste}/message',     [PosteController::class, 'envoyerMessage'])->name('postes.message');
 
@@ -94,6 +101,24 @@ Route::middleware('auth')->group(function () {
     Route::post('/postes/{poste}/arreter',     [PosteController::class, 'arreter'])->name('postes.arreter');
     Route::post('/postes/{poste}/recharger',   [PosteController::class, 'recharger'])->name('postes.recharger');
     Route::post('/postes/{poste}/hotspot',     [PosteController::class, 'enregistrerHotspot'])->name('postes.hotspot');
+
+    // -----------------------------------------------------------------
+    // Paramètres (identité du cyber : nom, logo, couleur…)
+    // -----------------------------------------------------------------
+    Route::get('/parametres',         [ParametresController::class, 'index'])->name('parametres.index');
+    Route::post('/parametres',        [ParametresController::class, 'update'])->name('parametres.update');
+    Route::delete('/parametres/logo', [ParametresController::class, 'supprimerLogo'])->name('parametres.logo.supprimer');
+
+    // -----------------------------------------------------------------
+    // Historique des sessions terminées (liste filtrable + export CSV)
+    // -----------------------------------------------------------------
+    Route::get('/historique',        [HistoriqueController::class, 'index'])->name('historique.index');
+    Route::get('/historique/export', [HistoriqueController::class, 'export'])->name('historique.export');
+
+    // -----------------------------------------------------------------
+    // Statistiques (revenus Postes / Wi-Fi, graphiques)
+    // -----------------------------------------------------------------
+    Route::get('/statistiques', [StatistiqueController::class, 'index'])->name('statistiques.index');
 
     // -----------------------------------------------------------------
     // Profil utilisateur
@@ -214,6 +239,7 @@ Route::prefix('api/agent')->group(function () {
     Route::post('/session/fermer',    [AgentController::class, 'fermerSession']);
     Route::get('/commandes',  [AgentController::class, 'commandes']);
     Route::post('/commandes/{commande}/confirmer', [AgentController::class, 'confirmerCommande']);
+    Route::get('/logo',       [AgentController::class, 'logo'])->name('agent.logo');
     
 });
 

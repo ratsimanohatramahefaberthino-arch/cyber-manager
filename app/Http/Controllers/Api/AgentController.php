@@ -12,6 +12,7 @@ use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Str;
+use App\Models\CyberSetting;
 
 class AgentController extends Controller
 {
@@ -27,14 +28,11 @@ class AgentController extends Controller
             'agent_version'      => ['nullable', 'string', 'max:32'],
         ]);
 
-        $mac = isset($data['adresse_mac'])
-            ? strtoupper(str_replace('-', ':', $data['adresse_mac']))
-            : null;
+        $mac = isset($data['adresse_mac']) ? strtoupper(str_replace('-', ':', $data['adresse_mac'])) : null;
 
         $poste = Poste::where('identifiant_unique', $data['identifiant_unique'])
             ->orWhere(function($q) use ($data) {
-                $q->where('nom_poste', $data['nom_poste'])
-                  ->whereNotNull('identifiant_unique');
+                $q->where('nom_poste', $data['nom_poste'])->whereNotNull('identifiant_unique');
             })->first();
 
         $retourApresPanne = false;
@@ -90,6 +88,7 @@ class AgentController extends Controller
             'etat'                 => $etat,
             'doit_etre_verrouille' => $this->doitEtreVerrouille($etat),
             'session'              => $session ? $this->resumeSession($session) : null,
+            'branding'             => CyberSetting::brandingAgent(), // <-- AJOUT ICI
             'message'              => $nouveau ? 'Poste enregistré.' : 'Poste reconnu.',
         ]);
     }
@@ -97,9 +96,7 @@ class AgentController extends Controller
     public function heartbeat(Request $request, PosteSessionService $sessions): JsonResponse
     {
         $poste = $this->authentifier($request);
-        if ($poste === null) {
-            return response()->json(['ok' => false, 'message' => 'Token invalide.'], 401);
-        }
+        if ($poste === null) return response()->json(['ok' => false, 'message' => 'Token invalide.'], 401);
 
         $data = $request->validate(['adresse_ip' => ['nullable', 'ip']]);
 
@@ -107,9 +104,8 @@ class AgentController extends Controller
         $ancienSigne  = $poste->dernier_heartbeat;
 
         $maj = ['dernier_heartbeat' => now(), 'derniere_communication' => now()];
-        if (!empty($data['adresse_ip'])) {
-            $maj['adresse_ip'] = $data['adresse_ip'];
-        }
+        if (!empty($data['adresse_ip'])) $maj['adresse_ip'] = $data['adresse_ip'];
+        
         if ($poste->etat === Poste::ETAT_HORS_LIGNE) {
             $maj['etat'] = $poste->sessionActive() ? Poste::ETAT_OCCUPE : Poste::ETAT_DISPONIBLE;
         }
@@ -131,34 +127,31 @@ class AgentController extends Controller
             'etat'                 => $etat,
             'doit_etre_verrouille' => $this->doitEtreVerrouille($etat),
             'session'              => $session ? $this->resumeSession($session) : null,
+            'branding'             => CyberSetting::brandingAgent(), // <-- AJOUT ICI
         ]);
     }
 
     public function activer(Request $request, PosteSessionService $sessions): JsonResponse
     {
         $poste = $this->authentifier($request);
-        if ($poste === null) {
-            return response()->json(['ok' => false, 'message' => 'Token invalide.'], 401);
-        }
+        if ($poste === null) return response()->json(['ok' => false, 'message' => 'Token invalide.'], 401);
 
         [$code, $corps, $posteFinal] = DB::transaction(function () use ($poste, $sessions) {
             $p = Poste::whereKey($poste->id)->lockForUpdate()->first();
             $p->update(['dernier_heartbeat' => now(), 'derniere_communication' => now()]);
 
             switch ($p->etatAffiche()) {
-                case Poste::ETAT_DESACTIVE:
-                    return [403, ['ok' => false, 'message' => 'Poste désactivé, contactez le gérant.'], null];
-                case Poste::ETAT_SUSPENDU:
-                    return [409, ['ok' => false, 'message' => "Votre session est en pause. Adressez-vous à l'accueil."], null];
-                case Poste::ETAT_VERROUILLE:
-                    return [409, ['ok' => false, 'message' => "Ce poste est verrouillé par l'administrateur."], null];
+                case Poste::ETAT_DESACTIVE: return [403, ['ok' => false, 'message' => 'Poste désactivé, contactez le gérant.'], null];
+                case Poste::ETAT_SUSPENDU: return [409, ['ok' => false, 'message' => "Votre session est en pause."], null];
+                case Poste::ETAT_VERROUILLE: return [409, ['ok' => false, 'message' => "Ce poste est verrouillé."], null];
                 case Poste::ETAT_OCCUPE:
                     $s = $p->sessionActive();
-                    return [200, [
-                        'ok'      => true,
-                        'message' => 'Session déjà active.',
-                        'session' => $s ? $this->resumeSession($s) : null,
-                    ], $s ? $p : null];
+                    return [200, ['ok' => true, 'message' => 'Session déjà active.', 'session' => $s ? $this->resumeSession($s) : null], $s ? $p : null];
+            }
+
+            // Garde-fou : seul un poste « disponible » peut être activé depuis le client
+            if ($p->etatAffiche() !== Poste::ETAT_DISPONIBLE) {
+                return [409, ['ok' => false, 'message' => "Ce poste n'est pas disponible."], null];
             }
 
             $session = $sessions->creerSession($p, 'postpaye', null);
@@ -166,18 +159,12 @@ class AgentController extends Controller
             $this->tracer($p, 'demarrer', 'Activation depuis le poste client', ['session_id' => $session->id, 'type' => 'postpaye']);
             $p->update(['etat' => Poste::ETAT_OCCUPE]);
 
-            return [200, [
-                'ok'      => true,
-                'message' => 'Poste activé.',
-                'session' => $this->resumeSession($session),
-            ], $p];
+            return [200, ['ok' => true, 'message' => 'Poste activé.', 'session' => $this->resumeSession($session)], $p];
         });
 
         if ($posteFinal !== null) {
             $reseau = $sessions->connecterReseau($posteFinal);
-            if ($reseau === false) {
-                $corps['avertissement'] = "Connexion Internet momentanément indisponible. Prévenez l'accueil.";
-            }
+            if ($reseau === false) $corps['avertissement'] = "Connexion Internet momentanément indisponible.";
         }
 
         return response()->json($corps, $code);
@@ -186,88 +173,59 @@ class AgentController extends Controller
     public function suspendreSession(Request $request, PosteSessionService $sessions): JsonResponse
     {
         $poste = $this->authentifier($request);
-        if ($poste === null) {
-            return response()->json(['ok' => false, 'message' => 'Token invalide.'], 401);
-        }
+        if ($poste === null) return response()->json(['ok' => false, 'message' => 'Token invalide.'], 401);
 
         $ok = DB::transaction(function () use ($poste, $sessions) {
             $p = Poste::whereKey($poste->id)->lockForUpdate()->first();
             $p->update(['dernier_heartbeat' => now(), 'derniere_communication' => now()]);
-
             $session = $p->sessionActive();
-            if ($session === null || !$sessions->suspendre($p)) {
-                return false;
-            }
-
+            if ($session === null || !$sessions->suspendre($p)) return false;
             $this->tracer($p, 'suspendre', 'Suspension depuis le widget client', ['session_id' => $session->id]);
             return true;
         });
 
-        if (!$ok) {
-            return response()->json(['ok' => false, 'message' => 'Aucune session active à suspendre.'], 409);
-        }
+        if (!$ok) return response()->json(['ok' => false, 'message' => 'Aucune session active à suspendre.'], 409);
 
         $corps = ['ok' => true, 'message' => 'Session suspendue.'];
-        if ($sessions->deconnecterReseau($poste) === false) {
-            $corps['avertissement'] = "Coupure Internet non confirmée. Prévenez l'accueil.";
-        }
-
+        if ($sessions->deconnecterReseau($poste) === false) $corps['avertissement'] = "Coupure Internet non confirmée.";
         return response()->json($corps);
     }
 
     public function reprendreSession(Request $request, PosteSessionService $sessions): JsonResponse
     {
         $poste = $this->authentifier($request);
-        if ($poste === null) {
-            return response()->json(['ok' => false, 'message' => 'Token invalide.'], 401);
-        }
+        if ($poste === null) return response()->json(['ok' => false, 'message' => 'Token invalide.'], 401);
 
         $ok = DB::transaction(function () use ($poste, $sessions) {
             $p = Poste::whereKey($poste->id)->lockForUpdate()->first();
-            if ($p === null || !$sessions->reprendre($p)) {
-                return false;
-            }
+            if ($p === null || !$sessions->reprendre($p)) return false;
             $this->tracer($p, 'reprendre', 'Reprise depuis l\'écran de verrouillage client');
             return true;
         });
 
-        if (!$ok) {
-            return response()->json(['ok' => false, 'message' => 'Aucune session à reprendre.'], 409);
-        }
+        if (!$ok) return response()->json(['ok' => false, 'message' => 'Aucune session à reprendre.'], 409);
 
         $corps = ['ok' => true, 'message' => 'Session reprise.'];
-        if ($sessions->connecterReseau($poste) === false) {
-            $corps['avertissement'] = "Connexion Internet non confirmée. Prévenez l'accueil.";
-        }
-
+        if ($sessions->connecterReseau($poste) === false) $corps['avertissement'] = "Connexion Internet non confirmée.";
         return response()->json($corps);
     }
 
     private function doitEtreVerrouille(string $etat): bool
     {
-        return in_array($etat, [
-            Poste::ETAT_DISPONIBLE,
-            Poste::ETAT_VERROUILLE,
-            Poste::ETAT_DESACTIVE,
-            Poste::ETAT_SUSPENDU,
-        ], true);
+        return in_array($etat, [Poste::ETAT_DISPONIBLE, Poste::ETAT_VERROUILLE, Poste::ETAT_DESACTIVE, Poste::ETAT_SUSPENDU], true);
     }
 
     public function fermerSession(Request $request, PosteSessionService $sessions): JsonResponse
     {
         $poste = $this->authentifier($request);
-        if ($poste === null) {
-            return response()->json(['ok' => false, 'message' => 'Token invalide.'], 401);
-        }
+        if ($poste === null) return response()->json(['ok' => false, 'message' => 'Token invalide.'], 401);
 
         $resultat = DB::transaction(function () use ($poste, $sessions) {
             $p = Poste::whereKey($poste->id)->lockForUpdate()->first();
             $p->update(['dernier_heartbeat' => now(), 'derniere_communication' => now()]);
 
             $session = $sessions->cloturer($p, 'client');
-            if ($session === null) {
-                return null;
-            }
+            if ($session === null) return null;
 
             $p->update(['etat' => Poste::ETAT_DESACTIVE]);
             PosteCommande::create(['poste_id' => $p->id, 'type' => 'verrouiller']);
@@ -276,88 +234,60 @@ class AgentController extends Controller
             return [$p, (int) $session->montant_total];
         });
 
-        if ($resultat === null) {
-            return response()->json(['ok' => false, 'message' => 'Aucune session active à fermer.'], 409);
-        }
+        if ($resultat === null) return response()->json(['ok' => false, 'message' => 'Aucune session active à fermer.'], 409);
 
         [$posteFinal, $montant] = $resultat;
 
         $corps = ['ok' => true, 'message' => 'Session terminée.', 'montant' => $montant];
-        if ($sessions->deconnecterReseau($posteFinal) === false) {
-            $corps['avertissement'] = "Coupure Internet non confirmée. Prévenez l'accueil.";
-        }
-
+        if ($sessions->deconnecterReseau($posteFinal) === false) $corps['avertissement'] = "Coupure Internet non confirmée.";
         return response()->json($corps);
     }
 
     public function message(Request $request): JsonResponse
     {
         $poste = $this->authentifier($request);
-        if ($poste === null) {
-            return response()->json(['ok' => false, 'message' => 'Token invalide.'], 401);
-        }
+        if ($poste === null) return response()->json(['ok' => false, 'message' => 'Token invalide.'], 401);
 
         $data  = $request->validate(['texte' => ['required', 'string', 'max:500']]);
         $texte = trim($data['texte']);
-        if ($texte === '') {
-            return response()->json(['ok' => false, 'message' => 'Message vide.'], 422);
-        }
+        if ($texte === '') return response()->json(['ok' => false, 'message' => 'Message vide.'], 422);
 
-        $m = PosteMessage::create([
-            'poste_id' => $poste->id,
-            'sens'     => PosteMessage::SENS_CLIENT,
-            'contenu'  => $texte,
-        ]);
-
+        $m = PosteMessage::create(['poste_id' => $poste->id, 'sens' => PosteMessage::SENS_CLIENT, 'contenu' => $texte]);
         return response()->json(['ok' => true, 'message' => 'Message envoyé.', 'id' => $m->id]);
     }
 
     public function commandes(Request $request): JsonResponse
     {
         $poste = $this->authentifier($request);
-        if ($poste === null) {
-            return response()->json(['ok' => false, 'message' => 'Token invalide.'], 401);
-        }
+        if ($poste === null) return response()->json(['ok' => false, 'message' => 'Token invalide.'], 401);
 
-        $commandes = PosteCommande::where('poste_id', $poste->id)
-            ->where('statut', 'en_attente')
-            ->orderBy('id')
-            ->limit(10)
-            ->get();
-
-        foreach ($commandes as $c) {
-            $c->update(['statut' => 'recue', 'recue_at' => now()]);
-        }
+        $commandes = PosteCommande::where('poste_id', $poste->id)->where('statut', 'en_attente')->orderBy('id')->limit(10)->get();
+        foreach ($commandes as $c) $c->update(['statut' => 'recue', 'recue_at' => now()]);
 
         return response()->json([
             'ok'        => true,
-            'commandes' => $commandes->map(fn ($c) => [
-                'id'      => $c->id,
-                'type'    => $c->type,
-                'payload' => $c->payload,
-            ])->values(),
+            'commandes' => $commandes->map(fn ($c) => ['id' => $c->id, 'type' => $c->type, 'payload' => $c->payload])->values(),
         ]);
     }
 
     public function confirmerCommande(Request $request, PosteCommande $commande): JsonResponse
     {
         $poste = $this->authentifier($request);
-        if ($poste === null || $commande->poste_id !== $poste->id) {
-            return response()->json(['ok' => false], 401);
-        }
+        if ($poste === null || $commande->poste_id !== $poste->id) return response()->json(['ok' => false], 401);
 
-        $data = $request->validate([
-            'succes'  => ['required', 'boolean'],
-            'message' => ['nullable', 'string', 'max:500'],
-        ]);
-
-        $commande->update([
-            'statut'      => $data['succes'] ? 'executee' : 'echouee',
-            'resultat'    => $data['message'] ?? null,
-            'executee_at' => now(),
-        ]);
-
+        $data = $request->validate(['succes' => ['required', 'boolean'], 'message' => ['nullable', 'string', 'max:500']]);
+        $commande->update(['statut' => $data['succes'] ? 'executee' : 'echouee', 'resultat' => $data['message'] ?? null, 'executee_at' => now()]);
         return response()->json(['ok' => true]);
+    }
+
+    /** Logo du cyber (public : pas de token requis). */
+    public function logo()
+    {
+        $chemin = CyberSetting::logoChemin();
+        if ($chemin === null) {
+            return response()->json(['ok' => false, 'message' => 'Aucun logo.'], 404);
+        }
+        return response()->file($chemin, ['Cache-Control' => 'no-cache']);
     }
 
     private function authentifier(Request $request): ?Poste
@@ -370,13 +300,8 @@ class AgentController extends Controller
     private function tracer(Poste $poste, string $type, string $resultat, array $payload = []): void
     {
         PosteCommande::create([
-            'poste_id'    => $poste->id,
-            'type'        => $type,
-            'payload'     => $payload + ['origine' => 'client'],
-            'statut'      => 'executee',
-            'resultat'    => $resultat,
-            'recue_at'    => now(),
-            'executee_at' => now(),
+            'poste_id' => $poste->id, 'type' => $type, 'payload' => $payload + ['origine' => 'client'],
+            'statut' => 'executee', 'resultat' => $resultat, 'recue_at' => now(), 'executee_at' => now(),
         ]);
     }
 
@@ -387,16 +312,40 @@ class AgentController extends Controller
         $prevue  = (int) $session->duree_prevue;
         $restant = ($mode === 'forfait' && $prevue > 0) ? max(0, $prevue * 60 - $ecoule) : null;
 
+        // Calcul du forfait total (initial + recharges)
+        $forfaitTotal = 0;
+        if ($mode === 'forfait') {
+            $tarif = app(\App\Services\TarifService::class)->tarifStandard();
+            $forfaitTotal = app(\App\Services\TarifService::class)->montantPourMinutes($prevue, $tarif);
+        }
+
+        // Paramètres tarifaires envoyés au widget : même formule que l'interface admin
+        $tarifInfo = ['par_minute' => 20, 'minimum' => 300, 'arrondi_actif' => false, 'unite' => 0, 'seuil' => 0];
+        try {
+            $t = $session->tarif ?: app(\App\Services\TarifService::class)->tarifStandard();
+            $tarifInfo = [
+                'par_minute'    => (int) $t->montant_par_minute,
+                'minimum'       => (int) $t->montant_minimum,
+                'arrondi_actif' => (bool) $t->arrondi_actif,
+                'unite'         => (int) $t->unite_arrondi,
+                'seuil'         => (int) $t->seuil_arrondi,
+            ];
+        } catch (\Throwable) {
+            // tarif introuvable : valeurs par défaut ci-dessus
+        }
+
         return [
             'id'               => $session->id,
             'mode'             => $mode,
             'date_heure_debut' => $session->date_heure_debut?->toIso8601String(),
             'date_heure_fin'   => $session->date_heure_fin_prevue?->toIso8601String(),
             'duree_prevue'     => $prevue,
+            'forfait_total'    => $forfaitTotal,
             'montant_actuel'   => app(PosteSessionService::class)->montant($session),
             'etat'             => $session->etat,
             'ecoule_s'         => $ecoule,
             'restant_s'        => $restant,
+            'tarif'            => $tarifInfo,
         ];
     }
 }

@@ -1,11 +1,29 @@
 @extends('layouts.cyber-manager', ['title' => 'Postes — Cyber Manager'])
 
 @section('content')
+{{-- Styles volontairement en CSS "pur" : ils ne dépendent pas de la compilation Tailwind (cause des modales géantes / z-index ignorés) --}}
+<style>
+    .cm-overlay { position: fixed; top: 0; right: 0; bottom: 0; left: 0; display: flex; align-items: center; justify-content: center; padding: 16px; }
+    .cm-backdrop { position: absolute; top: 0; right: 0; bottom: 0; left: 0; background: rgba(15, 23, 42, .6); }
+    .cm-confirm { position: relative; width: 100%; max-width: 22rem; background: #fff; border-radius: 14px; padding: 22px 20px; text-align: center; box-shadow: 0 25px 50px -12px rgba(0, 0, 0, .35); }
+    .cm-confirm h3 { font-size: 16px; font-weight: 700; color: #0f172a; margin-bottom: 8px; }
+    .cm-confirm p { font-size: 13px; color: #64748b; margin-bottom: 20px; }
+    .cm-bascule { border: 1px solid #6366f1; background: #eef2ff; color: #4338ca; border-radius: 8px; padding: 5px 12px; font-size: 12px; font-weight: 600; cursor: pointer; transition: all .15s; white-space: nowrap; }
+    .cm-bascule:hover { background: #4f46e5; color: #fff; border-color: #4f46e5; }
+    .cm-err { color: #dc2626; font-size: 14px; font-weight: 700; margin-top: 8px; line-height: 1.3; }
+    .cm-num { width: 5.5rem; max-width: 100%; }
+    .cm-table-wrap { max-height: 13rem; overflow-y: auto; border: 1px solid #e2e8f0; border-radius: 8px; }
+    .cm-table { width: 100%; table-layout: fixed; border-collapse: collapse; font-size: 14px; }
+    .cm-table th { position: sticky; top: 0; background: #f1f5f9; text-align: left; padding: 8px; font-size: 12px; border-bottom: 1px solid #e2e8f0; }
+    .cm-table td { padding: 8px; border-bottom: 1px solid #f1f5f9; white-space: nowrap; }
+</style>
+
 <script>
 const POSTES_URL = @json(url('/postes'));
 const TARIFS_RACCOURCIS = @json($tarifs);
 const TARIF_MINUTE = {{ $tarif_minute ?? 20 }};
 const TARIF_MIN = {{ $tarif_min ?? 300 }};
+const TARIF_ARRONDI = @json($tarif_arrondi ?? ['actif' => false, 'unite' => 0, 'seuil' => 0]);
 
 const COULEURS = { disponible: '#22c55e', occupe: '#f59e0b', suspendu: '#8b5cf6', verrouille: '#ef4444', desactive: '#94a3b8', hors_ligne: '#94a3b8' };
 const LIBELLES = { disponible: 'Disponible', occupe: 'Utilisé', suspendu: 'En pause', verrouille: 'Verrouillé', desactive: 'Désactivé', hors_ligne: 'Non présent' };
@@ -33,6 +51,13 @@ function fmtDuree(s) {
     return `${p(Math.floor(s / 3600))}:${p(Math.floor((s % 3600) / 60))}:${p(s % 60)}`;
 }
 const fmtAr = n => (Number(n) || 0).toLocaleString('fr-FR') + ' Ar';
+
+// Montant temps réel : STRICTEMENT max(minimum, minutes × prix/min), SANS arrondi.
+// Même formule que TarifService::montantTempsReel() (Laravel) et que le widget C#.
+function montantPourMinutes(minutes) {
+    return Math.max(TARIF_MIN, Math.max(0, Math.floor(minutes)) * TARIF_MINUTE);
+}
+
 const BOUTONS = { vert: 'bg-emerald-600 hover:bg-emerald-700 text-white', rouge: 'bg-rose-600 hover:bg-rose-700 text-white', ambre: 'bg-amber-500 hover:bg-amber-600 text-white', violet: 'bg-violet-600 hover:bg-violet-700 text-white', bleu: 'bg-sky-600 hover:bg-sky-700 text-white', gris: 'bg-slate-600 hover:bg-slate-700 text-white' };
 
 function postesApp() {
@@ -41,13 +66,15 @@ function postesApp() {
         selId: null,
         menu: { ouvert: false, x: 0, y: 0, id: null },
         modal: null,
-        confirm: { ouvert: false, action: null, id: null, titre: '', texte: '' },
-        form: { montantManuel: '', h: 0, m: 0, minutes: 30 },
+        confirm: { ouvert: false, action: null, id: null, titre: '', texte: '', callback: null },
+        form: { montantManuel: '', h: 0, m: 0 },
         lignesForfait: [...TARIFS_RACCOURCIS],
         ligneSelectionnee: null,
         newLigne: { type: 'montant', montant: '', h: 0, m: 0 },
+        erreurLigne: '',
+        enregLigne: false,
         hs: { username: '', password: '', voir: false, erreur: '' },
-        chat: [], chatDernier: 0, texte: '',
+        chat: [], chatDernier: 0, chatSession: null, texte: '', envoiChat: false,
         nonLusVus: {},
         maintenant: Date.now(), recuLe: Date.now(),
         horsServeur: false, notif: null, enCours: null,
@@ -57,7 +84,13 @@ function postesApp() {
             setInterval(() => this.maintenant = Date.now(), 1000);
             setInterval(() => this.rafraichir(), 3000);
             document.addEventListener('click', () => this.menu.ouvert = false);
-            document.addEventListener('keydown', e => { if (e.key === 'Escape') { this.menu.ouvert = false; this.modal = null; this.confirm.ouvert = false; } });
+            document.addEventListener('keydown', e => {
+                if (e.key === 'Escape') {
+                    // Escape ferme d'abord la confirmation (au premier plan), pas la modale dessous
+                    if (this.confirm.ouvert) { this.confirm.ouvert = false; return; }
+                    this.menu.ouvert = false; this.modal = null;
+                }
+            });
         },
 
         get sel() { return this.postes.find(p => p.id === this.selId) || null; },
@@ -74,18 +107,31 @@ function postesApp() {
         ecoule(p) { return p.session ? fmtDuree(p.session.ecoule_s + this.decalage(p)) : '—'; },
         restant(p) { if (!p.session || p.session.restant_s === null) return '—'; return fmtDuree(p.session.restant_s - this.decalage(p)); },
         tempsListe(p) { if (!p.session) return ''; return p.session.restant_s !== null ? this.restant(p) : this.ecoule(p); },
-        
+
+        // Montant temps réel (forfait ET postpayé) : même formule que le serveur et le widget client
         montantActuel(p) {
             if (!p.session) return '—';
             if (p.session.mode === 'libre') return 'Sans facturation';
-            if (p.session.mode === 'forfait') return fmtAr(p.session.montant);
-            
-            // Postpayé : montant minimum puis temps réel
-            const sec = p.session.ecoule_s + this.decalage(p);
-            const min = Math.floor(sec / 60);
-            const m = Math.max(TARIF_MIN, min * TARIF_MINUTE);
-            return fmtAr(m); 
+            if (p.session.etat === 'terminee') return fmtAr(p.session.montant);   // montant final figé
+
+            let sec = p.session.ecoule_s + this.decalage(p);
+            if (p.session.mode === 'forfait' && p.session.duree_min) sec = Math.min(sec, p.session.duree_min * 60);
+            return fmtAr(montantPourMinutes(Math.floor(sec / 60)));
         },
+
+        // Heure de début : horodatage ISO du serveur affiché à l'heure réelle (plus de décalage d'1 h)
+        debutAffiche(p) {
+            const s = p?.session;
+            if (!s) return '—';
+            if (s.debut_iso) {
+                const d = new Date(s.debut_iso);
+                if (!isNaN(d.getTime())) return d.toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+            }
+            return s.debut || '—';
+        },
+
+        // Durée minimale (min) correspondant au montant minimum du tarif
+        dureeMinimale() { return TARIF_MINUTE > 0 ? Math.ceil(TARIF_MIN / TARIF_MINUTE) : 0; },
 
         async rafraichir() {
             try {
@@ -96,22 +142,32 @@ function postesApp() {
                     if ((p.non_lus || 0) > avant && p.id !== this.selId) this.afficher(`Nouveau message de ${p.nom}`, true);
                     this.nonLusVus[p.id] = p.non_lus || 0;
                 }
-                // Fusion intelligente avec les postes existants pour ne pas perdre le chat
-                this.postes = d.postes.map(nouveau => {
-                    const ancien = this.postes.find(x => x.id === nouveau.id);
-                    return nouveau;
-                });
+                this.postes = d.postes;
                 this.recuLe = Date.now();
                 this.horsServeur = false;
                 if (this.selId && !this.sel) this.selId = null;
+
+                // Nouvelle session (ou plus de session) sur le poste sélectionné : on repart d'un chat propre
+                if (this.selId) {
+                    const sidNow = this.sel?.session?.id ?? null;
+                    if (sidNow !== this.chatSession) {
+                        this.chatSession = sidNow;
+                        this.chat = []; this.chatDernier = 0;
+                        if (sidNow) await this.chargerChat(true);
+                    }
+                }
                 if (this.selId && (this.sel?.etat === 'occupe' || this.sel?.etat === 'desactive')) this.chargerChat(false);
             } catch (e) { this.horsServeur = true; }
         },
 
-        choisir(id) { this.selId = id; this.chat = []; this.chatDernier = 0; if(this.sel?.session) this.chargerChat(true); },
+        choisir(id) {
+            this.selId = id; this.chat = []; this.chatDernier = 0;
+            this.chatSession = this.sel?.session?.id ?? null;
+            if (this.sel?.session) this.chargerChat(true);
+        },
 
         ouvrirMenu(e, id) {
-            this.selId = id;
+            if (this.selId !== id) this.choisir(id);
             this.menu = { ouvert: true, x: Math.min(e.clientX, window.innerWidth - 220), y: Math.min(e.clientY, window.innerHeight - 320), id };
         },
 
@@ -119,15 +175,16 @@ function postesApp() {
             const def = (this.postes.find(p => p.id === id)?.actions || []).find(a => a.cle === action);
             if (!def) return;
             this.menu.ouvert = false;
-            this.selId = id;
-            if (def.modal) { 
-                this.form = { montantManuel: '', h: 0, m: 0, minutes: 30 };
+            if (this.selId !== id) this.choisir(id);
+            if (def.modal) {
+                this.form = { montantManuel: '', h: 0, m: 0 };
                 this.ligneSelectionnee = null;
-                this.modal = action; 
-                return; 
+                this.erreurLigne = '';
+                this.modal = action;
+                return;
             }
             if (def.confirm) {
-                this.confirm = { ouvert: true, action, id, titre: def.label, texte: def.confirm };
+                this.confirm = { ouvert: true, action, id, titre: def.label, texte: def.confirm, callback: null };
                 return;
             }
             this.executer(id, action, {});
@@ -153,20 +210,66 @@ function postesApp() {
         },
 
         // Gestion modale forfait
-        ajouterLigne() {
+        async ajouterLigne() {
+            this.erreurLigne = '';
             let m = 0;
-            if (this.newLigne.type === 'montant') m = Math.round(this.newLigne.montant);
-            else m = ((Number(this.newLigne.h) * 60) + Number(this.newLigne.m)) * TARIF_MINUTE;
-            
-            if (m <= 0) return;
-            this.lignesForfait.push({ montant: m, duree: Math.round(m / TARIF_MINUTE) });
-            this.lignesForfait.sort((a,b) => a.montant - b.montant);
-            this.newLigne = { type: 'montant', montant: '', h: 0, m: 0 };
-        },
-        supprimerLigne(index) {
-            if (confirm('Supprimer cette ligne ?')) {
-                this.lignesForfait.splice(index, 1);
+            if (this.newLigne.type === 'montant') m = Math.round(Number(this.newLigne.montant));
+            else m = (((Number(this.newLigne.h) || 0) * 60) + (Number(this.newLigne.m) || 0)) * TARIF_MINUTE;
+
+            if (!m || m <= 0) { this.erreurLigne = 'Saisissez un montant ou une durée valide.'; return; }
+            if (m < TARIF_MIN) { this.erreurLigne = `Montant trop faible : le minimum est de ${fmtAr(TARIF_MIN)}.`; return; }
+
+            const duree = Math.round(m / TARIF_MINUTE);
+            if (this.lignesForfait.some(l => Number(l.montant) === m || Number(l.duree) === duree)) {
+                this.erreurLigne = 'Une recharge identique (même montant ou même durée) existe déjà dans le tableau.';
+                return;
             }
+            if (this.enregLigne) return;
+            this.enregLigne = true;
+
+            // Enregistrement côté serveur : la recharge persiste jusqu'à suppression manuelle
+            try {
+                const r = await cmFetch(POSTES_URL + '/raccourcis', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+                    body: JSON.stringify({ montant: m })
+                });
+                const d = await r.json().catch(() => ({}));
+                if (!r.ok || !d.ok) {
+                    this.erreurLigne = d.message || 'Enregistrement impossible.';
+                } else {
+                    this.lignesForfait.push({ id: d.id, montant: d.montant, duree: d.duree });
+                    this.lignesForfait.sort((a, b) => a.montant - b.montant);
+                    this.newLigne = { type: this.newLigne.type, montant: '', h: 0, m: 0 };
+                }
+            } catch (e) { this.erreurLigne = 'Serveur injoignable.'; }
+            this.enregLigne = false;
+        },
+        demanderSupprimerLigne(index) {
+            const ligne = this.lignesForfait[index];
+            this.confirm = {
+                ouvert: true,
+                action: 'supprimer_ligne',
+                id: null,
+                titre: 'Supprimer',
+                texte: 'Supprimer cette recharge du tableau ?',
+                callback: async () => {
+                    this.confirm.ouvert = false;
+                    if (!ligne) return;
+                    if (ligne.id) {
+                        try {
+                            const r = await cmFetch(`${POSTES_URL}/raccourcis/${ligne.id}/supprimer`, {
+                                method: 'POST',
+                                headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+                                body: '{}'
+                            });
+                            const d = await r.json().catch(() => ({}));
+                            if (!r.ok || !d.ok) { this.afficher(d.message || 'Suppression impossible.', false); return; }
+                        } catch (e) { this.afficher('Serveur injoignable.', false); return; }
+                    }
+                    this.lignesForfait = this.lignesForfait.filter(l => Number(l.montant) !== Number(ligne.montant));
+                }
+            };
         },
         selectionnerLigne(l) {
             this.ligneSelectionnee = l.montant;
@@ -174,19 +277,19 @@ function postesApp() {
             this.form.h = 0; this.form.m = 0;
         },
 
-        calculerDepuisMontant() { 
+        calculerDepuisMontant() {
             this.ligneSelectionnee = null;
-            const m = Number(this.form.montantManuel); 
-            if (m > 0) { 
+            const m = Number(this.form.montantManuel);
+            if (m > 0) {
                 const totalMin = m / TARIF_MINUTE;
-                this.form.h = Math.floor(totalMin / 60); 
-                this.form.m = Math.round(totalMin % 60); 
-            } 
+                this.form.h = Math.floor(totalMin / 60);
+                this.form.m = Math.round(totalMin % 60);
+            }
         },
-        calculerDepuisDuree() { 
+        calculerDepuisDuree() {
             this.ligneSelectionnee = null;
-            const d = (Number(this.form.h) * 60) + Number(this.form.m); 
-            if (d > 0) this.form.montantManuel = d * TARIF_MINUTE; 
+            const d = (Number(this.form.h) * 60) + Number(this.form.m);
+            if (d > 0) this.form.montantManuel = d * TARIF_MINUTE;
         },
 
         validerModal() {
@@ -198,6 +301,15 @@ function postesApp() {
 
             if (montant <= 0) { this.afficher("Veuillez sélectionner ou saisir un montant.", false); return; }
             const duree = Math.round(montant / TARIF_MINUTE);
+
+            // Minimum : uniquement à la PREMIÈRE activation (Démarrer). Les recharges n'ont pas cette restriction.
+            if (this.modal === 'demarrer') {
+                const dMin = this.dureeMinimale();
+                if (montant < TARIF_MIN || duree < dMin) {
+                    this.afficher(`Première activation : minimum ${fmtAr(TARIF_MIN)} (${dMin} min).`, false, 4500);
+                    return;
+                }
+            }
 
             if (this.modal === 'demarrer') this.executer(id, 'demarrer', { type: 'forfait', duree_minutes: duree });
             else this.executer(id, 'recharger', { minutes: duree });
@@ -212,9 +324,10 @@ function postesApp() {
                 if (id !== this.selId) return;
                 if (reset) this.chat = [];
                 if (d.messages?.length) {
-                    // Filtrer les doublons pour garder l'affichage instantané
+                    // Anti-doublon : un message n'est ajouté que si son id n'est pas déjà présent
                     const existants = new Set(this.chat.map(m => m.id));
-                    d.messages.forEach(m => { if (!existants.has(m.id)) this.chat.push(m); });
+                    d.messages.forEach(m => { if (!existants.has(m.id)) { this.chat.push(m); existants.add(m.id); } });
+                    this.chat.sort((a, b) => a.id - b.id);
                     this.chatDernier = d.messages[d.messages.length - 1].id;
                     this.$nextTick(() => { const b = this.$refs.chatBox; if (b) b.scrollTop = b.scrollHeight; });
                 }
@@ -223,16 +336,25 @@ function postesApp() {
 
         async envoyerMessage() {
             const t = this.texte.trim();
-            if (!t || !this.selId) return;
-            
-            // Optimistic UI : on ajoute tout de suite le message à la liste
-            const msgLocal = { id: Date.now(), sens: 'admin', contenu: t, heure: new Date().toLocaleTimeString('fr-FR', {hour: '2-digit', minute:'2-digit'}) };
-            this.chat.push(msgLocal);
-            this.texte = '';
-            this.$nextTick(() => { const b = this.$refs.chatBox; if (b) b.scrollTop = b.scrollHeight; });
-
-            await this.executer(this.selId, 'message', { message: t });
-            this.chargerChat(false);
+            if (!t || !this.selId || this.envoiChat) return;   // anti double-clic
+            const id = this.selId;
+            this.envoiChat = true;
+            try {
+                const r = await cmFetch(`${POSTES_URL}/${id}/message`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ message: t }) });
+                const d = await r.json().catch(() => ({}));
+                if (r.ok && d.ok) {
+                    this.texte = '';
+                    // On ajoute avec l'ID RÉEL du serveur : si le polling l'a déjà apporté, il n'est pas dupliqué
+                    if (id === this.selId && d.id && !this.chat.some(m => m.id === d.id)) {
+                        this.chat.push({ id: d.id, sens: 'admin', contenu: t, heure: d.heure || new Date().toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' }) });
+                        this.chat.sort((a, b) => a.id - b.id);
+                    }
+                    this.$nextTick(() => { const b = this.$refs.chatBox; if (b) b.scrollTop = b.scrollHeight; });
+                } else {
+                    this.afficher(d.message || 'Message non envoyé.', false);
+                }
+            } catch (e) { this.afficher('Serveur injoignable.', false); }
+            this.envoiChat = false;
         },
 
         afficher(msg, ok, ms = 3000) { this.notif = { msg, ok }; setTimeout(() => this.notif = null, ms); },
@@ -289,14 +411,15 @@ function postesApp() {
                                 <span class="w-40 shrink-0 text-right text-sm text-slate-500">État</span>
                                 <span class="flex-1 rounded border border-amber-100 bg-amber-50/70 px-3 py-1.5 font-mono text-sm text-slate-900 font-bold" x-text="libelle(sel.etat)"></span>
                             </div>
-                            
+
                             <template x-if="sel.session">
                                 <div class="space-y-2">
                                     <div class="flex items-center gap-3"><span class="w-40 shrink-0 text-right text-sm text-slate-500">Type</span><span class="flex-1 rounded border border-amber-100 bg-amber-50/70 px-3 py-1.5 font-mono text-sm text-slate-900" x-text="mode(sel.session.mode)"></span></div>
-                                    <div class="flex items-center gap-3"><span class="w-40 shrink-0 text-right text-sm text-slate-500">Début</span><span class="flex-1 rounded border border-amber-100 bg-amber-50/70 px-3 py-1.5 font-mono text-sm text-slate-900" x-text="sel.session.debut"></span></div>
+                                    <div class="flex items-center gap-3" x-show="sel.session.mode === 'forfait'"><span class="w-40 shrink-0 text-right text-sm text-slate-500">Forfait</span><span class="flex-1 rounded border border-amber-100 bg-amber-50/70 px-3 py-1.5 font-mono text-sm text-slate-900" x-text="fmtAr(sel.session.forfait_total)"></span></div>
+                                    <div class="flex items-center gap-3"><span class="w-40 shrink-0 text-right text-sm text-slate-500">Début</span><span class="flex-1 rounded border border-amber-100 bg-amber-50/70 px-3 py-1.5 font-mono text-sm text-slate-900" x-text="debutAffiche(sel)"></span></div>
                                     <div class="flex items-center gap-3" x-show="sel.session.mode === 'forfait'"><span class="w-40 shrink-0 text-right text-sm text-slate-500">Temps restant</span><span class="flex-1 rounded border border-amber-100 bg-amber-50/70 px-3 py-1.5 font-mono text-sm text-slate-900 font-bold" x-text="restant(sel)"></span></div>
                                     <div class="flex items-center gap-3" x-show="sel.session.mode !== 'forfait'"><span class="w-40 shrink-0 text-right text-sm text-slate-500">Temps écoulé</span><span class="flex-1 rounded border border-amber-100 bg-amber-50/70 px-3 py-1.5 font-mono text-sm text-slate-900" x-text="ecoule(sel)"></span></div>
-                                    <div class="flex items-center gap-3"><span class="w-40 shrink-0 text-right text-sm text-slate-500">Montant actuel</span><span class="flex-1 rounded border border-amber-100 bg-amber-50/70 px-3 py-1.5 font-mono text-sm text-slate-900 font-bold" x-text="montantActuel(sel)"></span></div>
+                                    <div class="flex items-center gap-3"><span class="w-40 shrink-0 text-right text-sm text-slate-500" x-text="sel.session.etat === 'terminee' ? 'Montant final' : 'Montant actuel'"></span><span class="flex-1 rounded border border-amber-100 bg-amber-50/70 px-3 py-1.5 font-mono text-sm text-slate-900 font-bold" x-text="montantActuel(sel)"></span></div>
                                     <div class="flex items-center gap-3"><span class="w-40 shrink-0 text-right text-sm text-slate-500">HotSpot</span><span class="flex-1 rounded border border-amber-100 bg-amber-50/70 px-3 py-1.5 font-mono text-sm text-slate-900" x-text="sel.hotspot_username || 'Non configuré'"></span></div>
                                 </div>
                             </template>
@@ -313,10 +436,11 @@ function postesApp() {
                                 </template>
                                 <p x-show="chat.length === 0" x-cloak class="py-6 text-center text-xs text-slate-400">Aucun message.</p>
                             </div>
-                            <form @submit.prevent="envoyerMessage()" class="mt-2 flex gap-2">
-                                <input x-model="texte" maxlength="500" placeholder="Écrire au client..." class="flex-1 rounded-lg border-slate-300 text-sm">
-                                <button type="submit" :disabled="!texte.trim() || enCours" class="rounded-lg bg-indigo-600 px-4 py-2 text-sm font-semibold text-white hover:bg-indigo-700 disabled:opacity-40 flex items-center gap-1">
-                                    <span x-show="enCours === 'message'" class="animate-spin h-3 w-3 border-2 border-white border-t-transparent rounded-full"></span>
+                            <p x-show="sel.etat === 'desactive'" x-cloak class="mt-2 text-center text-xs text-slate-400">Session terminée — conversation en lecture seule (effacée à la prochaine activation).</p>
+                            <form x-show="sel.etat !== 'desactive'" @submit.prevent="envoyerMessage()" class="mt-2 flex gap-2">
+                                <input x-model="texte" maxlength="500" :disabled="envoiChat" placeholder="Écrire au client..." class="flex-1 rounded-lg border-slate-300 text-sm">
+                                <button type="submit" :disabled="!texte.trim() || envoiChat" class="rounded-lg bg-indigo-600 px-4 py-2 text-sm font-semibold text-white hover:bg-indigo-700 disabled:opacity-40 flex items-center gap-1">
+                                    <span x-show="envoiChat" x-cloak class="animate-spin h-3 w-3 border-2 border-white border-t-transparent rounded-full"></span>
                                     Envoyer
                                 </button>
                             </form>
@@ -336,7 +460,7 @@ function postesApp() {
         </section>
     </div>
 
-    <div x-show="menu.ouvert" x-cloak @click.stop :style="`left:${menu.x}px; top:${menu.y}px`" class="fixed z-[9400] w-52 overflow-hidden rounded-xl border border-slate-200 bg-white py-1 shadow-2xl">
+    <div x-show="menu.ouvert" x-cloak @click.stop :style="`left:${menu.x}px; top:${menu.y}px; z-index:9400`" class="fixed w-52 overflow-hidden rounded-xl border border-slate-200 bg-white py-1 shadow-2xl">
         <template x-for="a in (postes.find(p => p.id === menu.id)?.actions || [])" :key="a.cle">
             <button type="button" @click="demanderConfirm(menu.id, a.cle)" class="flex w-full items-center gap-2 px-4 py-2 text-left text-sm text-slate-700 hover:bg-indigo-50">
                 <span class="h-2 w-2 rounded-full" :class="{'bg-emerald-500': a.couleur==='vert', 'bg-rose-500': a.couleur==='rouge', 'bg-amber-500': a.couleur==='ambre', 'bg-violet-500': a.couleur==='violet', 'bg-sky-500': a.couleur==='bleu', 'bg-slate-500': a.couleur==='gris' }"></span>
@@ -345,77 +469,71 @@ function postesApp() {
         </template>
     </div>
 
-    <div x-show="confirm.ouvert" x-cloak class="fixed inset-0 z-[9300] flex items-center justify-center p-4">
-        <div class="absolute inset-0 bg-slate-900/60" @click="confirm.ouvert = false"></div>
-        <div class="relative w-full max-w-xs rounded-xl bg-white p-5 text-center shadow-2xl">
-            <h3 class="text-base font-bold text-slate-900 mb-2" x-text="confirm.titre"></h3>
-            <p class="text-xs text-slate-500 mb-5" x-text="confirm.texte"></p>
-            <div class="flex justify-center gap-3">
-                <button type="button" @click="confirm.ouvert = false" class="rounded-lg border bg-white px-4 py-2 text-xs font-medium hover:bg-slate-50">Annuler</button>
-                <button type="button" @click="confirmerAction()" class="rounded-lg bg-indigo-600 px-4 py-2 text-xs font-bold text-white hover:bg-indigo-700 flex items-center gap-1">
-                    <span x-show="enCours === confirm.action" class="animate-spin h-3 w-3 border-2 border-white border-t-transparent rounded-full"></span>
-                    Confirmer
-                </button>
-            </div>
-        </div>
-    </div>
-
-    <div x-show="modal === 'demarrer' || modal === 'recharger'" x-cloak class="fixed inset-0 z-[9300] flex items-center justify-center p-4">
-        <div class="absolute inset-0 bg-slate-900/60" @click="modal = null"></div>
-        <div class="relative w-full max-w-3xl rounded-2xl bg-white shadow-2xl flex flex-col">
+    {{-- Modale Démarrer / Recharger (z-index 9300) --}}
+    <div x-show="modal === 'demarrer' || modal === 'recharger'" x-cloak class="cm-overlay" style="z-index: 9300;">
+        <div class="cm-backdrop" @click="modal = null"></div>
+        <div class="relative w-full max-w-3xl rounded-2xl bg-white shadow-2xl flex flex-col" style="max-width: 48rem;">
             <div class="border-b border-slate-100 p-4">
-                <h2 class="text-lg font-bold" x-text="modal === 'demarrer' ? 'Démarrer (Forfait) — ' : 'Recharger (Forfait) — '"></h2>
+                <h2 class="text-lg font-bold" x-text="(modal === 'demarrer' ? 'Démarrer (Forfait)' : 'Recharger (Forfait)') + (sel ? ' — ' + sel.nom : '')"></h2>
+                <p class="text-xs text-slate-500 mt-1" x-text="'Tarif : ' + TARIF_MINUTE + ' Ar/min • Minimum : ' + TARIF_MIN + ' Ar'"></p>
             </div>
-            <div class="p-4 grid grid-cols-2 gap-6">
-                <div class="border-r pr-4">
-                    <div class="flex justify-between items-center mb-2">
+            <div class="p-4" style="display: grid; grid-template-columns: minmax(0, 1.15fr) minmax(0, 1fr); gap: 24px;">
+                <div class="border-r pr-4" style="min-width: 0;">
+                    <div class="flex justify-between items-center mb-2" style="gap: 8px;">
                         <h3 class="font-semibold text-sm">Recharges rapides</h3>
-                        <button type="button" @click="newLigne.type = (newLigne.type === 'montant' ? 'duree' : 'montant')" class="text-xs text-indigo-600 hover:underline">
-                            Basculer Saisie (Montant/Durée)
+                        <button type="button" @click="newLigne.type = (newLigne.type === 'montant' ? 'duree' : 'montant'); erreurLigne = ''" class="cm-bascule">
+                            ⇄ Basculer saisie (Montant/Durée)
                         </button>
                     </div>
-                    <div class="flex gap-2 mb-4 items-end bg-slate-50 p-2 rounded border">
-                        <template x-if="newLigne.type === 'montant'">
-                            <div class="flex-1">
-                                <label class="text-[10px] text-slate-500">Montant (Ar)</label>
-                                <input type="number" x-model="newLigne.montant" class="w-full text-xs p-1 border-slate-300 rounded">
-                            </div>
-                        </template>
-                        <template x-if="newLigne.type === 'duree'">
-                            <div class="flex-1 flex gap-1">
-                                <div><label class="text-[10px] text-slate-500">H</label><input type="number" x-model="newLigne.h" class="w-full text-xs p-1 border-slate-300 rounded"></div>
-                                <div><label class="text-[10px] text-slate-500">Min</label><input type="number" x-model="newLigne.m" class="w-full text-xs p-1 border-slate-300 rounded"></div>
-                            </div>
-                        </template>
-                        <button type="button" @click="ajouterLigne()" class="bg-slate-800 text-white px-3 py-1 rounded text-xs hover:bg-slate-700 h-[28px]">Ajouter</button>
+                    <div class="mb-4 bg-slate-50 p-2 rounded border">
+                        <div class="flex gap-2 items-end">
+                            <template x-if="newLigne.type === 'montant'">
+                                <div class="flex-1" style="min-width: 0;">
+                                    <label class="text-[10px] text-slate-500">Montant (Ar)</label>
+                                    <input type="number" x-model="newLigne.montant" @input="erreurLigne = ''" @keydown.enter.prevent="ajouterLigne()" class="w-full text-xs p-1 border-slate-300 rounded" :style="erreurLigne ? 'border-color:#dc2626' : ''">
+                                </div>
+                            </template>
+                            <template x-if="newLigne.type === 'duree'">
+                                <div class="flex-1 flex gap-1" style="min-width: 0;">
+                                    <div style="flex: 1; min-width: 0;"><label class="text-[10px] text-slate-500">H</label><input type="number" x-model="newLigne.h" @input="erreurLigne = ''" class="w-full text-xs p-1 border-slate-300 rounded" :style="erreurLigne ? 'border-color:#dc2626' : ''"></div>
+                                    <div style="flex: 1; min-width: 0;"><label class="text-[10px] text-slate-500">Min</label><input type="number" x-model="newLigne.m" @input="erreurLigne = ''" class="w-full text-xs p-1 border-slate-300 rounded" :style="erreurLigne ? 'border-color:#dc2626' : ''"></div>
+                                </div>
+                            </template>
+                            <button type="button" @click="ajouterLigne()" class="bg-slate-800 text-white px-3 py-1 rounded text-xs hover:bg-slate-700 h-[28px]">Ajouter</button>
+                        </div>
+                        <p x-show="erreurLigne" x-cloak class="cm-err" x-text="erreurLigne"></p>
                     </div>
 
-                    <table class="w-full text-sm text-left border-collapse">
-                        <thead class="bg-slate-100"><tr><th class="p-2 border text-xs">Durée</th><th class="p-2 border text-xs">Montant</th><th class="p-2 border text-xs w-10"></th></tr></thead>
-                        <tbody class="max-h-48 overflow-y-auto block">
-                            <template x-for="(r, i) in lignesForfait" :key="i">
-                                <tr @click="selectionnerLigne(r)" :class="ligneSelectionnee === r.montant ? 'bg-indigo-50 font-bold' : 'cursor-pointer hover:bg-slate-50'">
-                                    <td class="p-2 border" x-text="r.duree + ' min'"></td>
-                                    <td class="p-2 border" x-text="r.montant + ' Ar'"></td>
-                                    <td class="p-2 border text-center">
-                                        <button type="button" @click.stop="supprimerLigne(i)" class="text-rose-600 hover:text-rose-800 text-xs">✕</button>
-                                    </td>
-                                </tr>
-                            </template>
-                        </tbody>
-                    </table>
+                    <div class="cm-table-wrap">
+                        <table class="cm-table">
+                            <colgroup><col style="width: 27%;"><col style="width: 29%;"><col style="width: 44%;"></colgroup>
+                            <thead><tr><th>Durée</th><th>Montant</th><th>Actions</th></tr></thead>
+                            <tbody>
+                                <template x-for="(r, i) in lignesForfait" :key="i">
+                                    <tr @click="selectionnerLigne(r)" :class="ligneSelectionnee === r.montant ? 'bg-indigo-50 font-bold' : 'cursor-pointer hover:bg-slate-50'">
+                                        <td x-text="r.duree + ' min'"></td>
+                                        <td x-text="r.montant + ' Ar'"></td>
+                                        <td>
+                                            <button type="button" @click.stop="demanderSupprimerLigne(i)" class="text-rose-600 hover:text-rose-800 text-xs flex items-center gap-1" style="color: #e11d48;"><svg class="w-3 h-3" style="width: 12px; height: 12px;" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"></path></svg> Supprimer</button>
+                                        </td>
+                                    </tr>
+                                </template>
+                            </tbody>
+                        </table>
+                    </div>
                 </div>
-                <div>
+                <div style="min-width: 0;">
                     <h3 class="font-semibold text-sm mb-2">Saisie manuelle</h3>
+                    <p x-show="modal === 'demarrer'" x-cloak class="text-[11px] text-slate-500 mb-3" x-text="'Minimum (1re activation) : ' + fmtAr(TARIF_MIN) + ' / ' + dureeMinimale() + ' min'"></p>
                     <div class="mb-4">
                         <label class="text-xs text-slate-500">Montant (Ar)</label>
-                        <input type="number" x-model="form.montantManuel" @input="calculerDepuisMontant" class="w-full rounded border-slate-300">
+                        <input type="number" x-model="form.montantManuel" @input="calculerDepuisMontant" class="w-full rounded border-slate-300" style="box-sizing: border-box;">
                     </div>
                     <div>
                         <label class="text-xs text-slate-500">Durée</label>
-                        <div class="flex gap-2 items-center">
-                            <input type="number" x-model="form.h" @input="calculerDepuisDuree" class="w-1/2 rounded border-slate-300" placeholder="Heure"> h
-                            <input type="number" x-model="form.m" @input="calculerDepuisDuree" class="w-1/2 rounded border-slate-300" placeholder="Min"> min
+                        <div class="flex items-center gap-2">
+                            <input type="number" min="0" x-model="form.h" @input="calculerDepuisDuree" class="cm-num rounded border-slate-300" placeholder="0"> <span class="text-sm text-slate-600">h</span>
+                            <input type="number" min="0" x-model="form.m" @input="calculerDepuisDuree" class="cm-num rounded border-slate-300" placeholder="0"> <span class="text-sm text-slate-600">min</span>
                         </div>
                     </div>
                 </div>
@@ -430,6 +548,22 @@ function postesApp() {
         </div>
     </div>
 
-    <div x-show="notif" x-cloak x-transition class="fixed bottom-6 right-6 z-[9500] max-w-md rounded-xl px-4 py-3 text-sm font-medium text-white shadow-lg" :class="notif?.ok ? 'bg-emerald-600' : 'bg-rose-600'" x-text="notif?.msg"></div>
+    {{-- Confirmation : placée APRÈS la modale dans le DOM et avec un z-index supérieur (9600) → toujours au premier plan --}}
+    <div x-show="confirm.ouvert" x-cloak class="cm-overlay" style="z-index: 9600;">
+        <div class="cm-backdrop" @click="confirm.ouvert = false"></div>
+        <div class="cm-confirm">
+            <h3 x-text="confirm.titre"></h3>
+            <p x-text="confirm.texte"></p>
+            <div style="display: flex; justify-content: center; gap: 12px;">
+                <button type="button" @click="confirm.ouvert = false" class="rounded-lg border bg-white px-4 py-2 text-xs font-medium hover:bg-slate-50">Annuler</button>
+                <button type="button" @click="confirm.callback ? confirm.callback() : confirmerAction()" class="rounded-lg bg-indigo-600 px-4 py-2 text-xs font-bold text-white hover:bg-indigo-700 flex items-center gap-1">
+                    <span x-show="enCours === confirm.action" class="animate-spin h-3 w-3 border-2 border-white border-t-transparent rounded-full"></span>
+                    Confirmer
+                </button>
+            </div>
+        </div>
+    </div>
+
+    <div x-show="notif" x-cloak x-transition class="fixed bottom-6 right-6 max-w-md rounded-xl px-4 py-3 text-sm font-medium text-white shadow-lg" style="z-index: 9700;" :class="notif?.ok ? 'bg-emerald-600' : 'bg-rose-600'" x-text="notif?.msg"></div>
 </div>
 @endsection
