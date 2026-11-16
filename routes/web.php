@@ -261,3 +261,4 @@ Route::prefix('api/agent')->group(function () {
 */
 
 require __DIR__.'/auth.php';
+require __DIR__.'/agent_maj.php';

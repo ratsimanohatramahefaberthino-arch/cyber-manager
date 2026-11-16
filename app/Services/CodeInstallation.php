@@ -3,6 +3,8 @@
 namespace App\Services;
 
 use App\Models\CyberSetting;
+use Illuminate\Support\Facades\Cache;
+use Illuminate\Support\Facades\Log;
 
 /**
  * Code d'installation : il faut le connaître pour enregistrer un NOUVEAU poste.
@@ -14,6 +16,7 @@ use App\Models\CyberSetting;
 final class CodeInstallation
 {
     private const CLE = 'code_installation';
+    private const CACHE_KEY = 'code_installation_brut';
 
     // Sans caractères ambigus (pas de 0/O, 1/I)
     private const ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
@@ -30,6 +33,8 @@ final class CodeInstallation
     {
         $brut = self::generer();
         CyberSetting::definir(self::CLE, $brut);
+        Cache::forget(self::CACHE_KEY);
+        Log::info("Code d'installation régénéré. Nouveau code : " . self::formater($brut));
 
         return self::formater($brut);
     }
@@ -42,23 +47,35 @@ final class CodeInstallation
             return false;
         }
 
-        return hash_equals(self::obtenirBrut(), $saisi);
+        $attendu = self::obtenirBrut();
+
+        // Log de débogage (visible dans storage/logs/laravel.log)
+        Log::debug("Vérification code d'installation : saisi='" . $saisi . "', attendu='" . $attendu . "'");
+
+        return hash_equals($attendu, $saisi);
     }
 
     // ------------------------------------------------------------------
 
     private static function obtenirBrut(): string
     {
-        $brut = '';
-        try {
-            $brut = self::normaliser((string) CyberSetting::query()->where('cle', self::CLE)->value('valeur'));
-        } catch (\Throwable) {
-            // table indisponible : on génère quand même un code
-        }
+        // On essaie de lire depuis le cache d'abord
+        $brut = Cache::remember(self::CACHE_KEY, 60, function () {
+            try {
+                $valeur = CyberSetting::query()->where('cle', self::CLE)->value('valeur');
+                return self::normaliser((string) $valeur);
+            } catch (\Throwable $e) {
+                Log::error("Impossible de lire le code d'installation : " . $e->getMessage());
+                return '';
+            }
+        });
 
+        // Si le code est vide ou invalide, on en génère un nouveau
         if (strlen($brut) !== self::LONGUEUR) {
             $brut = self::generer();
             CyberSetting::definir(self::CLE, $brut);
+            Cache::put(self::CACHE_KEY, $brut, 60);
+            Log::info("Nouveau code d'installation généré automatiquement : " . self::formater($brut));
         }
 
         return $brut;

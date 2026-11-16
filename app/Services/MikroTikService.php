@@ -3,26 +3,25 @@
 namespace App\Services;
 
 use App\Services\MikroTik\MikrotikConnection;
+use App\Models\CyberSetting;
 use RuntimeException;
 
-/**
- * Façade haut niveau vers l'API RouterOS.
- *
- * Responsabilités :
- *  - gérer la connexion + login ;
- *  - exposer des méthodes métier simples (listHotspotUsers, ...) ;
- *  - isoler toute la cuisine du protocole dans MikrotikConnection.
- *
- * Ne contient AUCUN accès aux Controllers, AUCUN SQL.
- */
 class MikroTikService
 {
     private ?MikrotikConnection $connection = null;
     private bool $loggedIn = false;
+    private array $config;
 
-    public function __construct(
-        private array $config
-    ) {
+    public function __construct(array $config = [])
+    {
+        $this->config = [
+            'host'     => $config['host']     ?? CyberSetting::reseau('mikrotik_host', env('MIKROTIK_HOST', '128.0.1.1')),
+            'port'     => $config['port']     ?? (int) CyberSetting::reseau('mikrotik_port', env('MIKROTIK_PORT', '8728')),
+            'user'     => $config['user']     ?? CyberSetting::reseau('mikrotik_user', env('MIKROTIK_USER', 'admin')),
+            'password' => $config['password'] ?? CyberSetting::reseau('mikrotik_password', env('MIKROTIK_PASSWORD', '')),
+            'ssl'      => $config['ssl']      ?? false,
+            'timeout'  => $config['timeout']  ?? 5.0,
+        ];
     }
 
     public function connection(): MikrotikConnection
@@ -40,12 +39,9 @@ class MikroTikService
 
     public function login(): void
     {
-        if ($this->loggedIn) {
-            return;
-        }
+        if ($this->loggedIn) return;
 
         $this->connection()->connect();
-
         $reply = $this->connection()->sendSentence([
             '/login',
             '=name='     . $this->config['user'],
@@ -57,7 +53,6 @@ class MikroTikService
             $this->disconnect();
             throw new RuntimeException($msg);
         }
-
         $this->loggedIn = true;
     }
 
@@ -70,11 +65,6 @@ class MikroTikService
         $this->loggedIn   = false;
     }
 
-    /**
-     * Vérifie la connexion et retourne les infos de base du routeur.
-     *
-     * @return array{identity: ?string, version: ?string, board_name: ?string, uptime: ?string}
-     */
     public function testConnection(): array
     {
         $identity = $this->query('/system/identity/print');
@@ -88,12 +78,6 @@ class MikroTikService
         ];
     }
 
-    /**
-     * Envoie une commande /... et retourne uniquement les enregistrements !re.
-     *
-     * @param  array<string, scalar>  $arguments
-     * @return array<int, array<string,string>>
-     */
     public function query(string $command, array $arguments = []): array
     {
         $words = [$command];
@@ -121,299 +105,102 @@ class MikroTikService
         return $this->send($words);
     }
 
-    /**
-     * @param  string[]  $words
-     * @return array<int, array<string,string>>
-     */
-private function send(array $words): array
-{
-    $this->login();
+    private function send(array $words): array
+    {
+        $this->login();
+        $reply = $this->connection()->sendSentence($words);
 
-    $reply = $this->connection()->sendSentence($words);
+        if ($this->replyHasTrap($reply)) {
+            $msg = $this->extractTrapMessage($reply);
+            $this->disconnect();
+            throw new RuntimeException('MikroTik ' . ($words[0] ?? '?') . ' : ' . $msg);
+        }
 
-    if ($this->replyHasTrap($reply)) {
-        $msg = $this->extractTrapMessage($reply);
+        $records = [];
+        foreach ($reply as $item) {
+            if ($item['type'] === '!re') {
+                $records[] = $item['attributes'];
+            }
+        }
         $this->disconnect();
-        throw new RuntimeException(
-            'MikroTik ' . ($words[0] ?? '?') . ' : ' . $msg
-        );
+        return $records;
     }
 
-    $records = [];
-    foreach ($reply as $item) {
-        if ($item['type'] === '!re') {
-            $records[] = $item['attributes'];
-        }
-    }
+    // -----------------------------------------------------------------
+    // Méthodes existantes (Hotspot, DHCP, etc.)
+    // -----------------------------------------------------------------
+    
+    public function listHotspotUsers(): array { return $this->query('/ip/hotspot/user/print'); }
+    public function listHotspotActive(): array { return $this->query('/ip/hotspot/active/print'); }
+    public function listHotspotProfiles(): array { return $this->query('/ip/hotspot/user/profile/print'); }
+    public function listHotspotServers(): array { return $this->query('/ip/hotspot/print'); }
 
-    $this->disconnect();   // ← AJOUT : ferme le socket après chaque commande
-
-    return $records;
-}
-
-    /**
-     * Liste les utilisateurs HotSpot configurés.
-     */
-    public function listHotspotUsers(): array
+    public function createHotspotUser(string $username, string $password, ?string $profile = null, ?string $comment = null, ?string $limitUptime = null, ?string $server = null, ?string $limitBytesTotal = null): void
     {
-        return $this->query('/ip/hotspot/user/print');
-    }
-
-    /**
-     * Liste les sessions HotSpot actuellement actives.
-     */
-    public function listHotspotActive(): array
-    {
-        return $this->query('/ip/hotspot/active/print');
-    }
-
-    /**
-     * Liste les profils HotSpot.
-     */
-    public function listHotspotProfiles(): array
-    {
-        return $this->query('/ip/hotspot/user/profile/print');
-    }
-
-    /**
-     * Liste les instances de serveur HotSpot configurées sur le routeur
-     * (le "Server" du formulaire d'ajout — différent du profil).
-     */
-    public function listHotspotServers(): array
-    {
-        return $this->query('/ip/hotspot/print');
-    }
-
-    /**
-     * Table d'enregistrement Wi-Fi : associe une MAC à l'interface wireless
-     * (wlan1, wlan2…) qui la sert. Permet de retrouver le vrai SSID.
-     */
-    public function listWirelessRegistrationTable(): array
-    {
-        return $this->query('/interface/wireless/registration-table/print');
-    }
-
-    /**
-     * Interfaces wireless configurées (nom → SSID).
-     */
-    public function listWirelessInterfaces(): array
-    {
-        return $this->query('/interface/wireless/print');
-    }
-
-    /**
-     * Crée un utilisateur HotSpot.
-     *
-     * @throws \RuntimeException si la commande échoue côté RouterOS
-     */
-    public function createHotspotUser(
-        string $username,
-        string $password,
-        ?string $profile = null,
-        ?string $comment = null,
-        ?string $limitUptime = null,
-        ?string $server = null,
-        ?string $limitBytesTotal = null,
-    ): void {
         $profile ??= config('mikrotik.hotspot_profile', 'default');
-
-        $args = [
-            'name'     => $username,
-            'password' => $password,
-            'profile'  => $profile,
-        ];
-
-        if ($comment !== null && $comment !== '') {
-            $args['comment'] = $comment;
-        }
-        if ($limitUptime !== null && $limitUptime !== '') {
-            $args['limit-uptime'] = $limitUptime;
-        }
-        if ($server !== null && $server !== '' && $server !== 'all') {
-            $args['server'] = $server;
-        }
-        if ($limitBytesTotal !== null && $limitBytesTotal !== '') {
-            $args['limit-bytes-total'] = $limitBytesTotal;
-        }
-
+        $args = ['name' => $username, 'password' => $password, 'profile' => $profile];
+        if ($comment) $args['comment'] = $comment;
+        if ($limitUptime) $args['limit-uptime'] = $limitUptime;
+        if ($server && $server !== 'all') $args['server'] = $server;
+        if ($limitBytesTotal) $args['limit-bytes-total'] = $limitBytesTotal;
         $this->query('/ip/hotspot/user/add', $args);
     }
 
-    /**
-     * Recherche un utilisateur HotSpot par nom exact.
-     * Retourne le premier enregistrement trouvé ou null.
-     */
     public function findHotspotUser(string $username): ?array
     {
-        $rows = $this->queryFiltered('/ip/hotspot/user/print', [
-            'name' => $username,
-        ]);
-
-        return $rows[0] ?? null;
+        return $this->queryFiltered('/ip/hotspot/user/print', ['name' => $username])[0] ?? null;
     }
 
-    /**
-     * Supprime un utilisateur HotSpot par nom.
-     * Retourne true si supprimé, false s'il n'existait pas.
-     */
     public function deleteHotspotUser(string $username): bool
     {
         $user = $this->findHotspotUser($username);
-
-        if ($user === null || !isset($user['.id'])) {
-            return false;
-        }
-
+        if ($user === null || !isset($user['.id'])) return false;
         $this->queryWithId('/ip/hotspot/user/remove', $user['.id']);
-
         return true;
     }
 
-    /**
-     * Liste uniquement les utilisateurs créés par Cyber Manager
-     * (ceux dont le nom commence par le préfixe configuré).
-     *
-     * @return array<int, array<string,string>>
-     */
-    public function listCyberManagerHotspotUsers(): array
-    {
-        $prefix = config('mikrotik.hotspot_user_prefix', 'cm-');
+    public function listDhcpLeases(): array { return $this->query('/ip/dhcp-server/lease/print'); }
+    public function listHotspotHosts(): array { return $this->query('/ip/hotspot/host/print'); }
+    public function findHotspotActive(string $id): ?array { return $this->queryFiltered('/ip/hotspot/active/print', ['.id' => $id])[0] ?? null; }
 
-        return array_values(array_filter(
-            $this->listHotspotUsers(),
-            fn (array $u) => str_starts_with($u['name'] ?? '', $prefix)
-        ));
-    }
-
-    /**
-     * Baux DHCP — tous les appareils connus du réseau (même non authentifiés).
-     */
-    public function listDhcpLeases(): array
-    {
-        return $this->query('/ip/dhcp-server/lease/print');
-    }
-
-    /**
-     * Hosts connus du HotSpot — appareils ayant déjà été vus par le portail.
-     */
-    public function listHotspotHosts(): array
-    {
-        return $this->query('/ip/hotspot/host/print');
-    }
-
-    /**
-     * Détail d'une session HotSpot active par son .id.
-     */
-    public function findHotspotActive(string $id): ?array
-    {
-        $rows = $this->queryFiltered('/ip/hotspot/active/print', [
-            '.id' => $id,
-        ]);
-
-        return $rows[0] ?? null;
-    }
-
-    /**
-     * Déconnecte un client actif par son adresse MAC.
-     * Retourne true si une session active a été trouvée et supprimée.
-     */
     public function disconnectHotspotActiveByMac(string $mac): bool
     {
-        $rows = $this->queryFiltered('/ip/hotspot/active/print', [
-            'mac-address' => $mac,
-        ]);
-
-        if (empty($rows) || !isset($rows[0]['.id'])) {
-            return false;
-        }
-
+        $mac = strtoupper(str_replace('-', ':', trim($mac)));
+        $rows = $this->queryFiltered('/ip/hotspot/active/print', ['mac-address' => $mac]);
+        if (empty($rows) || !isset($rows[0]['.id'])) return false;
         $this->queryWithId('/ip/hotspot/active/remove', $rows[0]['.id']);
-
         return true;
     }
 
-        /**
-     * Normalise une adresse MAC au format RouterOS (AA:BB:CC:DD:EE:FF).
-     */
-    private function normaliserMac(string $mac): string
-    {
-        return strtoupper(str_replace('-', ':', trim($mac)));
-    }
-
-    /**
-     * Retire toutes les sessions HotSpot actives correspondant aux filtres.
-     *
-     * @param  array<string, scalar>  $filtres
-     * @return int Nombre de sessions retirées
-     */
-    private function retirerSessionsActives(array $filtres): int
-    {
-        $retirees = 0;
-
-        foreach ($this->queryFiltered('/ip/hotspot/active/print', $filtres) as $ligne) {
-            if (isset($ligne['.id'])) {
-                $this->queryWithId('/ip/hotspot/active/remove', $ligne['.id']);
-                $retirees++;
-            }
-        }
-
-        return $retirees;
-    }
-
-    /**
-     * Retrouve l'IP actuelle d'un appareil à partir de sa MAC (table des hôtes HotSpot,
-     * puis baux DHCP). Source de vérité : le routeur lui-même.
-     */
     public function trouverIpParMac(string $mac): ?string
     {
-        $mac = $this->normaliserMac($mac);
-
+        $mac = strtoupper(str_replace('-', ':', trim($mac)));
         foreach ($this->queryFiltered('/ip/hotspot/host/print', ['mac-address' => $mac]) as $hote) {
-            if (!empty($hote['address'])) {
-                return $hote['address'];
-            }
+            if (!empty($hote['address'])) return $hote['address'];
         }
-
         foreach ($this->queryFiltered('/ip/dhcp-server/lease/print', ['mac-address' => $mac]) as $bail) {
             $ip = $bail['active-address'] ?? $bail['address'] ?? null;
-            if (!empty($ip)) {
-                return $ip;
-            }
+            if (!empty($ip)) return $ip;
         }
-
         return null;
     }
 
-    /**
-     * Connecte un poste à Internet : ouvre une session HotSpot pour le compte du poste.
-     * Idempotent : si le poste est déjà connecté avec ce compte et la bonne IP, ne fait rien.
-     *
-     * @param  string|null $ipIndice IP connue côté Laravel, utilisée seulement si le routeur ne la trouve pas
-     * @return bool true = poste connecté
-     *
-     * @throws RuntimeException si le routeur est injoignable ou refuse la connexion
-     */
     public function connecterPosteHotspot(string $username, string $password, string $mac, ?string $ipIndice = null): bool
     {
-        $mac = $this->normaliserMac($mac);
+        $mac = strtoupper(str_replace('-', ':', trim($mac)));
         $ip  = $this->trouverIpParMac($mac) ?? ($ipIndice !== '' ? $ipIndice : null);
 
         $actives = $this->queryFiltered('/ip/hotspot/active/print', ['mac-address' => $mac]);
         foreach ($actives as $ligne) {
             $memeCompte = ($ligne['user'] ?? null) === $username;
             $memeIp     = $ip === null || ($ligne['address'] ?? null) === $ip;
-            if ($memeCompte && $memeIp) {
-                return true;   // déjà connecté
-            }
+            if ($memeCompte && $memeIp) return true;
         }
 
-        // Autre compte / ancienne IP sur cette MAC, ou ce compte déjà utilisé ailleurs (shared-users) : on libère
         $this->retirerSessionsActives(['mac-address' => $mac]);
         $this->retirerSessionsActives(['user' => $username]);
 
-        if ($ip === null) {
-            throw new RuntimeException("Adresse IP introuvable sur MikroTik pour la MAC {$mac}.");
-        }
+        if ($ip === null) throw new RuntimeException("Adresse IP introuvable sur MikroTik pour la MAC {$mac}.");
 
         $this->query('/ip/hotspot/active/login', [
             'user'        => $username,
@@ -421,100 +208,204 @@ private function send(array $words): array
             'ip'          => $ip,
             'mac-address' => $mac,
         ]);
-
         return true;
     }
 
-    /**
-     * Coupe Internet pour un poste : retire ses sessions HotSpot actives (par MAC et par compte)
-     * et purge ses cookies HotSpot pour empêcher une reconnexion automatique.
-     *
-     * @return bool true si au moins une session active a été retirée
-     */
     public function deconnecterPosteHotspot(string $mac, ?string $username = null): bool
     {
-        $mac = $this->normaliserMac($mac);
-
+        $mac = strtoupper(str_replace('-', ':', trim($mac)));
         $retirees = $this->retirerSessionsActives(['mac-address' => $mac]);
-        if ($username !== null && $username !== '') {
-            $retirees += $this->retirerSessionsActives(['user' => $username]);
-        }
+        if ($username) $retirees += $this->retirerSessionsActives(['user' => $username]);
 
-        // Cookies HotSpot : sans eux, le navigateur ne peut pas se reconnecter tout seul
         try {
             foreach ($this->queryFiltered('/ip/hotspot/cookie/print', ['mac-address' => $mac]) as $cookie) {
-                if (isset($cookie['.id'])) {
-                    $this->queryWithId('/ip/hotspot/cookie/remove', $cookie['.id']);
-                }
+                if (isset($cookie['.id'])) $this->queryWithId('/ip/hotspot/cookie/remove', $cookie['.id']);
             }
-        } catch (\Throwable) {
-            // non bloquant : la session active est déjà coupée
-        }
-
+        } catch (\Throwable) {}
         return $retirees > 0;
     }
 
-    /**
-     * Active ou désactive un compte HotSpot.
-     */
     public function setHotspotUserDisabled(string $username, bool $disabled): bool
     {
         $user = $this->findHotspotUser($username);
-
-        if ($user === null || !isset($user['.id'])) {
-            return false;
-        }
-
-        $this->queryWithId('/ip/hotspot/user/set', $user['.id'], [
-            'disabled' => $disabled ? 'yes' : 'no',
-        ]);
-
+        if ($user === null || !isset($user['.id'])) return false;
+        $this->queryWithId('/ip/hotspot/user/set', $user['.id'], ['disabled' => $disabled ? 'yes' : 'no']);
         return true;
     }
 
-    /**
-     * Convertit une durée en minutes au format uptime RouterOS.
-     * Ex: 30 → "30m", 90 → "1h30m", 1500 → "1d1h".
-     */
     public static function formatUptime(int $minutes): string
     {
-        if ($minutes <= 0) {
-            return '1m';
-        }
-
+        if ($minutes <= 0) return '1m';
         $days  = intdiv($minutes, 1440);
         $hours = intdiv($minutes % 1440, 60);
         $mins  = $minutes % 60;
-
         $out = '';
-        if ($days  > 0) { $out .= "{$days}d"; }
-        if ($hours > 0) { $out .= "{$hours}h"; }
-        if ($mins  > 0) { $out .= "{$mins}m"; }
-
+        if ($days > 0) $out .= "{$days}d";
+        if ($hours > 0) $out .= "{$hours}h";
+        if ($mins > 0) $out .= "{$mins}m";
         return $out ?: '1m';
     }
 
-    // -----------------------------------------------------------------
-    // Helpers
-    // -----------------------------------------------------------------
-
-    private function replyHasDone(array $reply): bool
+    private function retirerSessionsActives(array $filtres): int
     {
-        foreach ($reply as $item) {
-            if ($item['type'] === '!done') {
-                return true;
+        $retirees = 0;
+        foreach ($this->queryFiltered('/ip/hotspot/active/print', $filtres) as $ligne) {
+            if (isset($ligne['.id'])) {
+                $this->queryWithId('/ip/hotspot/active/remove', $ligne['.id']);
+                $retirees++;
             }
         }
+        return $retirees;
+    }
+
+    // -----------------------------------------------------------------
+    // MÉTHODES RÉSEAU (Combinaison Google AI Studio + Base de données)
+    // -----------------------------------------------------------------
+
+    public function detecterIpLocaleVersRouteur(): ?string
+    {
+        $hoteRouteur = $this->config['host'] ?? null;
+        if (!$hoteRouteur) return null;
+
+        $sock = @socket_create(AF_INET, SOCK_DGRAM, SOL_UDP);
+        if ($sock) {
+            if (@socket_connect($sock, $hoteRouteur, (int) ($this->config['port'] ?? 8728))) {
+                @socket_getsockname($sock, $ipLocale);
+                @socket_close($sock);
+                if (!empty($ipLocale) && $ipLocale !== '0.0.0.0' && !str_starts_with($ipLocale, '127.') && !str_starts_with($ipLocale, '169.254.')) {
+                    return $ipLocale;
+                }
+            }
+            @socket_close($sock);
+        }
+        return null;
+    }
+
+    public function nettoyerReglesObsolètesPortail(): void
+    {
+        foreach ($this->query('/ip/dns/static/print') as $dns) {
+            $comment = $dns['comment'] ?? '';
+            $address = $dns['address'] ?? '';
+            if (str_contains($comment, 'Portail Captif') || str_contains($comment, 'Cyber Manager') || str_starts_with($address, '169.254.')) {
+                if (isset($dns['.id'])) $this->queryWithId('/ip/dns/static/remove', $dns['.id']);
+            }
+        }
+
+        foreach ($this->query('/ip/hotspot/walled-garden/ip/print') as $wg) {
+            $comment = $wg['comment'] ?? '';
+            $dstAddress = $wg['dst-address'] ?? '';
+            if (str_starts_with($dstAddress, '169.254.') || str_contains($comment, 'Portail Captif Laravel (Auto)')) {
+                if (isset($wg['.id'])) $this->queryWithId('/ip/hotspot/walled-garden/ip/remove', $wg['.id']);
+            }
+        }
+    }
+
+    public function configurerWalledGarden(string $ip, string $port = '80'): void
+    {
+        $existantes = $this->queryFiltered('/ip/hotspot/walled-garden/ip/print', [
+            'dst-address' => $ip,
+            'dst-port'    => $port,
+        ]);
+
+        if (empty($existantes)) {
+            $this->query('/ip/hotspot/walled-garden/ip/add', [
+                'dst-address' => $ip,
+                'dst-port'    => $port,
+                'protocol'    => 'tcp',
+                'action'      => 'accept',
+                'comment'     => 'Cyber Manager - Portail Captif',
+            ]);
+        }
+    }
+
+    public function installerRedirectionHotspot(string $urlPortail): bool
+    {
+        $profils = $this->query('/ip/hotspot/profile/print');
+        $htmlDir = 'flash/hotspot';
+        foreach ($profils as $p) {
+            if (!empty($p['html-directory'])) {
+                $htmlDir = $p['html-directory'];
+                break;
+            }
+        }
+
+        $cheminFichier = trim($htmlDir, '/') . '/login.html';
+
+        $contenu = '<!DOCTYPE html>' . "\n"
+            . '<html><head><meta charset="utf-8">' . "\n"
+            . '<meta http-equiv="refresh" content="0; url=' . $urlPortail . '?mac=$(mac)&ip=$(ip)&link-login-only=$(link-login-only-esc)&link-orig=$(link-orig-esc)&error=$(error-esc)">' . "\n"
+            . '<script type="text/javascript">' . "\n"
+            . 'window.location.href="' . $urlPortail . '?mac=$(mac)&ip=$(ip)&link-login-only="+encodeURIComponent("$(link-login-only)")+"&link-orig="+encodeURIComponent("$(link-orig)")+"&error="+encodeURIComponent("$(error)");' . "\n"
+            . '</script></head>' . "\n"
+            . '<body style="background:#0f172a;color:#fff;text-align:center;padding-top:40px;font-family:sans-serif;">' . "\n"
+            . '<p>Connexion au portail Wi-Fi en cours...</p>' . "\n"
+            . '</body></html>';
+
+        try {
+            $fichiers = $this->queryFiltered('/file/print', ['name' => $cheminFichier]);
+            if (!empty($fichiers) && isset($fichiers[0]['.id'])) {
+                $this->queryWithId('/file/set', $fichiers[0]['.id'], ['contents' => $contenu]);
+            } else {
+                $this->query('/file/add', ['name' => $cheminFichier, 'contents' => $contenu]);
+            }
+            return true;
+        } catch (\Throwable) {
+            return false;
+        }
+    }
+
+    public function verifierEtAjusterDhcpDns(): void
+    {
+        $networks = $this->query('/ip/dhcp-server/network/print');
+        $adresses = $this->query('/ip/address/print');
+
+        $routeurIp = null;
+        foreach ($adresses as $adr) {
+            $ipNet = explode('/', $adr['address'] ?? '')[0] ?? '';
+            if ($ipNet && !str_starts_with($ipNet, '127.') && ($adr['interface'] ?? '') !== 'ether1') {
+                $routeurIp = $ipNet;
+                break;
+            }
+        }
+
+        if (!$routeurIp) return;
+
+        foreach ($networks as $net) {
+            $dnsCourant = $net['dns-server'] ?? '';
+            if (!str_contains($dnsCourant, $routeurIp) && isset($net['.id'])) {
+                $this->queryWithId('/ip/dhcp-server/network/set', $net['.id'], [
+                    'dns-server' => $routeurIp,
+                ]);
+            }
+        }
+    }
+
+    public function redemarrerHotspotEtPurger(): void
+    {
+        try {
+            $this->query('/ip/dns/cache/flush');
+
+            $hotspots = $this->query('/ip/hotspot/print');
+            foreach ($hotspots as $hs) {
+                if (isset($hs['.id'])) $this->queryWithId('/ip/hotspot/disable', $hs['.id']);
+            }
+            usleep(500000);
+            foreach ($hotspots as $hs) {
+                if (isset($hs['.id'])) $this->queryWithId('/ip/hotspot/enable', $hs['.id']);
+            }
+        } catch (\Throwable) {}
+    }
+
+    // Helpers
+    private function replyHasDone(array $reply): bool
+    {
+        foreach ($reply as $item) if ($item['type'] === '!done') return true;
         return false;
     }
 
     private function replyHasTrap(array $reply): bool
     {
-        foreach ($reply as $item) {
-            if ($item['type'] === '!trap' || $item['type'] === '!fatal') {
-                return true;
-            }
-        }
+        foreach ($reply as $item) if ($item['type'] === '!trap' || $item['type'] === '!fatal') return true;
         return false;
     }
 
@@ -522,43 +413,18 @@ private function send(array $words): array
     {
         foreach ($reply as $item) {
             if ($item['type'] === '!trap' || $item['type'] === '!fatal') {
-                return $item['attributes']['message']
-                    ?? $item['attributes']['category']
-                    ?? 'Erreur inconnue';
+                return $item['attributes']['message'] ?? $item['attributes']['category'] ?? 'Erreur inconnue';
             }
         }
         return null;
     }
 
         /**
-     * Autorise l'adresse IP de ce serveur à être vue par les clients non connectés.
-     */
-    public function configurerWalledGarden(string $ip, string $port = '80'): void
-    {
-        // On vérifie si la règle exacte (IP + Port) existe déjà
-        $existantes = $this->queryFiltered('/ip/hotspot/walled-garden/ip/print', [
-            'dst-address' => $ip,
-            'dst-port'    => $port
-        ]);
-        
-        if (empty($existantes)) {
-            $this->query('/ip/hotspot/walled-garden/ip/add', [
-                'dst-address' => $ip,
-                'dst-port'    => $port,
-                'protocol'    => 'tcp',
-                'action'      => 'accept',
-                'comment'     => 'Portail Captif Laravel (Auto)'
-            ]);
-        }
-    }
-
-    /**
-     * Ajoute ou met à jour un nom de domaine local sur le routeur.
-     * Ex: portail.cyber pointe vers l'IP de Laravel.
+     * Ajoute une règle DNS statique sur le routeur pour associer le nom du portail
+     * à l'adresse IP du serveur.
      */
     public function configurerDnsLocal(string $domaine, string $ip): void
     {
-        $ip = trim($ip);
         $existantes = $this->queryFiltered('/ip/dns/static/print', ['name' => $domaine]);
 
         if (!empty($existantes)) {
@@ -568,26 +434,7 @@ private function send(array $words): array
             $this->query('/ip/dns/static/add', [
                 'name'    => $domaine,
                 'address' => $ip,
-                'comment' => 'Portail Captif Laravel (Auto)'
-            ]);
-        }
-    }
-
-        /**
-     * Configure le nom de domaine (DNS Name) dans le profil HotSpot.
-     */
-    public function configurerDnsNameHotspot(string $nomDeDomaine): void
-    {
-        $profils = $this->query('/ip/hotspot/profile/print');
-        
-        if (empty($profils)) {
-            throw new \RuntimeException("Aucun profil HotSpot trouvé sur le routeur.");
-        }
-
-        // On boucle sur TOUS les profils pour être sûr que le bon soit configuré
-        foreach ($profils as $profil) {
-            $this->queryWithId('/ip/hotspot/profile/set', $profil['.id'], [
-                'dns-name' => $nomDeDomaine,
+                'comment' => 'Portail Captif (Auto)',
             ]);
         }
     }

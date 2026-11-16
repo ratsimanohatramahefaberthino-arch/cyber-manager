@@ -18,7 +18,6 @@ class CyberSetting extends Model
         'logo_path'          => null,
     ];
 
-    /** Tous les réglages (défauts inclus). Ne plante jamais si la table n'existe pas encore. */
     public static function tous(): array
     {
         try {
@@ -52,7 +51,6 @@ class CyberSetting extends Model
         static::updateOrCreate(['cle' => $cle], ['valeur' => $valeur]);
     }
 
-    /** Chemin disque du logo, ou null s'il n'y en a pas (ou si le fichier a disparu). */
     public static function logoChemin(): ?string
     {
         $p = self::tous()['logo_path'];
@@ -67,7 +65,6 @@ class CyberSetting extends Model
         return self::logoChemin() !== null;
     }
 
-    /** Empreinte du logo : change à chaque nouveau fichier. '' si pas de logo. */
     public static function logoVersion(): string
     {
         $chemin = self::logoChemin();
@@ -77,7 +74,6 @@ class CyberSetting extends Model
         return substr(md5($chemin . '|' . @filemtime($chemin) . '|' . @filesize($chemin)), 0, 12);
     }
 
-    /** Bloc envoyé à l'agent dans le handshake et le heartbeat. */
     public static function brandingAgent(): array
     {
         $t = self::tous();
@@ -90,5 +86,23 @@ class CyberSetting extends Model
             'avec_logo'    => $version !== '',
             'logo_version' => $version,
         ];
+    }
+
+    // -----------------------------------------------------------------
+    // NOUVELLES MÉTHODES RÉSEAU
+    // -----------------------------------------------------------------
+
+    public static function reseau(string $cle, ?string $defaut = null): ?string
+    {
+        $valeur = static::query()->where('cle', $cle)->value('valeur');
+        if ($valeur !== null && $valeur !== '') {
+            return $valeur;
+        }
+        return $defaut;
+    }
+
+    public static function setReseau(string $cle, ?string $valeur): void
+    {
+        static::updateOrCreate(['cle' => $cle], ['valeur' => $valeur]);
     }
 }

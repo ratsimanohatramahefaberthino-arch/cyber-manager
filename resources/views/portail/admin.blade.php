@@ -3,7 +3,8 @@
 @section('content')
 @php
     $portPortail = request()->getPort();
-    $urlPortail  = 'http://inside.net' . (in_array($portPortail, [80, 443]) ? '' : ':' . $portPortail) . '/portail';
+    $domainePortail = $domainePortail ?? \App\Models\CyberSetting::reseau('portail_domaine', 'portail.izara');
+    $urlPortail  = 'http://' . $domainePortail . (in_array($portPortail, [80, 443]) ? '' : ':' . $portPortail) . '/portail';
     $ipServeur   = env('SERVER_IP') ?: request()->server('SERVER_ADDR');
     $ipInvalide  = !$ipServeur || in_array($ipServeur, ['127.0.0.1', '::1']) || str_starts_with((string) $ipServeur, '169.254');
     $logoInitial = !empty($config['logo']) ? Storage::url($config['logo']) : '';
@@ -18,7 +19,6 @@
         'urlPortail'=> $urlPortail,
     ];
 
-    // Classes pour les champs (prennent 100% de leur colonne, ni plus ni moins)
     $champ = 'w-full rounded-lg border-slate-300 bg-white text-sm text-slate-900 shadow-sm placeholder:text-slate-400 focus:border-indigo-500 focus:ring-indigo-500';
     $label = 'mb-1.5 block text-[13px] font-medium text-slate-700';
     $swatch = 'h-9 w-9 shrink-0 cursor-pointer appearance-none rounded-md border-0 bg-transparent p-0 [&::-webkit-color-swatch-wrapper]:p-0 [&::-webkit-color-swatch]:rounded-md [&::-webkit-color-swatch]:border [&::-webkit-color-swatch]:border-slate-200 [&::-moz-color-swatch]:rounded-md [&::-moz-color-swatch]:border-slate-200';
@@ -141,12 +141,8 @@ document.addEventListener('alpine:init', () => {
         </div>
     </div>
 
-    {{-- Grille 12 colonnes : 5 pour les réglages, 7 pour l'aperçu --}}
     <div class="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start w-full">
 
-        {{-- =============================================================== --}}
-        {{-- GAUCHE : RÉGLAGES (5 colonnes / 12)                             --}}
-        {{-- =============================================================== --}}
         <div class="col-span-1 lg:col-span-5 w-full min-w-0 rounded-2xl border border-slate-200 bg-white shadow-sm overflow-hidden flex flex-col">
             
             <div class="flex items-center justify-between gap-3 border-b border-slate-200 px-5 py-4 bg-slate-50/50">
@@ -326,25 +322,83 @@ document.addEventListener('alpine:init', () => {
 
                     {{-- RÉSEAU --}}
                     <div x-show="tab === 'reseau'" x-cloak class="space-y-6 w-full">
+                        {{-- État du routeur --}}
+                        <div class="rounded-xl border p-4 w-full {{ $routeurInfo ? 'border-emerald-200 bg-emerald-50/50' : 'border-rose-200 bg-rose-50/50' }}">
+                            <div class="flex items-center justify-between">
+                                <div class="flex items-center gap-3">
+                                    <span class="flex h-3 w-3 rounded-full {{ $routeurInfo ? 'bg-emerald-500' : 'bg-rose-500' }}"></span>
+                                    <span class="text-sm font-semibold text-slate-800">
+                                        Routeur MikroTik : {{ $routeurInfo ? ($routeurInfo['identity'] ?? 'Connecté') : 'Injoignable' }}
+                                    </span>
+                                </div>
+                                @if($routeurInfo)
+                                    <span class="text-xs text-slate-500 font-mono">{{ $routeurInfo['board_name'] ?? '' }} (v{{ $routeurInfo['version'] ?? '' }})</span>
+                                @endif
+                            </div>
+                        </div>
+
+                        {{-- Adresse du portail générée --}}
                         <div class="w-full">
-                            <span class="{{ $label }}">Adresse du portail</span>
+                            <span class="{{ $label }}">URL du portail (distribuée aux clients)</span>
                             <div class="flex gap-2 w-full">
-                                <input type="text" readonly value="{{ $urlPortail }}" class="w-full rounded-lg border-slate-200 bg-slate-50 font-mono text-xs text-slate-600">
+                                <input type="text" readonly value="{{ $urlPortail }}" class="w-full rounded-lg border-slate-200 bg-slate-50 font-mono text-xs text-slate-700">
                                 <button type="button" @click="copier()" class="inline-flex w-24 shrink-0 items-center justify-center rounded-lg border border-slate-300 bg-white text-xs font-semibold">
                                     <span x-show="!copie">Copier</span>
                                     <span x-show="copie" class="text-emerald-600">Copié</span>
                                 </button>
                             </div>
+                            <p class="mt-1 text-xs text-slate-500">Accessible directement en HTTP, sans risque de blocage SSL ou HSTS.</p>
                         </div>
 
-                        <div class="rounded-xl border p-4 w-full {{ $ipInvalide ? 'border-rose-200 bg-rose-50' : 'border-slate-200 bg-slate-50' }}">
-                            <span class="text-[13px] font-medium">IP Serveur : </span>
-                            <code class="rounded bg-white px-2 py-0.5 text-xs">{{ $ipServeur ?: 'Inconnue' }}</code>
+                        {{-- IP du serveur --}}
+                        <div class="rounded-xl border border-slate-200 bg-slate-50/50 p-4 w-full space-y-3">
+                            <label for="server_ip_input" class="text-xs font-semibold text-slate-700 block">
+                                Adresse IP de ce PC serveur
+                            </label>
+                            <input id="server_ip_input" type="text" name="server_ip_override" value="{{ $ipServeur }}" class="{{ $champ }} font-mono text-xs">
+                            <p class="text-xs text-slate-500">Détectée automatiquement. Modifiez-la uniquement si ce PC utilise une carte réseau spécifique.</p>
                         </div>
 
-                        <div class="rounded-xl border border-slate-200 p-4 w-full">
-                            <button type="submit" formaction="{{ route('portail.admin.configurer') }}" class="w-full rounded-lg bg-slate-900 px-4 py-2.5 text-sm font-semibold text-white hover:bg-slate-800">
-                                Configurer le routeur
+                        {{-- NOUVEAU : Nom de domaine local du portail --}}
+                        <div class="rounded-xl border border-slate-200 bg-slate-50/50 p-4 w-full space-y-3">
+                            <label for="portail_domaine_input" class="text-xs font-semibold text-slate-700 block">
+                                Nom de domaine du portail (local)
+                            </label>
+                            <input id="portail_domaine_input" type="text" name="portail_domaine" value="{{ $domainePortail }}" class="{{ $champ }} font-mono text-xs" placeholder="portail.izara">
+                            <p class="text-xs text-slate-500">Ce nom sera résolu par le routeur pour accéder au portail (ex: portail.izara). Ne pas utiliser un nom qui existe déjà sur Internet (comme inside.net).</p>
+                        </div>
+
+                        {{-- Configuration MikroTik --}}
+                        <div class="rounded-xl border border-slate-200 bg-slate-50/50 p-4 w-full space-y-3">
+                            <span class="text-xs font-semibold text-slate-700 block">Configuration du routeur</span>
+                            <div class="grid grid-cols-2 gap-3">
+                                <div>
+                                    <label for="mt_host" class="text-[11px] text-slate-500 mb-1 block">IP du routeur</label>
+                                    <input id="mt_host" type="text" name="mikrotik_host" value="{{ $mikrotikConfig['host'] }}" class="{{ $champ }} text-xs font-mono">
+                                </div>
+                                <div>
+                                    <label for="mt_port" class="text-[11px] text-slate-500 mb-1 block">Port API</label>
+                                    <input id="mt_port" type="number" name="mikrotik_port" value="{{ $mikrotikConfig['port'] }}" class="{{ $champ }} text-xs font-mono">
+                                </div>
+                            </div>
+                            <div>
+                                <label for="mt_user" class="text-[11px] text-slate-500 mb-1 block">Utilisateur</label>
+                                <input id="mt_user" type="text" name="mikrotik_user" value="{{ $mikrotikConfig['user'] }}" class="{{ $champ }} text-xs">
+                            </div>
+                            <div>
+                                <label for="mt_pass" class="text-[11px] text-slate-500 mb-1 block">Mot de passe</label>
+                                <input id="mt_pass" type="password" name="mikrotik_password" placeholder="(laisser vide pour ne pas changer)" class="{{ $champ }} text-xs">
+                            </div>
+                        </div>
+
+                        {{-- Bouton de configuration automatique du routeur --}}
+                        <div class="rounded-xl border border-slate-200 p-4 w-full bg-white space-y-2">
+                            <p class="text-xs text-slate-600 leading-relaxed">
+                                Clique sur ce bouton pour synchroniser le routeur : cela nettoie les anciennes règles, autorise ce PC dans le Walled Garden et installe la redirection automatique.
+                            </p>
+                            <button type="submit" formaction="{{ route('portail.admin.configurer') }}" class="w-full inline-flex items-center justify-center gap-2 rounded-lg bg-slate-900 px-4 py-3 text-sm font-semibold text-white shadow hover:bg-slate-800 transition">
+                                <x-icone nom="link" class="h-4 w-4 text-emerald-400" />
+                                Configurer et synchroniser le routeur
                             </button>
                         </div>
                     </div>
@@ -359,12 +413,8 @@ document.addEventListener('alpine:init', () => {
             </form>
         </div>
 
-        {{-- =============================================================== --}}
-        {{-- DROITE : APERÇU (7 colonnes / 12)                               --}}
-        {{-- =============================================================== --}}
         <div class="col-span-1 lg:col-span-7 w-full min-w-0 sticky top-20">
             <div class="flex flex-col overflow-hidden rounded-2xl border border-slate-800 bg-slate-900 shadow-xl h-[750px] w-full">
-                {{-- Barre d'outils --}}
                 <div class="flex items-center justify-between gap-3 border-b border-white/10 bg-slate-950/70 px-4 py-3 shrink-0">
                     <div class="flex items-center gap-2 text-sm font-medium text-slate-300">
                         <span class="relative flex h-2 w-2">
@@ -386,13 +436,11 @@ document.addEventListener('alpine:init', () => {
                     <span class="w-14 text-right font-mono text-xs text-slate-500" x-text="Math.round(scale * 100) + ' %'"></span>
                 </div>
 
-                {{-- Zone d'affichage de l'aperçu --}}
                 <div x-ref="stage" class="relative flex flex-1 items-center justify-center overflow-hidden w-full" style="background-color:#0f172a;background-image:radial-gradient(#27364d 1px,transparent 1px);background-size:20px 20px;">
                     
                     <div class="relative shrink-0" :style="{ width: (frameW * scale) + 'px', height: (frameH * scale) + 'px' }">
                         <div class="absolute left-0 top-0 origin-top-left" :style="{ width: frameW + 'px', height: frameH + 'px', transform: 'scale(' + scale + ')' }">
                             
-                            {{-- Coque du téléphone --}}
                             <div class="flex h-full w-full flex-col bg-slate-950 shadow-2xl ring-1 ring-white/10" :class="mode === 'mobile' ? 'rounded-[46px] p-3' : 'rounded-xl'">
                                 
                                 <div x-show="mode === 'desktop'" class="flex h-10 shrink-0 items-center gap-3 px-4">

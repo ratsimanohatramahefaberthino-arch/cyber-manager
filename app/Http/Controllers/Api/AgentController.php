@@ -42,10 +42,8 @@ class AgentController extends Controller
         $ancienSigne      = null;
 
         if ($poste === null) {
-            // Identifiant inconnu = nouveau poste : le code d'installation est obligatoire.
-            // On ne renvoie JAMAIS le jeton d'un poste existant à un identifiant inconnu.
             if (!CodeInstallation::verifier($data['code_installation'] ?? null)) {
-                Log::warning("Enregistrement refusé depuis {$ipVue} : code d'installation absent ou invalide.");
+                Log::warning("Enregistrement refusé depuis {$ipVue} : code d'installation absent ou invalide. Code reçu : " . ($data['code_installation'] ?? 'null'));
                 return response()->json([
                     'ok'      => false,
                     'code'    => 'code_installation_invalide',
@@ -68,7 +66,6 @@ class AgentController extends Controller
                     'derniere_communication' => now(),
                 ]);
             } catch (UniqueConstraintViolationException) {
-                // Deux enregistrements simultanés avec le même identifiant : l'agent réessaiera.
                 return response()->json([
                     'ok'      => false,
                     'code'    => 'enregistrement_simultane',
@@ -79,8 +76,6 @@ class AgentController extends Controller
             Log::info("Nouveau poste enregistré : « {$poste->nom_poste} » (demandé : « {$data['nom_poste']} »).");
             $nouveau = true;
         } else {
-            // Conflit d'identité déjà signalé (PC cloné) : l'ordinateur dont l'adresse MAC n'est pas
-            // celle du poste d'origine doit prendre une nouvelle identité.
             if ($poste->aConflitIdentite() && $mac !== null && $poste->adresse_mac !== null
                 && $mac !== strtoupper($poste->adresse_mac)) {
                 Log::warning("Poste « {$poste->nom_poste} » : un ordinateur dupliqué (MAC différente) reçoit l'ordre de changer d'identité.");
@@ -134,10 +129,12 @@ class AgentController extends Controller
             'etat'                 => $etat,
             'doit_etre_verrouille' => $this->doitEtreVerrouille($etat),
             'session'              => $session ? $this->resumeSession($session) : null,
-            'branding'             => CyberSetting::brandingAgent(), // <-- AJOUT ICI
+            'branding'             => CyberSetting::brandingAgent(),
             'message'              => $nouveau ? 'Poste enregistré.' : 'Poste reconnu.',
         ]);
     }
+
+    // ... (le reste du fichier est inchangé, je le mets en entier pour éviter toute erreur)
 
     public function heartbeat(Request $request, PosteSessionService $sessions): JsonResponse
     {
@@ -149,7 +146,6 @@ class AgentController extends Controller
         $etaitEnLigne = $poste->estEnLigne();
         $ancienSigne  = $poste->dernier_heartbeat;
 
-        // Détection d'un PC cloné : le même jeton arrive de deux adresses réseau différentes, coup sur coup.
         $ipVue   = $this->ipVue($request);
         $conflit = $this->conflitProbable($poste, $ipVue);
 
@@ -163,7 +159,7 @@ class AgentController extends Controller
             $maj['conflit_identite_at'] = now();
         } elseif ($poste->conflit_identite_at !== null
             && $poste->conflit_identite_at->lt(now()->subMinutes(Poste::DUREE_CONFLIT_MINUTES))) {
-            $maj['conflit_identite_at'] = null;   // plus de signalement depuis 10 min : alerte effacée
+            $maj['conflit_identite_at'] = null;
         }
 
         if ($poste->etat === Poste::ETAT_HORS_LIGNE) {
@@ -187,7 +183,7 @@ class AgentController extends Controller
             'etat'                 => $etat,
             'doit_etre_verrouille' => $this->doitEtreVerrouille($etat),
             'session'              => $session ? $this->resumeSession($session) : null,
-            'branding'             => CyberSetting::brandingAgent(), // <-- AJOUT ICI
+            'branding'             => CyberSetting::brandingAgent(),
         ]);
     }
 
@@ -209,7 +205,6 @@ class AgentController extends Controller
                     return [200, ['ok' => true, 'message' => 'Session déjà active.', 'session' => $s ? $this->resumeSession($s) : null], $s ? $p : null];
             }
 
-            // Garde-fou : seul un poste « disponible » peut être activé depuis le client
             if ($p->etatAffiche() !== Poste::ETAT_DISPONIBLE) {
                 return [409, ['ok' => false, 'message' => "Ce poste n'est pas disponible."], null];
             }
@@ -340,7 +335,6 @@ class AgentController extends Controller
         return response()->json(['ok' => true]);
     }
 
-    /** Logo du cyber (public : pas de token requis). */
     public function logo()
     {
         $chemin = CyberSetting::logoChemin();
@@ -357,20 +351,15 @@ class AgentController extends Controller
         return Poste::where('agent_token', $token)->first();
     }
 
-    /** Adresse réseau de l'appelant, telle que le SERVEUR la voit (pas celle que l'agent déclare). */
     private function ipVue(Request $request): ?string
     {
         $ip = $request->ip();
         if ($ip === null) return null;
 
-        if (str_starts_with($ip, '::ffff:')) $ip = substr($ip, 7);   // IPv4 écrite en IPv6
-        return $ip === '::1' ? '127.0.0.1' : $ip;                    // les deux formes de « cet ordinateur »
+        if (str_starts_with($ip, '::ffff:')) $ip = substr($ip, 7);
+        return $ip === '::1' ? '127.0.0.1' : $ip;
     }
 
-    /**
-     * Deux ordinateurs partagent-ils ce poste ? Oui si le poste vient de donner signe de vie
-     * (moins de 12 s) depuis une AUTRE adresse réseau que celle de cet appel.
-     */
     private function conflitProbable(Poste $poste, ?string $ipVue): bool
     {
         return $ipVue !== null
@@ -395,14 +384,12 @@ class AgentController extends Controller
         $prevue  = (int) $session->duree_prevue;
         $restant = ($mode === 'forfait' && $prevue > 0) ? max(0, $prevue * 60 - $ecoule) : null;
 
-        // Calcul du forfait total (initial + recharges)
         $forfaitTotal = 0;
         if ($mode === 'forfait') {
             $tarif = app(\App\Services\TarifService::class)->tarifStandard();
             $forfaitTotal = app(\App\Services\TarifService::class)->montantPourMinutes($prevue, $tarif);
         }
 
-        // Paramètres tarifaires envoyés au widget : même formule que l'interface admin
         $tarifInfo = ['par_minute' => 20, 'minimum' => 300, 'arrondi_actif' => false, 'unite' => 0, 'seuil' => 0];
         try {
             $t = $session->tarif ?: app(\App\Services\TarifService::class)->tarifStandard();
@@ -413,9 +400,7 @@ class AgentController extends Controller
                 'unite'         => (int) $t->unite_arrondi,
                 'seuil'         => (int) $t->seuil_arrondi,
             ];
-        } catch (\Throwable) {
-            // tarif introuvable : valeurs par défaut ci-dessus
-        }
+        } catch (\Throwable) {}
 
         return [
             'id'               => $session->id,

@@ -9,9 +9,6 @@ use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Str;
 
-/**
- * Page « Enregistrement » : code d'installation, renommage des postes, conflits d'identité (PC clonés).
- */
 class EnregistrementController extends Controller
 {
     public function index(Request $request)
@@ -26,7 +23,6 @@ class EnregistrementController extends Controller
     public function regenererCode(): RedirectResponse
     {
         CodeInstallation::regenerer();
-        Log::info("Code d'installation régénéré.");
 
         return redirect()->route('enregistrement.index')
             ->with('success', "Nouveau code généré. Les postes déjà enregistrés continuent de fonctionner ; seuls les nouveaux postes devront utiliser ce code.");
@@ -58,11 +54,6 @@ class EnregistrementController extends Controller
             ->with('success', "Poste renommé : « {$ancien} » → « {$nom} ». Le poste affiche son nouveau nom en quelques secondes.");
     }
 
-    /**
-     * Sépare deux ordinateurs qui partagent la même identité : le jeton est renouvelé, les deux
-     * ordinateurs se ré-identifient, et celui dont l'adresse MAC n'est pas celle du poste d'origine
-     * reçoit une nouvelle identité (il apparaît alors comme un nouveau poste).
-     */
     public function separer(Poste $poste): RedirectResponse
     {
         if (!$poste->aConflitIdentite()) {
@@ -75,7 +66,6 @@ class EnregistrementController extends Controller
         return back()->with('success', "Séparation lancée pour « {$poste->nom_poste} ». Dans quelques secondes, l'ordinateur en trop apparaîtra comme un nouveau poste (à renommer).");
     }
 
-    /** Efface l'alerte (fausse alerte, ou problème réglé à la main). Elle revient si le conflit persiste. */
     public function ignorerConflit(Poste $poste): RedirectResponse
     {
         $poste->update(['conflit_identite_at' => null]);

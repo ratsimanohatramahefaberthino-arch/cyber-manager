@@ -61,6 +61,8 @@ function parametresApp(couleur, logoUrl, nom, slogan) {
         <p class="text-sm text-slate-500">Identité du cyber : affichée sur l'écran de verrouillage des postes et dans l'administration.</p>
     </div>
 
+    @include('parametres._onglets')
+
     @if (session('success')) <div class="cm-p-ok">{{ session('success') }}</div> @endif
     @if ($errors->any())
         <div class="cm-p-err">@foreach ($errors->all() as $e) <div>• {{ $e }}</div> @endforeach</div>

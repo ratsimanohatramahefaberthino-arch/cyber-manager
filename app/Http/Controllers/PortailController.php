@@ -5,6 +5,7 @@ namespace App\Http\Controllers;
 use App\Models\AppareilWifi;
 use App\Models\PortailParametre;
 use App\Models\Session;
+use App\Models\CyberSetting;
 use App\Services\MikroTikService;
 use App\Services\TarifService;
 use Illuminate\Http\JsonResponse;
@@ -19,10 +20,6 @@ class PortailController extends Controller
         private TarifService $tarifService
     ) {}
 
-    // =================================================================
-    // VALEURS PAR DÉFAUT DU THÈME DU PORTAIL
-    // =================================================================
-
     public static function parametresParDefaut(): array
     {
         return [
@@ -32,14 +29,14 @@ class PortailController extends Controller
             'message'             => 'Veuillez vous connecter avec vos identifiants pour accéder à Internet.',
             'message_couleur'     => '#b9d3d4',
             'police'              => 'Inter, system-ui, sans-serif',
-            'fond_type'           => 'gradient', // gradient ou solid
+            'fond_type'           => 'gradient',
             'fond_couleur_1'      => '#0b1f24',
             'fond_couleur_2'      => '#1b5c63',
             'carte_couleur'       => '#f4f7f6',
             'carte_texte'         => '#10262b',
             'bouton_fond'         => '#ffb020',
             'bouton_texte'        => '#2b1c00',
-            'bouton_rayon'        => '16', // px
+            'bouton_rayon'        => '16',
             'accent_couleur'      => '#3dd6d0',
             'annonce_active'      => '0',
             'annonce_texte'       => '🎉 Profitez d\'une connexion haut débit stable et sécurisée !',
@@ -54,26 +51,45 @@ class PortailController extends Controller
     {
         $defauts = self::parametresParDefaut();
         $config = [];
-
         foreach ($defauts as $cle => $valeurDefaut) {
             $config[$cle] = PortailParametre::get($cle, $valeurDefaut);
         }
-
         return $config;
     }
-
-    // =================================================================
-    // CÔTÉ ADMINISTRATION
-    // =================================================================
 
     public function adminIndex()
     {
         $tarifWifi = $this->tarifService->tarifWifi();
         $config = $this->getConfigurationPortail();
 
+        $ipOverride = CyberSetting::reseau('portail_ip_serveur');
+        $ipServeur = $ipOverride ?: ($this->mikroTik->detecterIpLocaleVersRouteur() ?: request()->server('SERVER_ADDR') ?: '127.0.0.1');
+        $portServeur = (int) (request()->getPort() ?: 80);
+
+        // NOUVEAU : nom de domaine local du portail
+        $domaine = CyberSetting::reseau('portail_domaine', 'portail.izara');
+
+        // URL basée sur le domaine local (plus stable que l'IP)
+        $urlPortail = 'http://' . $domaine . ($portServeur !== 80 ? ':' . $portServeur : '') . '/portail';
+
+        $routeurInfo = null;
+        try {
+            $routeurInfo = $this->mikroTik->testConnection();
+        } catch (\Throwable) {}
+
         return view('portail.admin', [
-            'config'    => $config,
-            'tarifWifi' => $tarifWifi,
+            'config'         => $config,
+            'tarifWifi'      => $tarifWifi,
+            'ipServeur'      => $ipServeur,
+            'portServeur'    => $portServeur,
+            'urlPortail'     => $urlPortail,
+            'domainePortail' => $domaine,
+            'routeurInfo'    => $routeurInfo,
+            'mikrotikConfig' => [
+                'host'     => CyberSetting::reseau('mikrotik_host'),
+                'user'     => CyberSetting::reseau('mikrotik_user'),
+                'port'     => CyberSetting::reseau('mikrotik_port'),
+            ],
         ]);
     }
 
@@ -114,82 +130,67 @@ class PortailController extends Controller
             PortailParametre::set($champ, $request->input($champ, self::parametresParDefaut()[$champ] ?? ''));
         }
 
-        // Gestion du logo
         if ($request->hasFile('logo')) {
             $ancienLogo = PortailParametre::get('logo');
-            if ($ancienLogo && Storage::disk('public')->exists($ancienLogo)) {
-                Storage::disk('public')->delete($ancienLogo);
-            }
+            if ($ancienLogo && Storage::disk('public')->exists($ancienLogo)) Storage::disk('public')->delete($ancienLogo);
             $path = $request->file('logo')->store('portail', 'public');
             PortailParametre::set('logo', $path);
         } elseif ($request->boolean('supprimer_logo')) {
             $ancienLogo = PortailParametre::get('logo');
-            if ($ancienLogo && Storage::disk('public')->exists($ancienLogo)) {
-                Storage::disk('public')->delete($ancienLogo);
-            }
+            if ($ancienLogo && Storage::disk('public')->exists($ancienLogo)) Storage::disk('public')->delete($ancienLogo);
             PortailParametre::set('logo', null);
         }
 
-        return back()->with('success', 'Paramètres et design du portail enregistrés avec succès.');
+        return back()->with('success', 'Paramètres enregistrés.');
     }
 
     public function adminResetDefaults()
     {
         $defauts = self::parametresParDefaut();
         foreach ($defauts as $cle => $valeur) {
-            if ($cle !== 'logo') {
-                PortailParametre::set($cle, $valeur);
-            }
+            if ($cle !== 'logo') PortailParametre::set($cle, $valeur);
         }
-        return back()->with('success', 'Les styles par défaut ont été restaurés.');
+        return back()->with('success', 'Styles réinitialisés.');
     }
 
-    public function configurerRouteur()
+    public function configurerRouteur(Request $request)
     {
-        $ipLocale = $this->trouverIpLocale();
-        $port = request()->getPort();
+        $ipLocale = $request->input('server_ip') ?: (CyberSetting::reseau('portail_ip_serveur') ?: ($this->mikroTik->detecterIpLocaleVersRouteur() ?: request()->server('SERVER_ADDR')));
+        $port = (string) (request()->getPort() ?: '80');
 
-        if ($ipLocale === '127.0.0.1' || str_starts_with($ipLocale, '169.254')) {
-            return back()->with('error', "L'IP détectée ({$ipLocale}) est locale ou invalide. Renseignez SERVER_IP dans votre fichier .env.");
+        if (!$ipLocale || $ipLocale === '127.0.0.1' || str_starts_with($ipLocale, '169.254')) {
+            return back()->with('error', "L'IP détectée ({$ipLocale}) est invalide. Saisissez manuellement l'IP du serveur.");
         }
 
-        try {
-            $this->mikroTik->configurerWalledGarden($ipLocale, (string) $port);
-            $this->mikroTik->configurerDnsLocal('inside.net', $ipLocale);
-            $this->mikroTik->configurerDnsNameHotspot('inside.net');
+        CyberSetting::setReseau('portail_ip_serveur', $ipLocale);
 
-            return back()->with('success', "Routeur MikroTik configuré ! Portail accessible sur http://inside.net:{$port}/portail");
+        // Sauvegarde du domaine saisi dans le formulaire
+        if ($request->filled('portail_domaine')) {
+            CyberSetting::setReseau('portail_domaine', trim($request->input('portail_domaine')));
+        }
+
+        $urlPortail = 'http://' . $ipLocale . ($port !== '80' ? ':' . $port : '') . '/portail';
+
+        try {
+            $this->mikroTik->nettoyerReglesObsolètesPortail();
+            $this->mikroTik->configurerWalledGarden($ipLocale, $port);
+            $this->mikroTik->verifierEtAjusterDhcpDns();
+
+            // Domaine : priorité au champ du formulaire, sinon valeur en base
+            $domaine = $request->input('portail_domaine') ?: CyberSetting::reseau('portail_domaine', 'portail.izara');
+            if ($domaine) {
+                $this->mikroTik->configurerDnsLocal($domaine, $ipLocale);
+            }
+
+            // L'URL utilisée pour la redirection reste l'IP directe (pour éviter HSTS)
+            $this->mikroTik->installerRedirectionHotspot($urlPortail);
+            $this->mikroTik->redemarrerHotspotEtPurger();
+
+            return back()->with('success', "Routeur configuré avec succès ! Portail accessible sur : http://{$domaine}:{$port}/portail");
         } catch (\Throwable $e) {
             return back()->with('error', "Erreur MikroTik : " . $e->getMessage());
         }
     }
-
-    private function trouverIpLocale(): string
-    {
-        if (env('SERVER_IP')) {
-            return env('SERVER_IP');
-        }
-
-        $ipRequete = request()->server('SERVER_ADDR');
-        if ($ipRequete && $ipRequete !== '127.0.0.1' && $ipRequete !== '::1') {
-            return $ipRequete;
-        }
-
-        $ips = gethostbynamel(gethostname());
-        if ($ips) {
-            foreach ($ips as $ip) {
-                if (!str_starts_with($ip, '127.') && !str_starts_with($ip, '169.254.')) {
-                    return $ip;
-                }
-            }
-        }
-
-        return '127.0.0.1';
-    }
-
-    // =================================================================
-    // CÔTÉ CLIENT (PORTAIL CAPTIF)
-    // =================================================================
 
     private function macValide(?string $mac): ?string
     {
@@ -201,14 +202,13 @@ class PortailController extends Controller
     private function traduireErreur(?string $brut): ?string
     {
         if (!$brut) return null;
-
         return match (true) {
             (bool) preg_match('/invalid (username|password)/i', $brut) => 'Identifiant ou mot de passe incorrect.',
             (bool) preg_match('/(uptime|time) limit/i', $brut)         => 'Le temps accordé à ce ticket est épuisé.',
             (bool) preg_match('/(bytes|data|traffic) limit/i', $brut)  => 'Le quota de données de ce ticket est épuisé.',
             (bool) preg_match('/already|simultaneous|active/i', $brut) => 'Ce compte est déjà utilisé sur un autre appareil.',
             (bool) preg_match('/disabled/i', $brut)                    => 'Ce compte est désactivé. Veuillez voir la caisse.',
-            default => 'Connexion refusée. Vérifiez vos identifiants ou contactez le comptoir.',
+            default => 'Connexion refusée. Vérifiez vos identifiants.',
         };
     }
 
@@ -218,8 +218,8 @@ class PortailController extends Controller
         $loginUrl = "http://{$hote}/login";
         $lien = $request->query('link-login-only');
 
-        if ($lien && ($p = parse_url($lien)) && in_array($p['host'] ?? '', [$hote, 'inside.net'], true)) {
-            $loginUrl = ($p['scheme'] ?? 'http') . '://' . $p['host'] . (isset($p['port']) ? ':' . $p['port'] : '') . ($p['path'] ?? '/login');
+        if ($lien && filter_var($lien, FILTER_VALIDATE_URL)) {
+            $loginUrl = $lien;
         }
 
         $mac = $this->macValide($request->query('mac'));
@@ -255,16 +255,11 @@ class PortailController extends Controller
         ])->header('Cache-Control', 'no-store, max-age=0');
     }
 
-    /**
-     * API Stats appelée en polling par le dashboard client.
-     * Résout les bugs de chrono et de calcul de tarif en temps réel.
-     */
     public function apiStats(Request $request): JsonResponse
     {
         $macNorm = $this->macValide($request->query('mac'));
         $ip = $request->ip();
 
-        // 1. Recherche de la session correspondante dans cyber_sessions
         $session = Session::query()
             ->where('type_session', 'wifi')
             ->where(function ($q) use ($macNorm, $ip) {
@@ -277,14 +272,11 @@ class PortailController extends Controller
             ->orderByDesc('id')
             ->first();
 
-        // Tarif Wi-Fi courant
         $tarif = $session?->tarif ?: $this->tarifService->tarifWifi();
         $parMin = max(1, (int) ($tarif->montant_par_minute ?? 20));
         $minimum = (int) ($tarif->montant_minimum ?? 300);
 
-        // Si aucune session n'est encore enregistrée en base locale
         if (!$session) {
-            // Tentative de secours : lecture directe MikroTik
             try {
                 $filtre = $macNorm ? ['mac-address' => $macNorm] : ['address' => $ip];
                 $active = Cache::remember("mt_active_{$macNorm}_{$ip}", 2, function () use ($filtre) {
@@ -316,16 +308,13 @@ class PortailController extends Controller
             }
         }
 
-        // 2. Traitement d'une session connue
         $estTermine = $session->estTermine();
         $estConnecte = $session->estConnecte();
         $estEnPause = $session->estEnPause() || $session->estDeconnecte();
 
-        // Calcul des secondes consommées effectives (décompte figé si déconnecté/pause/terminé)
         $secondes = $session->secondesConsommees();
         $minutes = intdiv($secondes, 60);
 
-        // Calcul du montant selon les règles tarifaires
         $montant = $tarif
             ? $this->tarifService->montantPourMinutes($minutes, $tarif)
             : max($minutes * $parMin, $minimum);
