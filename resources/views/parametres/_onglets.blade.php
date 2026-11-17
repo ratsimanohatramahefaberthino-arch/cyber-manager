@@ -1,9 +1,6 @@
+{{-- Styles partagés par les pages Installation, Versions et Parc.
+     La navigation entre onglets est maintenant dans components/parametres/coque.blade.php --}}
 <style>
-    .cm-t-tabs { display: flex; gap: 6px; flex-wrap: wrap; border-bottom: 1px solid #e2e8f0; margin-bottom: 20px; }
-    .cm-t-tab { padding: 9px 16px; font-size: 14px; font-weight: 600; color: #64748b; border-bottom: 2px solid transparent; margin-bottom: -1px; text-decoration: none; }
-    .cm-t-tab:hover { color: #0f172a; }
-    .cm-t-tab.actif { color: #4f46e5; border-bottom-color: #4f46e5; }
-    .cm-t-tab.bientot { color: #cbd5e1; cursor: not-allowed; }
     .cm-t-card { background: #fff; border: 1px solid #e2e8f0; border-radius: 16px; padding: 22px; box-shadow: 0 1px 2px rgba(0,0,0,.04); margin-bottom: 20px; }
     .cm-t-card h2 { font-size: 16px; font-weight: 700; color: #0f172a; margin-bottom: 4px; }
     .cm-t-aide { font-size: 12px; color: #64748b; margin-bottom: 14px; }
@@ -30,10 +27,3 @@
     .cm-t-mono { font-family: monospace; font-size: 11px; color: #64748b; word-break: break-all; }
     .cm-t-inline { display: inline; }
 </style>
-
-<nav class="cm-t-tabs">
-    <a href="{{ route('parametres.index') }}" class="cm-t-tab {{ request()->routeIs('parametres.index') ? 'actif' : '' }}">Identité</a>
-    <a href="{{ route('parametres.installation.index') }}" class="cm-t-tab {{ request()->routeIs('parametres.installation.*') ? 'actif' : '' }}">Installation</a>
-    <a href="{{ route('parametres.versions.index') }}" class="cm-t-tab {{ request()->routeIs('parametres.versions.*') ? 'actif' : '' }}">Versions</a>
-    <a href="{{ route('parametres.parc.index') }}" class="cm-t-tab {{ request()->routeIs('parametres.parc.*') ? 'actif' : '' }}">Parc et restrictions</a>
-</nav>

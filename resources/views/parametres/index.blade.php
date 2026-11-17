@@ -1,47 +1,68 @@
-@extends('layouts.cyber-manager', ['title' => 'Paramètres — Cyber Manager'])
+@extends('layouts.cyber-manager', ['title' => 'Identité — Paramètres — Cyber Manager'])
 
 @section('content')
-<style>
-    .cm-p-wrap { max-width: 1100px; margin: 0 auto; }
-    .cm-p-grid { display: grid; grid-template-columns: minmax(0, 1.2fr) minmax(0, 1fr); gap: 24px; align-items: start; }
-    @media (max-width: 900px) { .cm-p-grid { grid-template-columns: minmax(0, 1fr); } }
-    .cm-p-card { background: #fff; border: 1px solid #e2e8f0; border-radius: 16px; padding: 24px; box-shadow: 0 1px 2px rgba(0,0,0,.04); }
-    .cm-p-card h2 { font-size: 16px; font-weight: 700; color: #0f172a; margin-bottom: 4px; }
-    .cm-p-card .cm-p-aide { font-size: 12px; color: #64748b; margin-bottom: 18px; }
-    .cm-p-champ { margin-bottom: 16px; }
-    .cm-p-champ label { display: block; font-size: 13px; font-weight: 600; color: #334155; margin-bottom: 6px; }
-    .cm-p-champ input[type=text] { width: 100%; box-sizing: border-box; border: 1px solid #cbd5e1; border-radius: 10px; padding: 9px 12px; font-size: 14px; }
-    .cm-p-champ small { display: block; font-size: 11px; color: #94a3b8; margin-top: 4px; }
-    .cm-p-couleur { display: flex; gap: 10px; align-items: center; }
-    .cm-p-couleur input[type=color] { width: 48px; height: 40px; padding: 2px; border: 1px solid #cbd5e1; border-radius: 10px; background: #fff; cursor: pointer; }
-    .cm-p-drop { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 8px; border: 2px dashed #cbd5e1; border-radius: 14px; padding: 22px; text-align: center; cursor: pointer; transition: all .15s; background: #f8fafc; }
-    .cm-p-drop.survol { border-color: #6366f1; background: #eef2ff; }
-    .cm-p-drop img { max-width: 220px; max-height: 120px; object-fit: contain; }
-    .cm-p-drop p { font-size: 13px; color: #64748b; }
-    .cm-p-btn { border: 0; border-radius: 10px; padding: 10px 20px; font-size: 14px; font-weight: 700; color: #fff; background: #4f46e5; cursor: pointer; }
-    .cm-p-btn:hover { background: #4338ca; }
-    .cm-p-btn-rouge { background: #fff; color: #dc2626; border: 1px solid #fecaca; padding: 6px 14px; font-size: 12px; margin-top: 10px; }
-    .cm-p-btn-rouge:hover { background: #fef2f2; }
-    .cm-p-ok { background: #ecfdf5; border: 1px solid #a7f3d0; color: #047857; padding: 10px 14px; border-radius: 10px; font-size: 14px; margin-bottom: 16px; }
-    .cm-p-err { background: #fef2f2; border: 1px solid #fecaca; color: #b91c1c; padding: 10px 14px; border-radius: 10px; font-size: 13px; margin-bottom: 16px; }
-    .cm-p-apercu { border-radius: 16px; padding: 28px 16px; text-align: center; background: #0b1226; color: #e2e8f0; position: relative; overflow: hidden; }
-    .cm-p-apercu .halo { position: absolute; inset: 0; opacity: .25; }
-    .cm-p-apercu .contenu { position: relative; }
-    .cm-p-logo-def { width: 84px; height: 84px; border-radius: 22px; margin: 0 auto 14px; display: flex; align-items: center; justify-content: center; }
-    .cm-p-apercu img.cm-p-logo { max-width: 200px; max-height: 110px; object-fit: contain; margin: 0 auto 14px; display: block; }
-    .cm-p-nom { font-size: 30px; font-weight: 800; letter-spacing: 3px; text-transform: uppercase; line-height: 1.1; word-break: break-word; }
-    .cm-p-slogan { font-size: 11px; letter-spacing: 3px; text-transform: uppercase; color: #94a3b8; margin-top: 6px; }
-    .cm-p-pastille { display: inline-block; margin-top: 18px; padding: 6px 18px; border-radius: 10px; font-size: 14px; font-weight: 700; background: rgba(255,255,255,.07); border: 1px solid rgba(255,255,255,.1); }
-</style>
+@php
+    $logoUrl = $logo ? route('agent.logo', ['v' => $logoVersion]) : null;
+
+    $initial = [
+        'nom'     => old('nom_cyber', $p['nom_cyber']),
+        'slogan'  => old('slogan', (string) $p['slogan']),
+        'admin'   => old('nom_admin', (string) $p['nom_admin']),
+        'couleur' => old('couleur_principale', $p['couleur_principale']),
+        'logoUrl' => $logoUrl,
+        'compte'  => Auth::user()->name,
+    ];
+
+    $couleursProposees = [
+        ['#7c3aed', 'Violet'], ['#4f46e5', 'Indigo'], ['#0891b2', 'Turquoise'],
+        ['#059669', 'Vert'],   ['#d97706', 'Orange'], ['#e11d48', 'Rouge'],
+    ];
+
+    $champ = 'h-11 w-full rounded-xl border border-slate-300 bg-white px-3.5 text-sm text-slate-900 shadow-sm placeholder:text-slate-400 focus:border-violet-500 focus:ring-2 focus:ring-violet-500/20';
+    $label = 'mb-1.5 block text-sm font-semibold text-slate-800';
+@endphp
 
 <script>
-function parametresApp(couleur, logoUrl, nom, slogan) {
+function identiteForm(init) {
     return {
-        couleur, logoUrl, nom, slogan, survol: false, nomFichier: '',
+        nom: init.nom, slogan: init.slogan, admin: init.admin, couleur: init.couleur,
+        logoUrl: init.logoUrl, objetUrl: null, nomFichier: '', erreurLogo: '', survol: false, enCours: false,
+
+        init() {
+            // Prévient avant de quitter la page avec des changements non enregistrés
+            window.addEventListener('beforeunload', (e) => {
+                if (this.dirty && !this.enCours) { e.preventDefault(); e.returnValue = ''; }
+            });
+        },
+
+        get dirty() {
+            return this.nom !== init.nom || this.slogan !== init.slogan || this.admin !== init.admin
+                || (this.couleur || '').toLowerCase() !== (init.couleur || '').toLowerCase()
+                || this.nomFichier !== '';
+        },
+        get couleurValide() { return /^#[0-9a-fA-F]{6}$/.test(this.couleur); },
+        get couleurAffichee() { return this.couleurValide ? this.couleur : init.couleur; },
+        get adminAffiche() { return this.admin.trim() !== '' ? this.admin : init.compte; },
+
+        liberer() { if (this.objetUrl) { URL.revokeObjectURL(this.objetUrl); this.objetUrl = null; } },
+
         choisir(f) {
+            this.erreurLogo = '';
             if (!f) return;
+            if (!['image/png', 'image/jpeg'].includes(f.type)) {
+                this.erreurLogo = 'Choisissez une image au format PNG ou JPG.';
+                this.$refs.fichier.value = '';
+                return;
+            }
+            if (f.size > 2 * 1024 * 1024) {
+                this.erreurLogo = 'Cette image est trop lourde (2 Mo maximum).';
+                this.$refs.fichier.value = '';
+                return;
+            }
+            this.liberer();
+            this.objetUrl = URL.createObjectURL(f);
             this.nomFichier = f.name;
-            this.logoUrl = URL.createObjectURL(f);
+            this.logoUrl = this.objetUrl;
         },
         deposer(e) {
             this.survol = false;
@@ -50,99 +71,201 @@ function parametresApp(couleur, logoUrl, nom, slogan) {
             try { this.$refs.fichier.files = e.dataTransfer.files; } catch (_) {}
             this.choisir(f);
         },
-        confirmerSuppression(e) { if (!confirm('Supprimer le logo ?')) e.preventDefault(); },
+        annuler() {
+            this.liberer();
+            this.nom = init.nom; this.slogan = init.slogan; this.admin = init.admin; this.couleur = init.couleur;
+            this.logoUrl = init.logoUrl; this.nomFichier = ''; this.erreurLogo = '';
+            this.$refs.fichier.value = '';
+        },
     };
 }
 </script>
 
-<div class="cm-p-wrap" x-data="parametresApp(@js($p['couleur_principale']), @js($logo ? route('agent.logo', ['v' => $logoVersion]) : null), @js($p['nom_cyber']), @js((string) $p['slogan']))">
-    <div style="margin-bottom: 18px;">
-        <h1 class="text-2xl font-semibold tracking-tight text-slate-900">Paramètres</h1>
-        <p class="text-sm text-slate-500">Identité du cyber : affichée sur l'écran de verrouillage des postes et dans l'administration.</p>
+<div x-data="identiteForm(@js($initial))" class="space-y-6">
+
+    <div>
+        <h1 class="text-2xl font-semibold tracking-tight text-slate-900">Identité du cyber</h1>
+        <p class="text-sm text-slate-500">Nom, slogan, logo et couleur : affichés sur l'écran de verrouillage des postes et dans l'administration.</p>
     </div>
 
-    @include('parametres._onglets')
+    <x-flash />
 
-    @if (session('success')) <div class="cm-p-ok">{{ session('success') }}</div> @endif
-    @if ($errors->any())
-        <div class="cm-p-err">@foreach ($errors->all() as $e) <div>• {{ $e }}</div> @endforeach</div>
+    @if($errors->any())
+        <div class="rounded-xl border border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-800" role="alert">
+            <p class="mb-1 font-semibold">Les changements n'ont pas été enregistrés :</p>
+            <ul class="list-disc space-y-0.5 pl-5">
+                @foreach($errors->all() as $e)<li>{{ $e }}</li>@endforeach
+            </ul>
+        </div>
     @endif
 
-    <div class="cm-p-grid">
-        <form method="POST" action="{{ route('parametres.update') }}" enctype="multipart/form-data" class="cm-p-card">
+    {{-- Suppression du logo : formulaire séparé (on ne peut pas imbriquer deux formulaires) --}}
+    @if($logo)
+        <form id="form-logo-supprimer" method="POST" action="{{ route('parametres.logo.supprimer') }}"
+              onsubmit="return confirm('Supprimer le logo ?')" class="hidden">
+            @csrf @method('DELETE')
+        </form>
+    @endif
+
+    {{-- Deux colonnes seulement sur grand écran (≥ 1536 px) : le menu de gauche réduit la largeur disponible --}}
+    <div class="grid items-start gap-6 2xl:grid-cols-2">
+
+        {{-- ═════════ Formulaire ═════════ --}}
+        <form id="form-identite" method="POST" action="{{ route('parametres.update') }}" enctype="multipart/form-data"
+              @submit="enCours = true" class="space-y-6">
             @csrf
 
-            <h2>Identité</h2>
-            <p class="cm-p-aide">Ces informations sont envoyées automatiquement à tous les postes clients.</p>
+            <section class="rounded-2xl border border-slate-200 bg-white p-6 shadow-sm">
+                <h2 class="text-base font-semibold text-slate-900">Informations de votre cyber</h2>
+                <p class="mb-5 mt-1 text-sm text-slate-500">Elles sont envoyées automatiquement à tous les postes clients.</p>
 
-            <div class="cm-p-champ">
-                <label for="nom_cyber">Nom du cyber</label>
-                <input type="text" id="nom_cyber" name="nom_cyber" maxlength="60" required x-model="nom" value="{{ old('nom_cyber', $p['nom_cyber']) }}">
-            </div>
-
-            <div class="cm-p-champ">
-                <label for="slogan">Slogan (facultatif)</label>
-                <input type="text" id="slogan" name="slogan" maxlength="80" x-model="slogan" value="{{ old('slogan', $p['slogan']) }}">
-                <small>Affiché sous le nom, sur l'écran de verrouillage.</small>
-            </div>
-
-            <div class="cm-p-champ">
-                <label for="nom_admin">Nom de l'administrateur (facultatif)</label>
-                <input type="text" id="nom_admin" name="nom_admin" maxlength="60" value="{{ old('nom_admin', $p['nom_admin']) }}">
-                <small>Affiché en haut à droite à la place du nom du compte.</small>
-            </div>
-
-            <div class="cm-p-champ">
-                <label>Couleur principale</label>
-                <div class="cm-p-couleur">
-                    <input type="color" x-model="couleur">
-                    <input type="text" name="couleur_principale" maxlength="7" x-model="couleur" style="max-width: 140px; font-family: monospace;">
-                </div>
-                <small>Utilisée pour l'ambiance de l'écran de verrouillage et l'icône de l'agent.</small>
-            </div>
-
-            <div class="cm-p-champ">
-                <label>Logo</label>
-                <div class="cm-p-drop" :class="survol ? 'survol' : ''"
-                     @click="$refs.fichier.click()"
-                     @dragover.prevent="survol = true" @dragleave.prevent="survol = false" @drop.prevent="deposer($event)">
-                    <template x-if="logoUrl"><img :src="logoUrl" alt="Logo"></template>
-                    <p><strong>Glissez une image ici</strong> ou cliquez pour parcourir</p>
-                    <p style="font-size: 11px;">PNG ou JPG · 2 Mo max · 64 × 64 px minimum (idéal : carré 512 × 512, fond transparent en PNG)</p>
-                    <p x-show="nomFichier" x-cloak style="color:#4f46e5; font-weight:600;" x-text="nomFichier"></p>
-                </div>
-                <input type="file" name="logo" accept="image/png,image/jpeg" x-ref="fichier" style="display:none" @change="choisir($event.target.files[0])">
-            </div>
-
-            <button type="submit" class="cm-p-btn">Enregistrer</button>
-        </form>
-
-        <div>
-            <div class="cm-p-card">
-                <h2>Aperçu de l'écran de verrouillage</h2>
-                <p class="cm-p-aide">Mise à jour en direct pendant la saisie.</p>
-                <div class="cm-p-apercu">
-                    <div class="halo" :style="`background: radial-gradient(circle at 70% 10%, ${couleur}, transparent 60%)`"></div>
-                    <div class="contenu">
-                        <template x-if="logoUrl"><img class="cm-p-logo" :src="logoUrl" alt=""></template>
-                        <template x-if="!logoUrl">
-                            <div class="cm-p-logo-def" :style="`background: linear-gradient(135deg, ${couleur}, #312e81)`">
-                                <svg width="44" height="44" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="12" rx="2"/><path d="M8 20h8M12 16v4"/></svg>
-                            </div>
-                        </template>
-                        <div class="cm-p-nom" x-text="nom || 'Cyber Manager'"></div>
-                        <div class="cm-p-slogan" x-show="slogan" x-text="slogan"></div>
-                        <div class="cm-p-pastille">POSTE 1</div>
+                <div class="space-y-5">
+                    <div>
+                        <label for="nom_cyber" class="{{ $label }}">Nom de votre cyber</label>
+                        <input type="text" id="nom_cyber" name="nom_cyber" x-model="nom" maxlength="60" required class="{{ $champ }}">
+                    </div>
+                    <div>
+                        <label for="slogan" class="{{ $label }}">Slogan <span class="font-normal text-slate-400">(facultatif)</span></label>
+                        <input type="text" id="slogan" name="slogan" x-model="slogan" maxlength="80" class="{{ $champ }}">
+                        <p class="mt-1 text-xs text-slate-500">Affiché sous le nom, sur l'écran de verrouillage.</p>
+                    </div>
+                    <div>
+                        <label for="nom_admin" class="{{ $label }}">Nom de l'administrateur <span class="font-normal text-slate-400">(facultatif)</span></label>
+                        <input type="text" id="nom_admin" name="nom_admin" x-model="admin" maxlength="60" class="{{ $champ }}">
+                        <p class="mt-1 text-xs text-slate-500">Affiché en haut à droite, à la place du nom du compte.</p>
                     </div>
                 </div>
-            </div>
+            </section>
 
-            @if ($logo)
-                <form method="POST" action="{{ route('parametres.logo.supprimer') }}" @submit="confirmerSuppression($event)" style="margin-top: 12px; text-align: right;">
-                    @csrf @method('DELETE')
-                    <button type="submit" class="cm-p-btn cm-p-btn-rouge">Supprimer le logo</button>
-                </form>
-            @endif
+            <section class="rounded-2xl border border-slate-200 bg-white p-6 shadow-sm">
+                <h2 class="text-base font-semibold text-slate-900">Couleur principale</h2>
+                <p class="mb-4 mt-1 text-sm text-slate-500">Donne l'ambiance de l'écran de verrouillage et la couleur de l'icône de l'agent.</p>
+
+                <div class="flex flex-wrap items-center gap-3">
+                    @foreach($couleursProposees as [$hex, $nomCouleur])
+                        <button type="button" title="{{ $nomCouleur }}" aria-label="{{ $nomCouleur }}"
+                                @click="couleur = '{{ $hex }}'"
+                                :class="couleur.toLowerCase() === '{{ $hex }}' ? 'ring-4 ring-slate-300' : 'hover:ring-2 hover:ring-slate-200'"
+                                class="flex h-9 w-9 items-center justify-center rounded-full text-white shadow-sm transition"
+                                style="background: {{ $hex }}">
+                            <span x-show="couleur.toLowerCase() === '{{ $hex }}'" x-cloak><x-icone nom="check" classe="h-5 w-5" /></span>
+                        </button>
+                    @endforeach
+
+                    <span class="mx-1 hidden h-6 w-px bg-slate-200 sm:block"></span>
+
+                    <label class="flex items-center gap-2 rounded-xl border border-slate-300 bg-white px-2 py-1.5 shadow-sm">
+                        <input type="color" :value="couleurAffichee" @input="couleur = $event.target.value"
+                               aria-label="Choisir une autre couleur" class="h-8 w-10 cursor-pointer rounded border-0 bg-transparent p-0">
+                        <input type="text" name="couleur_principale" x-model="couleur" maxlength="7" aria-label="Code de la couleur"
+                               class="w-24 border-0 bg-transparent p-0 font-mono text-sm font-semibold text-slate-800 focus:ring-0">
+                    </label>
+                </div>
+                <p x-show="!couleurValide" x-cloak class="mt-2 text-xs font-medium text-rose-600">Code de couleur incomplet : il doit ressembler à #7c3aed.</p>
+            </section>
+
+            <section class="rounded-2xl border border-slate-200 bg-white p-6 shadow-sm">
+                <h2 class="text-base font-semibold text-slate-900">Logo</h2>
+                <p class="mb-4 mt-1 text-sm text-slate-500">Affiché sur l'écran de verrouillage des postes.</p>
+
+                <div role="button" tabindex="0"
+                     @click="$refs.fichier.click()" @keydown.enter.prevent="$refs.fichier.click()"
+                     @dragover.prevent="survol = true" @dragleave.prevent="survol = false" @drop.prevent="deposer($event)"
+                     :class="survol ? 'border-violet-500 bg-violet-50' : 'border-slate-300 bg-slate-50 hover:border-violet-400'"
+                     class="flex cursor-pointer flex-col items-center gap-3 rounded-2xl border-2 border-dashed p-6 text-center transition focus:outline-none focus-visible:ring-2 focus-visible:ring-violet-500">
+                    <template x-if="logoUrl"><img :src="logoUrl" alt="Logo actuel" class="max-h-28 max-w-[220px] object-contain"></template>
+                    <template x-if="!logoUrl">
+                        <span class="flex h-14 w-14 items-center justify-center rounded-2xl bg-white text-slate-400 shadow-sm"><x-icone nom="upload-cloud" classe="h-7 w-7" /></span>
+                    </template>
+                    <p class="text-sm text-slate-600"><strong class="text-slate-900">Glissez une image ici</strong> ou cliquez pour la choisir</p>
+                    <p class="text-xs text-slate-500">PNG ou JPG · 2 Mo maximum · 64 × 64 px minimum<br>Idéal : image carrée 512 × 512, fond transparent (PNG)</p>
+                    <p x-show="nomFichier" x-cloak class="text-sm font-semibold text-violet-700" x-text="'Nouvelle image : ' + nomFichier"></p>
+                </div>
+                <input type="file" name="logo" accept="image/png,image/jpeg" x-ref="fichier" class="hidden" @change="choisir($event.target.files[0])">
+                <p x-show="erreurLogo" x-cloak class="mt-2 text-sm font-medium text-rose-600" x-text="erreurLogo"></p>
+
+                @if($logo)
+                    <div class="mt-3 text-right">
+                        <button type="submit" form="form-logo-supprimer"
+                                class="inline-flex h-9 items-center gap-1.5 rounded-lg border border-rose-200 bg-white px-3 text-sm font-medium text-rose-600 hover:bg-rose-50">
+                            <x-icone nom="trash" classe="h-4 w-4" /> Supprimer le logo
+                        </button>
+                    </div>
+                @endif
+            </section>
+        </form>
+
+        {{-- ═════════ Aperçu ═════════ --}}
+        <div class="space-y-6 2xl:sticky 2xl:top-4">
+            <section class="rounded-2xl border border-slate-200 bg-white p-6 shadow-sm">
+                <div class="mb-4 flex items-start justify-between gap-3">
+                    <div>
+                        <h2 class="text-base font-semibold text-slate-900">Aperçu de l'écran de verrouillage</h2>
+                        <p class="mt-1 text-sm text-slate-500">Ce que verront vos clients. Il change pendant que vous tapez.</p>
+                    </div>
+                    <span class="inline-flex shrink-0 items-center gap-1.5 text-xs font-medium text-slate-500">
+                        <span class="relative flex h-2 w-2">
+                            <span class="absolute inline-flex h-full w-full animate-ping rounded-full bg-violet-400 opacity-75"></span>
+                            <span class="relative inline-flex h-2 w-2 rounded-full bg-violet-500"></span>
+                        </span>
+                        En direct
+                    </span>
+                </div>
+
+                <div class="relative overflow-hidden rounded-2xl bg-slate-950 px-6 py-12 text-center text-slate-200 ring-1 ring-slate-800">
+                    <div class="absolute inset-0 opacity-30" :style="`background: radial-gradient(circle at 70% 10%, ${couleurAffichee}, transparent 60%)`"></div>
+                    <div class="relative">
+                        <template x-if="logoUrl"><img :src="logoUrl" alt="" class="mx-auto mb-4 max-h-28 max-w-[200px] object-contain"></template>
+                        <template x-if="!logoUrl">
+                            <div class="mx-auto mb-4 flex h-20 w-20 items-center justify-center rounded-[22px]"
+                                 :style="`background: linear-gradient(135deg, ${couleurAffichee}, #312e81)`">
+                                <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4" width="18" height="12" rx="2"/><path d="M8 20h8M12 16v4"/></svg>
+                            </div>
+                        </template>
+                        <div class="break-words text-3xl font-extrabold uppercase leading-tight tracking-[0.12em] text-white" x-text="nom.trim() || 'Cyber Manager'"></div>
+                        <div x-show="slogan.trim()" x-cloak class="mt-2 text-[11px] uppercase tracking-[0.25em] text-slate-400" x-text="slogan"></div>
+                        <div class="mt-6 inline-block rounded-xl border border-white/10 bg-white/10 px-5 py-1.5 text-sm font-bold">POSTE 1</div>
+                    </div>
+                </div>
+                <p class="mt-3 text-center text-xs text-slate-500">Aperçu simplifié : la disposition exacte sur le poste peut légèrement varier.</p>
+            </section>
+
+            <section class="rounded-2xl border border-slate-200 bg-white p-6 shadow-sm">
+                <h2 class="text-base font-semibold text-slate-900">Où ces informations apparaissent</h2>
+                <ul class="mt-3 space-y-3 text-sm text-slate-600">
+                    <li class="flex gap-3">
+                        <span class="mt-0.5 flex h-7 w-7 shrink-0 items-center justify-center rounded-lg bg-violet-50 text-violet-600"><x-icone nom="desktop" classe="h-4 w-4" /></span>
+                        <span><strong class="text-slate-900">Écran de verrouillage des postes :</strong> nom, slogan, logo et couleur, envoyés automatiquement.</span>
+                    </li>
+                    <li class="flex gap-3">
+                        <span class="mt-0.5 flex h-7 w-7 shrink-0 items-center justify-center rounded-lg bg-violet-50 text-violet-600"><x-icone nom="home" classe="h-4 w-4" /></span>
+                        <span><strong class="text-slate-900">Menu de gauche de l'administration :</strong> le nom de votre cyber.</span>
+                    </li>
+                    <li class="flex gap-3">
+                        <span class="mt-0.5 flex h-7 w-7 shrink-0 items-center justify-center rounded-lg bg-violet-50 text-violet-600"><x-icone nom="key" classe="h-4 w-4" /></span>
+                        <span><strong class="text-slate-900">En haut à droite :</strong> <span x-text="adminAffiche" class="font-semibold text-slate-900"></span></span>
+                    </li>
+                </ul>
+            </section>
+        </div>
+    </div>
+
+    {{-- ═════════ Barre d'enregistrement ═════════ --}}
+    <div class="sticky bottom-4 z-20 flex flex-wrap items-center justify-between gap-3 rounded-2xl border border-slate-200 bg-white/95 px-5 py-3 shadow-lg backdrop-blur">
+        <p class="flex items-center gap-2 text-sm" :class="dirty ? 'font-semibold text-amber-700' : 'text-slate-500'" aria-live="polite">
+            <span class="h-2 w-2 rounded-full" :class="dirty ? 'animate-pulse bg-amber-500' : 'bg-emerald-500'"></span>
+            <span x-text="dirty ? 'Vous avez des changements non enregistrés' : 'Tout est enregistré'"></span>
+        </p>
+        <div class="flex items-center gap-2">
+            <button type="button" @click="annuler()" :disabled="!dirty || enCours"
+                    class="inline-flex h-10 items-center rounded-xl border border-slate-300 bg-white px-4 text-sm font-semibold text-slate-700 hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-40">
+                Annuler les changements
+            </button>
+            <button type="submit" form="form-identite" :disabled="!dirty || enCours || !couleurValide"
+                    class="inline-flex h-10 items-center gap-2 rounded-xl bg-violet-600 px-5 text-sm font-semibold text-white shadow-sm hover:bg-violet-700 disabled:cursor-not-allowed disabled:opacity-40">
+                <span x-show="enCours" x-cloak class="h-4 w-4 animate-spin rounded-full border-2 border-white border-t-transparent"></span>
+                <span x-text="enCours ? 'Enregistrement…' : 'Enregistrer'"></span>
+            </button>
         </div>
     </div>
 </div>

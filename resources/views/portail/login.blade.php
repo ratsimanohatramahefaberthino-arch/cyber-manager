@@ -1,46 +1,55 @@
+@php
+    $c = $config;
+    $fond = $c['fond_type'] === 'gradient'
+        ? 'radial-gradient(120% 90% at 50% 0, ' . $c['fond_couleur_2'] . ' 0, transparent 70%), ' . $c['fond_couleur_1']
+        : $c['fond_couleur_1'];
+@endphp
 <!DOCTYPE html>
 <html lang="fr">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
-<meta name="theme-color" content="#0b1f24">
-<title>{{ $titre ?? 'Connexion Wi-Fi' }}</title>
+<meta name="theme-color" content="{{ $c['fond_couleur_1'] }}">
+<title>Connexion Wi-Fi</title>
 {{-- CSS inline : aucune requête externe, car avant connexion le client n'a pas Internet (seul le walled garden répond). --}}
 <style>
-:root{--nuit:#0b1f24;--onde:#3dd6d0;--ambre:#ffb020;--papier:#f4f7f6;--encre:#10262b;--gris:#5d7377;--err:#b3261e}
+:root{--f1:{{ $c['fond_couleur_1'] }};--carte:{{ $c['carte_couleur'] }};--carte-txt:{{ $c['carte_texte'] }};--accent:{{ $c['accent_couleur'] }};--bouton:{{ $c['bouton_fond'] }};--bouton-txt:{{ $c['bouton_texte'] }};--titre:{{ $c['titre_couleur'] }};--msg:{{ $c['message_couleur'] }};--rayon:{{ (int) $c['bouton_rayon'] }}px;--titre-t:{{ (int) $c['titre_taille'] }}px;--err:#b3261e}
 *{box-sizing:border-box;margin:0}
-body{font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;background:var(--nuit);color:var(--encre);min-height:100vh;min-height:100dvh;display:flex;flex-direction:column;-webkit-text-size-adjust:100%}
-.hero{padding:max(2rem,env(safe-area-inset-top)) 1.5rem 5rem;text-align:center;color:#fff;background:radial-gradient(120% 90% at 50% 0,#1b5c63 0,transparent 70%),var(--nuit)}
-.logo{width:76px;height:76px;margin:0 auto 1rem;border-radius:22px;background:#fff;display:grid;place-items:center;padding:10px;box-shadow:0 8px 30px rgba(61,214,208,.28)}
+body{font-family:{{ $c['police'] }};background:{{ $fond }};background-color:var(--f1);color:var(--carte-txt);min-height:100vh;min-height:100dvh;display:flex;flex-direction:column;-webkit-text-size-adjust:100%}
+.page{flex:1;display:flex;flex-direction:column}
+.hero{padding:max(2rem,env(safe-area-inset-top)) 1.5rem 5rem;text-align:center}
+.logo{width:76px;height:76px;margin:0 auto 1rem;border-radius:22px;background:#fff;display:grid;place-items:center;padding:10px;box-shadow:0 8px 30px rgba(0,0,0,.25)}
 .logo img{max-width:100%;max-height:100%;object-fit:contain}
-.logo svg{width:38px;height:38px;color:#12353c}
-h1{font-size:1.6rem;line-height:1.2;font-weight:750;letter-spacing:-.01em}
-.hero p{margin:.55rem auto 0;max-width:32ch;color:#b9d3d4;font-size:.95rem;line-height:1.45}
-main{flex:1;background:var(--papier);border-radius:28px 28px 0 0;margin-top:-3rem;padding:1.6rem 1.25rem calc(1.5rem + env(safe-area-inset-bottom))}
+.logo svg{width:38px;height:38px;color:#334155}
+h1{font-size:var(--titre-t);line-height:1.2;font-weight:700;letter-spacing:-.01em;color:var(--titre)}
+.hero p{margin:.55rem auto 0;max-width:32ch;color:var(--msg);font-size:.95rem;line-height:1.45}
+main{flex:1;background:var(--carte);color:var(--carte-txt);border-radius:28px 28px 0 0;margin-top:-3rem;padding:1.6rem 1.25rem calc(1.5rem + env(safe-area-inset-bottom))}
 .wrap{max-width:380px;margin:0 auto}
+.annonce{margin-bottom:1.1rem;padding:.7rem .9rem;border-radius:14px;text-align:center;font-size:.85rem;font-weight:700;line-height:1.35}
 .erreur{display:flex;gap:.6rem;align-items:flex-start;background:#fdecea;color:var(--err);border:1px solid #f5c6c2;border-radius:14px;padding:.8rem .9rem;font-size:.9rem;line-height:1.35;margin-bottom:1.1rem}
 .erreur svg{flex:none;width:20px;height:20px;margin-top:1px}
-label{display:block;font-size:.85rem;font-weight:600;color:var(--gris);margin:0 0 .35rem .15rem}
+label{display:block;font-size:.85rem;font-weight:600;opacity:.65;margin:0 0 .35rem .15rem}
 .champ{position:relative;margin-bottom:1rem}
-input{width:100%;height:54px;border:1.5px solid #cfdcdc;border-radius:14px;background:#fff;padding:0 1rem;font:inherit;font-size:16px;color:var(--encre);outline:0;transition:border-color .15s,box-shadow .15s}
-input:focus{border-color:var(--onde);box-shadow:0 0 0 4px rgba(61,214,208,.2)}
+input{width:100%;height:54px;border:1.5px solid #cfdcdc;border-radius:14px;background:#fff;padding:0 1rem;font:inherit;font-size:16px;color:#10262b;outline:0;transition:border-color .15s,box-shadow .15s}
+input:focus{border-color:var(--accent);box-shadow:0 0 0 2px var(--accent)}
 #mdp{padding-right:3.2rem}
-.oeil{position:absolute;right:.35rem;bottom:.35rem;width:44px;height:44px;border:0;background:none;color:var(--gris);border-radius:12px;display:grid;place-items:center;cursor:pointer}
-.oeil:focus-visible,.btn:focus-visible{outline:3px solid var(--onde);outline-offset:2px}
+.oeil{position:absolute;right:.35rem;bottom:.35rem;width:44px;height:44px;border:0;background:none;color:#5d7377;border-radius:12px;display:grid;place-items:center;cursor:pointer}
+.oeil:focus-visible,.btn:focus-visible{outline:3px solid var(--accent);outline-offset:2px}
 .oeil svg{width:22px;height:22px}
-.btn{width:100%;height:56px;margin-top:.4rem;border:0;border-radius:16px;background:var(--ambre);color:#2b1c00;font:inherit;font-size:1.05rem;font-weight:750;display:flex;align-items:center;justify-content:center;gap:.6rem;cursor:pointer;box-shadow:0 6px 18px rgba(255,176,32,.35);transition:transform .1s,filter .15s}
+.btn{width:100%;height:56px;margin-top:.4rem;border:0;border-radius:var(--rayon);background:var(--bouton);color:var(--bouton-txt);font:inherit;font-size:1.05rem;font-weight:700;display:flex;align-items:center;justify-content:center;gap:.6rem;cursor:pointer;box-shadow:0 6px 18px rgba(0,0,0,.2);transition:transform .1s,filter .15s}
 .btn:active{transform:scale(.98)}
 .btn[disabled]{filter:saturate(.7) brightness(.95);cursor:wait}
-.spin{display:none;width:20px;height:20px;border:3px solid rgba(43,28,0,.25);border-top-color:#2b1c00;border-radius:50%;animation:t .7s linear infinite}
+.spin{display:none;width:20px;height:20px;border:3px solid rgba(127,127,127,.35);border-top-color:currentColor;border-radius:50%;animation:t .7s linear infinite}
 .btn[disabled] .spin{display:block}
 @keyframes t{to{transform:rotate(360deg)}}
-.aide{margin-top:1.4rem;text-align:center;font-size:.88rem;color:var(--gris);line-height:1.5}
-.tarif{display:inline-block;margin-top:.5rem;background:#e3eeee;color:var(--encre);border-radius:999px;padding:.35rem .85rem;font-size:.82rem;font-weight:600}
+.aide{margin-top:1.4rem;text-align:center;font-size:.88rem;opacity:.8;line-height:1.5}
+.tarif{display:inline-block;margin-top:.5rem;background:rgba(0,0,0,.08);border-radius:999px;padding:.35rem .85rem;font-size:.82rem;font-weight:600}
 @media (prefers-reduced-motion:reduce){*{animation-duration:2s!important;transition:none!important}}
-@media (min-width:640px){body{justify-content:center;align-items:center;padding:2rem}.hero{width:100%;max-width:440px;border-radius:28px 28px 0 0;padding-bottom:5rem}main{flex:none;width:100%;max-width:440px;border-radius:0 0 28px 28px;margin-top:0}.hero+main{margin-top:-3rem;border-radius:28px}body>.hero{padding-top:2rem}}
+@media (min-width:640px){body{justify-content:center;align-items:center;padding:2rem}.page{flex:none;width:100%;max-width:440px}main{flex:none;border-radius:28px}}
 </style>
 </head>
 <body>
+<div class="page">
 <header class="hero">
     <div class="logo">
         @if($logo)
@@ -49,12 +58,16 @@ input:focus{border-color:var(--onde);box-shadow:0 0 0 4px rgba(61,214,208,.2)}
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M2 8.8a15 15 0 0 1 20 0M5 12.5a10 10 0 0 1 14 0M8.5 16a5 5 0 0 1 7 0"/><circle cx="12" cy="19.5" r="1" fill="currentColor"/></svg>
         @endif
     </div>
-    <h1>{{ $titre ?? 'Bienvenue' }}</h1>
-    <p>{{ $message ?? 'Entrez votre identifiant pour accéder à Internet.' }}</p>
+    <h1>{{ $c['titre'] }}</h1>
+    <p>{{ $c['message'] }}</p>
 </header>
 
 <main>
 <div class="wrap">
+    @if($c['annonce_active'] === '1' && $c['annonce_texte'] !== '')
+        <div class="annonce" style="background:{{ $c['annonce_fond'] }};color:{{ $c['annonce_texte_color'] }}">{{ $c['annonce_texte'] }}</div>
+    @endif
+
     @if(!empty($erreur))
         <div class="erreur" role="alert">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 7.5v5M12 16h.01"/></svg>
@@ -86,13 +99,15 @@ input:focus{border-color:var(--onde);box-shadow:0 0 0 4px rgba(61,214,208,.2)}
     </form>
 
     <p class="aide">
-        Pas encore d'identifiant ? Demandez un ticket à la caisse.
+        {{ $c['footer_texte'] }}
         @if(!empty($tarif_minute))
-            <br><span class="tarif">{{ $tarif_minute }} Ar/min · minimum {{ $tarif_minimum }} Ar</span>
+            @if($c['footer_texte'] !== '')<br>@endif
+            <span class="tarif">{{ $tarif_minute }} Ar/min · minimum {{ $tarif_minimum }} Ar</span>
         @endif
     </p>
 </div>
 </main>
+</div>
 
 <script>
 (function(){

@@ -64,20 +64,24 @@
 
 @php
     $cyber = \App\Models\CyberSetting::tous();
+
+    // 'motif' accepte un motif ou une liste de motifs de routes
     $liens = [
-        ['route' => 'dashboard',      'motif' => 'dashboard',   'label' => 'Dashboard', 'icone' => 'home'],
-        ['route' => 'postes.index',   'motif' => 'postes.*',    'label' => 'Postes',    'icone' => 'desktop'],
-        ['route' => 'sessions.index', 'motif' => 'sessions.*',  'label' => 'Sessions',  'icone' => 'clock'],
-        ['route' => 'wifi.index',     'motif' => 'wifi.*',      'label' => 'Wi-Fi',     'icone' => 'wifi'],
-        ['route' => 'hotspot.index',  'motif' => 'hotspot.*',   'label' => 'HotSpot',   'icone' => 'key'],
-        ['route' => 'tarifs.index',   'motif' => 'tarifs.*',    'label' => 'Tarifs',    'icone' => 'tag'],
-        ['route' => 'historique.index',   'motif' => 'historique.*',   'label' => 'Historique',   'icone' => 'archive'],
-        ['route' => 'statistiques.index', 'motif' => 'statistiques.*', 'label' => 'Statistiques', 'icone' => 'chart'],
-        ['route' => 'portail.admin',  'motif' => 'portail.*',   'label' => 'Portail Captif', 'icone' => 'link'],
-        ['route' => 'enregistrement.index', 'motif' => 'enregistrement.*', 'label' => 'Enregistrement', 'icone' => 'key'],
-        ['route' => 'parametres.index', 'motif' => 'parametres.*', 'label' => 'Paramètres', 'icone' => 'tag'],
+        ['route' => 'dashboard',          'motif' => 'dashboard',        'label' => 'Dashboard',    'icone' => 'home'],
+        ['route' => 'postes.index',       'motif' => 'postes.*',         'label' => 'Postes',       'icone' => 'desktop'],
+        ['route' => 'sessions.index',     'motif' => 'sessions.*',       'label' => 'Sessions',     'icone' => 'clock'],
+        ['route' => 'wifi.index',         'motif' => 'wifi.*',           'label' => 'Wi-Fi',        'icone' => 'wifi'],
+        ['route' => 'hotspot.index',      'motif' => 'hotspot.*',        'label' => 'HotSpot',      'icone' => 'key'],
+        ['route' => 'tarifs.index',       'motif' => 'tarifs.*',         'label' => 'Tarifs',       'icone' => 'tag'],
+        ['route' => 'historique.index',   'motif' => 'historique.*',     'label' => 'Historique',   'icone' => 'archive'],
+        ['route' => 'statistiques.index', 'motif' => 'statistiques.*',   'label' => 'Statistiques', 'icone' => 'chart'],
+        // Enregistrement et Portail Captif sont maintenant des onglets de Paramètres
+        ['route' => 'parametres.index',   'motif' => ['parametres.*', 'enregistrement.*', 'portail.*'], 'label' => 'Paramètres', 'icone' => 'tag'],
     ];
     $bientot = [];
+
+    // Pages qui reçoivent la navigation Paramètres (voir components/parametres/coque.blade.php)
+    $enParametres = request()->routeIs('parametres.*', 'enregistrement.*', 'portail.*');
 
     // Postes dont l'identité est en conflit (PC cloné) : alerte visible sur toutes les pages
     try {
@@ -115,7 +119,7 @@
 
             <nav class="flex-1 space-y-1 overflow-y-auto p-2">
                 @foreach($liens as $lien)
-                    @php $actif = request()->routeIs($lien['motif']); @endphp
+                    @php $actif = request()->routeIs(...(array) $lien['motif']); @endphp
                     <a href="{{ route($lien['route']) }}" title="{{ $lien['label'] }}"
                        @class([
                            'flex items-center gap-3 rounded-lg px-3 py-2.5 text-[15px] font-medium transition',
@@ -151,7 +155,7 @@
                 </div>
                 <nav class="flex-1 space-y-1 overflow-y-auto p-2">
                     @foreach($liens as $lien)
-                        @php $actif = request()->routeIs($lien['motif']); @endphp
+                        @php $actif = request()->routeIs(...(array) $lien['motif']); @endphp
                         <a href="{{ route($lien['route']) }}"
                            @class(['flex items-center gap-3 rounded-lg px-3 py-2.5 text-[15px] font-medium', 'bg-white text-indigo-900' => $actif, 'text-indigo-200 hover:bg-white/10' => !$actif])>
                             <x-icone :nom="$lien['icone']" class="h-5 w-5 shrink-0" /> {{ $lien['label'] }}
@@ -191,7 +195,13 @@
             </header>
 
             <main class="flex-1 overflow-y-auto p-4 sm:p-6">
-                @yield('content')
+                @if($enParametres)
+                    <x-parametres.coque>
+                        @yield('content')
+                    </x-parametres.coque>
+                @else
+                    @yield('content')
+                @endif
             </main>
         </div>
 

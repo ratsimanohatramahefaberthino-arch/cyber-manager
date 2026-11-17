@@ -2,195 +2,358 @@
 
 namespace App\Http\Controllers;
 
-use App\Models\AppareilWifi;
+use App\Models\CyberSetting;
 use App\Models\PortailParametre;
 use App\Models\Session;
-use App\Models\CyberSetting;
 use App\Services\MikroTikService;
+use App\Services\MikroTikStatusService;
+use App\Services\PortailConfig;
+use App\Services\ReseauService;
 use App\Services\TarifService;
+use Carbon\Carbon;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Cache;
+use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Storage;
+use Illuminate\Validation\Rule;
+use RuntimeException;
 
 class PortailController extends Controller
 {
+    private const MESSAGES = [
+        'required'     => 'Le champ « :attribute » est obligatoire.',
+        'regex'        => 'Le champ « :attribute » n\'a pas un format valide.',
+        'in'           => 'Le choix « :attribute » n\'est pas valide.',
+        'integer'      => '« :attribute » doit être un nombre entier.',
+        'between.numeric' => '« :attribute » doit être compris entre :min et :max.',
+        'max.string'   => '« :attribute » est trop long (:max caractères au plus).',
+        'max.file'     => 'Le logo est trop lourd (2 Mo au plus).',
+        'image'        => 'Le logo doit être une image.',
+        'mimes'        => 'Le logo doit être un fichier PNG, JPG ou WebP.',
+        'uploaded'     => 'Le logo n\'a pas pu être envoyé (fichier trop lourd pour le serveur ?).',
+        'ipv4'         => '« :attribute » doit ressembler à 192.168.1.10.',
+    ];
+
+    private const ATTRIBUTS = [
+        'titre' => 'Titre', 'titre_taille' => 'Taille du titre', 'message' => 'Message de bienvenue',
+        'police' => 'Police', 'fond_type' => 'Type de fond', 'bouton_rayon' => 'Arrondi du bouton',
+        'footer_texte' => 'Texte sous le bouton', 'annonce_texte' => 'Texte de l\'annonce', 'logo' => 'Logo',
+        'titre_couleur' => 'Couleur du titre', 'message_couleur' => 'Couleur du message',
+        'fond_couleur_1' => 'Fond principal', 'fond_couleur_2' => 'Halo du fond',
+        'carte_couleur' => 'Fond de la carte', 'carte_texte' => 'Texte de la carte',
+        'bouton_fond' => 'Fond du bouton', 'bouton_texte' => 'Texte du bouton', 'accent_couleur' => 'Couleur d\'accent',
+        'annonce_fond' => 'Fond de la bannière', 'annonce_texte_color' => 'Texte de la bannière',
+        'portail_domaine' => 'Nom de la page', 'portail_ip_serveur' => 'Adresse de ce PC',
+        'mikrotik_host' => 'Adresse du routeur', 'mikrotik_port' => 'Port du routeur',
+        'mikrotik_user' => 'Utilisateur du routeur', 'mikrotik_password' => 'Mot de passe du routeur',
+    ];
+
     public function __construct(
         private MikroTikService $mikroTik,
-        private TarifService $tarifService
+        private TarifService $tarifService,
+        private MikroTikStatusService $statutRouteur,
     ) {}
 
+    /** Conservée pour compatibilité avec le reste de l'application. */
     public static function parametresParDefaut(): array
     {
-        return [
-            'titre'               => 'Bienvenue au Cybercafé',
-            'titre_taille'        => '26',
-            'titre_couleur'       => '#ffffff',
-            'message'             => 'Veuillez vous connecter avec vos identifiants pour accéder à Internet.',
-            'message_couleur'     => '#b9d3d4',
-            'police'              => 'Inter, system-ui, sans-serif',
-            'fond_type'           => 'gradient',
-            'fond_couleur_1'      => '#0b1f24',
-            'fond_couleur_2'      => '#1b5c63',
-            'carte_couleur'       => '#f4f7f6',
-            'carte_texte'         => '#10262b',
-            'bouton_fond'         => '#ffb020',
-            'bouton_texte'        => '#2b1c00',
-            'bouton_rayon'        => '16',
-            'accent_couleur'      => '#3dd6d0',
-            'annonce_active'      => '0',
-            'annonce_texte'       => '🎉 Profitez d\'une connexion haut débit stable et sécurisée !',
-            'annonce_fond'        => '#ffb020',
-            'annonce_texte_color' => '#2b1c00',
-            'footer_texte'        => 'Demandez votre ticket d\'accès ou votre recharge à la caisse.',
-            'logo'                => null,
-        ];
+        return PortailConfig::defauts();
     }
 
-    private function getConfigurationPortail(): array
+    // ------------------------------------------------------------------
+    // Administration
+    // ------------------------------------------------------------------
+
+    public function adminIndex(Request $request)
     {
-        $defauts = self::parametresParDefaut();
-        $config = [];
-        foreach ($defauts as $cle => $valeurDefaut) {
-            $config[$cle] = PortailParametre::get($cle, $valeurDefaut);
-        }
-        return $config;
-    }
-
-    public function adminIndex()
-    {
-        $tarifWifi = $this->tarifService->tarifWifi();
-        $config = $this->getConfigurationPortail();
-
-        $ipOverride = CyberSetting::reseau('portail_ip_serveur');
-        $ipServeur = $ipOverride ?: ($this->mikroTik->detecterIpLocaleVersRouteur() ?: request()->server('SERVER_ADDR') ?: '127.0.0.1');
-        $portServeur = (int) (request()->getPort() ?: 80);
-
-        // NOUVEAU : nom de domaine local du portail
-        $domaine = CyberSetting::reseau('portail_domaine', 'portail.izara');
-
-        // URL basée sur le domaine local (plus stable que l'IP)
-        $urlPortail = 'http://' . $domaine . ($portServeur !== 80 ? ':' . $portServeur : '') . '/portail';
-
-        $routeurInfo = null;
-        try {
-            $routeurInfo = $this->mikroTik->testConnection();
-        } catch (\Throwable) {}
+        $config  = PortailConfig::charger();
+        $port    = (int) ($request->getPort() ?: 80);
+        $ip      = $this->ipServeur($this->mikroTik);
+        $domaine = CyberSetting::reseau('portail_domaine', PortailConfig::DOMAINE_DEFAUT);
+        $tarif   = $this->tarifService->tarifWifi();
+        $suffixe = ($port !== 80 ? ':' . $port : '') . '/portail';
 
         return view('portail.admin', [
-            'config'         => $config,
-            'tarifWifi'      => $tarifWifi,
-            'ipServeur'      => $ipServeur,
-            'portServeur'    => $portServeur,
-            'urlPortail'     => $urlPortail,
-            'domainePortail' => $domaine,
-            'routeurInfo'    => $routeurInfo,
-            'mikrotikConfig' => [
-                'host'     => CyberSetting::reseau('mikrotik_host'),
-                'user'     => CyberSetting::reseau('mikrotik_user'),
-                'port'     => CyberSetting::reseau('mikrotik_port'),
+            'config'      => $config,
+            'polices'     => PortailConfig::POLICES,
+            'logoUrl'     => $config['logo'] ? Storage::url($config['logo']) : '',
+            'port'        => $port,
+            'domaine'     => $domaine,
+            'ipServeur'   => $ip,
+            'ipManuelle'  => CyberSetting::reseau('portail_ip_serveur'),
+            'urlIp'       => $ip ? 'http://' . $ip . $suffixe : null,
+            'urlNom'      => $domaine ? 'http://' . $domaine . $suffixe : null,
+            'tarifTexte'  => $tarif ? "{$tarif->montant_par_minute} Ar/min · minimum {$tarif->montant_minimum} Ar" : null,
+            'routeur'     => $this->statutRouteur->obtenir(),
+            'routeurConfig' => [
+                'host' => CyberSetting::reseau('mikrotik_host'),
+                'port' => CyberSetting::reseau('mikrotik_port'),
+                'user' => CyberSetting::reseau('mikrotik_user'),
+                'mot_de_passe_defini' => filled(CyberSetting::reseau('mikrotik_password')),
             ],
+            'sync'        => $this->etatSynchro($ip),
         ]);
     }
 
+    /** « Enregistrer » ou « Enregistrer et diffuser au routeur » (sans redémarrer le HotSpot). */
     public function adminSave(Request $request)
     {
-        $request->validate([
-            'titre'               => 'required|string|max:255',
-            'titre_taille'        => 'required|integer|min:16|max:48',
-            'titre_couleur'       => 'required|string|max:20',
-            'message'             => 'required|string|max:1000',
-            'message_couleur'     => 'required|string|max:20',
-            'police'              => 'required|string|max:100',
-            'fond_type'           => 'required|in:gradient,solid',
-            'fond_couleur_1'      => 'required|string|max:20',
-            'fond_couleur_2'      => 'required|string|max:20',
-            'carte_couleur'       => 'required|string|max:20',
-            'carte_texte'         => 'required|string|max:20',
-            'bouton_fond'         => 'required|string|max:20',
-            'bouton_texte'        => 'required|string|max:20',
-            'bouton_rayon'        => 'required|integer|min:0|max:40',
-            'accent_couleur'      => 'required|string|max:20',
-            'annonce_active'      => 'nullable|in:0,1',
-            'annonce_texte'       => 'nullable|string|max:255',
-            'annonce_fond'        => 'nullable|string|max:20',
-            'annonce_texte_color' => 'nullable|string|max:20',
-            'footer_texte'        => 'nullable|string|max:255',
-            'logo'                => 'nullable|image|max:2048',
-        ]);
+        return $this->traiter($request, $request->boolean('diffuser'), false);
+    }
 
-        $champs = [
-            'titre', 'titre_taille', 'titre_couleur', 'message', 'message_couleur',
-            'police', 'fond_type', 'fond_couleur_1', 'fond_couleur_2', 'carte_couleur',
-            'carte_texte', 'bouton_fond', 'bouton_texte', 'bouton_rayon', 'accent_couleur',
-            'annonce_active', 'annonce_texte', 'annonce_fond', 'annonce_texte_color', 'footer_texte'
-        ];
-
-        foreach ($champs as $champ) {
-            PortailParametre::set($champ, $request->input($champ, self::parametresParDefaut()[$champ] ?? ''));
-        }
-
-        if ($request->hasFile('logo')) {
-            $ancienLogo = PortailParametre::get('logo');
-            if ($ancienLogo && Storage::disk('public')->exists($ancienLogo)) Storage::disk('public')->delete($ancienLogo);
-            $path = $request->file('logo')->store('portail', 'public');
-            PortailParametre::set('logo', $path);
-        } elseif ($request->boolean('supprimer_logo')) {
-            $ancienLogo = PortailParametre::get('logo');
-            if ($ancienLogo && Storage::disk('public')->exists($ancienLogo)) Storage::disk('public')->delete($ancienLogo);
-            PortailParametre::set('logo', null);
-        }
-
-        return back()->with('success', 'Paramètres enregistrés.');
+    /** Bouton de l'onglet Réseau : enregistre, synchronise ET redémarre le HotSpot. */
+    public function configurerRouteur(Request $request)
+    {
+        return $this->traiter($request, true, true);
     }
 
     public function adminResetDefaults()
     {
-        $defauts = self::parametresParDefaut();
-        foreach ($defauts as $cle => $valeur) {
-            if ($cle !== 'logo') PortailParametre::set($cle, $valeur);
-        }
-        return back()->with('success', 'Styles réinitialisés.');
+        $defauts = PortailConfig::defauts();
+        unset($defauts['logo']);
+        PortailConfig::enregistrer($defauts);
+
+        return redirect()->route('portail.admin')
+            ->with('onglet', 'design')
+            ->with('success', 'Textes et couleurs remis comme à l\'origine. Le logo est conservé.');
     }
 
-    public function configurerRouteur(Request $request)
+    private function traiter(Request $request, bool $diffuser, bool $redemarrer)
     {
-        $ipLocale = $request->input('server_ip') ?: (CyberSetting::reseau('portail_ip_serveur') ?: ($this->mikroTik->detecterIpLocaleVersRouteur() ?: request()->server('SERVER_ADDR')));
-        $port = (string) (request()->getPort() ?: '80');
+        $d = $request->validate($this->regles(), self::MESSAGES, self::ATTRIBUTS);
 
-        if (!$ipLocale || $ipLocale === '127.0.0.1' || str_starts_with($ipLocale, '169.254')) {
-            return back()->with('error', "L'IP détectée ({$ipLocale}) est invalide. Saisissez manuellement l'IP du serveur.");
+        // 1) Réglages d'affichage
+        $valeurs = [];
+        foreach (PortailConfig::CHAMPS as $cle) {
+            $valeurs[$cle] = $d[$cle] ?? ($cle === 'annonce_active' ? '0' : '');
         }
 
-        CyberSetting::setReseau('portail_ip_serveur', $ipLocale);
+        $ancienLogo  = PortailParametre::get('logo');
+        $nouveauLogo = $ancienLogo;
+        if ($request->hasFile('logo')) {
+            $nouveauLogo = $request->file('logo')->store('portail', 'public');
+        } elseif ($request->boolean('supprimer_logo')) {
+            $nouveauLogo = null;
+        }
+        $valeurs['logo'] = $nouveauLogo;
 
-        // Sauvegarde du domaine saisi dans le formulaire
-        if ($request->filled('portail_domaine')) {
-            CyberSetting::setReseau('portail_domaine', trim($request->input('portail_domaine')));
+        PortailConfig::enregistrer($valeurs);
+
+        if ($ancienLogo && $ancienLogo !== $nouveauLogo) {
+            Storage::disk('public')->delete($ancienLogo);
         }
 
-        $urlPortail = 'http://' . $ipLocale . ($port !== '80' ? ':' . $port : '') . '/portail';
+        // 2) Réglages réseau
+        if (filled($d['portail_domaine'] ?? null)) {
+            CyberSetting::setReseau('portail_domaine', strtolower(trim($d['portail_domaine'])));
+        }
+        CyberSetting::setReseau('portail_ip_serveur', filled($d['portail_ip_serveur'] ?? null) ? $d['portail_ip_serveur'] : null);
+
+        $routeurModifie = false;
+        foreach (['mikrotik_host', 'mikrotik_port', 'mikrotik_user', 'mikrotik_password'] as $k) {
+            if (filled($d[$k] ?? null)) {
+                CyberSetting::setReseau($k, (string) $d[$k]);
+                $routeurModifie = true;
+            }
+        }
+        if ($routeurModifie) {
+            Cache::forget('mikrotik.statut');
+        }
+
+        // 3) Réponse
+        $retour = redirect()->route('portail.admin')->with('onglet', $d['onglet'] ?? 'general');
+
+        if (!$diffuser) {
+            return $retour->with('success', 'Réglages enregistrés. Vos clients voient déjà les nouveaux textes et couleurs.');
+        }
+
+        $r = $this->synchroniserRouteur($request, $redemarrer);
+
+        return $r['ok']
+            ? $retour->with('success', 'Réglages enregistrés. ' . $r['message'])
+            : $retour->with('success', 'Réglages enregistrés : vos clients voient déjà les nouveaux textes et couleurs.')
+                     ->with('error', $r['message']);
+    }
+
+    private function regles(): array
+    {
+        $hex = ['required', 'regex:/^#[0-9a-fA-F]{6}$/'];
+
+        $ipUtilisable = function (string $attribut, mixed $valeur, \Closure $echec) {
+            if (!$this->ipUtilisable((string) $valeur)) {
+                $echec('L\'adresse saisie ne peut pas être utilisée (pas de 127.x.x.x ni de 169.254.x.x).');
+            }
+        };
+
+        return [
+            'titre'               => 'required|string|max:120',
+            'titre_taille'        => 'required|integer|between:18,36',
+            'message'             => 'required|string|max:300',
+            'police'              => ['required', Rule::in(array_keys(PortailConfig::POLICES))],
+            'fond_type'           => 'required|in:gradient,solid',
+            'bouton_rayon'        => 'required|integer|between:0,99',
+            'titre_couleur'       => $hex,
+            'message_couleur'     => $hex,
+            'fond_couleur_1'      => $hex,
+            'fond_couleur_2'      => $hex,
+            'carte_couleur'       => $hex,
+            'carte_texte'         => $hex,
+            'bouton_fond'         => $hex,
+            'bouton_texte'        => $hex,
+            'accent_couleur'      => $hex,
+            'annonce_fond'        => $hex,
+            'annonce_texte_color' => $hex,
+            'annonce_active'      => 'nullable|in:0,1',
+            'annonce_texte'       => 'nullable|string|max:150',
+            'footer_texte'        => 'nullable|string|max:200',
+            'logo'                => 'nullable|image|mimes:png,jpg,jpeg,webp|max:2048',
+
+            'portail_domaine'     => ['nullable', 'string', 'max:100', 'regex:/^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)*$/i'],
+            'portail_ip_serveur'  => ['nullable', 'ipv4', $ipUtilisable],
+            'mikrotik_host'       => ['nullable', 'ipv4'],
+            'mikrotik_port'       => 'nullable|integer|between:1,65535',
+            'mikrotik_user'       => 'nullable|string|max:64',
+            'mikrotik_password'   => 'nullable|string|max:128',
+            'onglet'              => 'nullable|in:general,design,reseau',
+        ];
+    }
+
+    // ------------------------------------------------------------------
+    // Synchronisation du routeur
+    // ------------------------------------------------------------------
+
+    /** @return array{ok:bool, message:string} */
+    private function synchroniserRouteur(Request $request, bool $redemarrer): array
+    {
+        // Nouvelle instance : elle relit l'adresse et le mot de passe du routeur qui viennent d'être enregistrés.
+        $mt = new MikroTikService();
+
+        $ip = $this->ipServeur($mt);
+        if ($ip === null) {
+            return $this->noter(false, null, 'L\'adresse de ce PC sur le réseau n\'a pas été trouvée. Saisissez-la dans l\'onglet Réseau (« Forcer une adresse »).');
+        }
+
+        $port    = (string) ($request->getPort() ?: 80);
+        $domaine = CyberSetting::reseau('portail_domaine', PortailConfig::DOMAINE_DEFAUT);
+        $url     = 'http://' . $ip . ($port !== '80' ? ':' . $port : '') . '/portail';
 
         try {
-            $this->mikroTik->nettoyerReglesObsolètesPortail();
-            $this->mikroTik->configurerWalledGarden($ipLocale, $port);
-            $this->mikroTik->verifierEtAjusterDhcpDns();
+            $mt->nettoyerReglesObsolètesPortail();
+            $mt->configurerWalledGarden($ip, $port);
+            $mt->verifierEtAjusterDhcpDns();
 
-            // Domaine : priorité au champ du formulaire, sinon valeur en base
-            $domaine = $request->input('portail_domaine') ?: CyberSetting::reseau('portail_domaine', 'portail.izara');
             if ($domaine) {
-                $this->mikroTik->configurerDnsLocal($domaine, $ipLocale);
+                $mt->configurerDnsLocal($domaine, $ip);
             }
 
-            // L'URL utilisée pour la redirection reste l'IP directe (pour éviter HSTS)
-            $this->mikroTik->installerRedirectionHotspot($urlPortail);
-            $this->mikroTik->redemarrerHotspotEtPurger();
+            if (!$mt->installerRedirectionHotspot($url)) {
+                throw new RuntimeException('Le fichier de redirection n\'a pas pu être écrit sur le routeur.');
+            }
 
-            return back()->with('success', "Routeur configuré avec succès ! Portail accessible sur : http://{$domaine}:{$port}/portail");
+            if ($redemarrer) {
+                $mt->redemarrerHotspotEtPurger();
+            } else {
+                $mt->viderCacheDns();
+            }
         } catch (\Throwable $e) {
-            return back()->with('error', "Erreur MikroTik : " . $e->getMessage());
+            Log::warning('Portail : synchronisation du routeur échouée', ['error' => $e->getMessage()]);
+
+            return $this->noter(false, $ip, $this->messageRouteur($e));
         }
+
+        $message = "Routeur synchronisé : les clients sont redirigés vers {$url}"
+            . ($domaine ? " (nom « {$domaine} » enregistré dans le routeur)." : '.')
+            . ($redemarrer ? ' Le HotSpot a été redémarré.' : '');
+
+        return $this->noter(true, $ip, $message);
     }
+
+    /** @return array{ok:bool, message:string} */
+    private function noter(bool $ok, ?string $ip, string $message): array
+    {
+        CyberSetting::setReseau('portail_sync_at', now()->toIso8601String());
+        CyberSetting::setReseau('portail_sync_ok', $ok ? '1' : '0');
+        CyberSetting::setReseau('portail_sync_message', $ok ? null : mb_substr($message, 0, 250));
+        if ($ok && $ip) {
+            CyberSetting::setReseau('portail_ip_synchronisee', $ip);
+        }
+
+        return ['ok' => $ok, 'message' => $message];
+    }
+
+    private function messageRouteur(\Throwable $e): string
+    {
+        $brut = $e->getMessage();
+
+        return match (true) {
+            (bool) preg_match('/impossible|timeout|ferm|refused/i', $brut)
+                => 'Le routeur ne répond pas. Vérifiez qu\'il est allumé, branché, et que son adresse est correcte (onglet Réseau).',
+            (bool) preg_match('/cannot log in|invalid user|login/i', $brut)
+                => 'Le routeur refuse l\'utilisateur ou le mot de passe (onglet Réseau, « Accès au routeur »).',
+            default => 'Le routeur a refusé une commande : ' . mb_substr($brut, 0, 160),
+        };
+    }
+
+    private function etatSynchro(?string $ipActuelle): array
+    {
+        $date = null;
+        try {
+            $at   = CyberSetting::reseau('portail_sync_at');
+            $date = $at ? Carbon::parse($at) : null;
+        } catch (\Throwable) {
+        }
+
+        $ipSync = CyberSetting::reseau('portail_ip_synchronisee');
+
+        return [
+            'jamais'          => $date === null,
+            'ok'              => CyberSetting::reseau('portail_sync_ok') === '1',
+            'il_y_a'          => $date?->locale('fr')->diffForHumans(),
+            'message'         => CyberSetting::reseau('portail_sync_message'),
+            'ip_synchronisee' => $ipSync,
+            'ip_changee'      => $ipSync && $ipActuelle && $ipSync !== $ipActuelle,
+        ];
+    }
+
+    // ------------------------------------------------------------------
+    // Adresse de ce PC
+    // ------------------------------------------------------------------
+
+    private function ipServeur(MikroTikService $mt): ?string
+    {
+        $manuelle = CyberSetting::reseau('portail_ip_serveur');
+        if ($manuelle && $this->ipUtilisable($manuelle)) {
+            return $manuelle;
+        }
+
+        try {
+            if (function_exists('socket_create')) {
+                $ip = $mt->detecterIpLocaleVersRouteur();
+                if ($ip && $this->ipUtilisable($ip)) {
+                    return $ip;
+                }
+            }
+        } catch (\Throwable) {
+        }
+
+        $ip = ReseauService::ipPrincipale();
+
+        return $ip && $this->ipUtilisable($ip) ? $ip : null;
+    }
+
+    private function ipUtilisable(?string $ip): bool
+    {
+        return $ip
+            && filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4)
+            && !str_starts_with($ip, '127.')
+            && !str_starts_with($ip, '169.254.')
+            && $ip !== '0.0.0.0';
+    }
+
+    // ------------------------------------------------------------------
+    // Pages vues par les clients
+    // ------------------------------------------------------------------
 
     private function macValide(?string $mac): ?string
     {
@@ -212,13 +375,31 @@ class PortailController extends Controller
         };
     }
 
+    /** Le formulaire de connexion ne doit jamais envoyer les identifiants vers un site extérieur. */
+    private function lienLoginAutorise(string $url): bool
+    {
+        $p = parse_url($url);
+        if (!$p || !in_array($p['scheme'] ?? '', ['http', 'https'], true) || empty($p['host'])) {
+            return false;
+        }
+
+        $hote = $p['host'];
+
+        if (filter_var($hote, FILTER_VALIDATE_IP)) {
+            // Accepté seulement si c'est une adresse privée ou réservée (réseau local)
+            return !filter_var($hote, FILTER_VALIDATE_IP, FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE);
+        }
+
+        return !str_contains($hote, '.') || (bool) preg_match('/\.(local|lan)$/i', $hote);
+    }
+
     public function login(Request $request)
     {
-        $hote = config('mikrotik.host');
+        $hote     = CyberSetting::reseau('mikrotik_host', config('mikrotik.host'));
         $loginUrl = "http://{$hote}/login";
-        $lien = $request->query('link-login-only');
+        $lien     = $request->query('link-login-only');
 
-        if ($lien && filter_var($lien, FILTER_VALIDATE_URL)) {
+        if (is_string($lien) && $this->lienLoginAutorise($lien)) {
             $loginUrl = $lien;
         }
 
@@ -226,7 +407,7 @@ class PortailController extends Controller
         $dst = url(route('portail.dashboard', array_filter(['mac' => $mac]), false));
 
         $tarif  = $this->tarifService->tarifWifi();
-        $config = $this->getConfigurationPortail();
+        $config = PortailConfig::charger();
 
         return response()->view('portail.login', [
             'config'        => $config,
@@ -241,17 +422,17 @@ class PortailController extends Controller
 
     public function dashboard(Request $request)
     {
-        $mac = $this->macValide($request->query('mac'));
-        $tarif = $this->tarifService->tarifWifi();
-        $config = $this->getConfigurationPortail();
+        $mac    = $this->macValide($request->query('mac'));
+        $tarif  = $this->tarifService->tarifWifi();
+        $config = PortailConfig::charger();
 
         return response()->view('portail.dashboard', [
-            'mac'          => $mac,
-            'mikrotik_ip'  => config('mikrotik.host'),
-            'config'       => $config,
-            'logo'         => $config['logo'] ? Storage::url($config['logo']) : null,
-            'tarif_minute' => $tarif?->montant_par_minute ?? 20,
-            'tarif_minimum'=> $tarif?->montant_minimum ?? 300,
+            'mac'           => $mac,
+            'mikrotik_ip'   => CyberSetting::reseau('mikrotik_host', config('mikrotik.host')),
+            'config'        => $config,
+            'logo'          => $config['logo'] ? Storage::url($config['logo']) : null,
+            'tarif_minute'  => $tarif?->montant_par_minute ?? 20,
+            'tarif_minimum' => $tarif?->montant_minimum ?? 300,
         ])->header('Cache-Control', 'no-store, max-age=0');
     }
 

@@ -438,4 +438,13 @@ class MikroTikService
             ]);
         }
     }
+
+        /** Vide le cache DNS du routeur, sans toucher au HotSpot (les clients restent connectés). */
+    public function viderCacheDns(): void
+    {
+        try {
+            $this->query('/ip/dns/cache/flush');
+        } catch (\Throwable) {
+        }
+    }
 }

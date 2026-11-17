@@ -4,19 +4,30 @@ namespace App\Http\Controllers;
 
 use App\Models\Poste;
 use App\Services\CodeInstallation;
+use App\Services\ReseauService;
 use Illuminate\Http\RedirectResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Facades\Validator;
 use Illuminate\Support\Str;
 
 class EnregistrementController extends Controller
 {
+    private const FUSEAU = 'Indian/Antananarivo';
+
     public function index(Request $request)
     {
+        $postes = Poste::all()->sortBy('nom_poste', SORT_NATURAL | SORT_FLAG_CASE)->values();
+
         return view('enregistrement.index', [
             'code'       => CodeInstallation::obtenir(),
-            'urlServeur' => $request->getSchemeAndHttpHost(),
-            'postes'     => Poste::orderBy('nom_poste')->get(),
+            'urlServeur' => ReseauService::urlServeur((int) $request->getPort()),
+            'ips'        => ReseauService::toutes(),
+            'nomExe'     => InstallationController::EXE,
+            'postes'     => $postes,
+            'conflits'   => $postes->filter(fn (Poste $p) => $p->aConflitIdentite())->values(),
+            'nbEnLigne'  => $postes->filter(fn (Poste $p) => $p->estEnLigne())->count(),
+            'fuseau'     => self::FUSEAU,
         ]);
     }
 
@@ -30,7 +41,8 @@ class EnregistrementController extends Controller
 
     public function renommer(Request $request, Poste $poste): RedirectResponse
     {
-        $data = $request->validate(
+        $validation = Validator::make(
+            $request->all(),
             ['nom_poste' => ['required', 'string', 'max:100']],
             [
                 'nom_poste.required' => 'Le nom du poste est obligatoire.',
@@ -38,7 +50,11 @@ class EnregistrementController extends Controller
             ]
         );
 
-        $nom = Poste::nettoyerNom($data['nom_poste']);
+        if ($validation->fails()) {
+            return back()->with('error', $validation->errors()->first());
+        }
+
+        $nom = Poste::nettoyerNom((string) $request->input('nom_poste'));
         if ($nom === '') {
             return back()->with('error', 'Le nom du poste est obligatoire.');
         }
