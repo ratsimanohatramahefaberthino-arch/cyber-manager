@@ -8,6 +8,7 @@ use App\Models\PosteCommande;
 use App\Models\PosteMessage;
 use App\Models\Session;
 use App\Services\CodeInstallation;
+use App\Services\IdentiteMaterielle;
 use App\Services\PosteSessionService;
 use Illuminate\Database\UniqueConstraintViolationException;
 use Illuminate\Http\JsonResponse;
@@ -21,6 +22,27 @@ class AgentController extends Controller
 {
     private const REGEX_MAC = '/^([0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}$/';
 
+    private function reglesEmpreinte(): array
+    {
+        return [
+            'nom_windows'      => ['nullable', 'string', 'max:100'],
+            'empreinte'        => ['nullable', 'array'],
+            'empreinte.uuid'   => ['nullable', 'string', 'max:40'],
+            'empreinte.macs'   => ['nullable', 'array', 'max:16'],
+            'empreinte.macs.*' => ['string', 'max:17'],
+        ];
+    }
+
+    private function reponseDoublon(): JsonResponse
+    {
+        return response()->json([
+            'ok'                    => false,
+            'code'                  => 'identifiant_a_regenerer',
+            'regenerer_identifiant' => true,
+            'message'               => "Cet ordinateur est un doublon d'un autre poste : il va recevoir une nouvelle identité.",
+        ], 409);
+    }
+
     public function handshake(Request $request, PosteSessionService $sessions): JsonResponse
     {
         $data = $request->validate([
@@ -30,15 +52,15 @@ class AgentController extends Controller
             'adresse_mac'        => ['nullable', 'string', 'regex:' . self::REGEX_MAC],
             'agent_version'      => ['nullable', 'string', 'max:32'],
             'code_installation'  => ['nullable', 'string', 'max:32'],
-        ]);
+        ] + $this->reglesEmpreinte());
 
-        $mac   = isset($data['adresse_mac']) ? strtoupper(str_replace('-', ':', $data['adresse_mac'])) : null;
-        $ipVue = $this->ipVue($request);
+        $mac        = isset($data['adresse_mac']) ? strtoupper(str_replace('-', ':', $data['adresse_mac'])) : null;
+        $ipVue      = $this->ipVue($request);
+        $emp        = IdentiteMaterielle::normaliser($data['empreinte'] ?? null);
+        $nomWindows = isset($data['nom_windows']) ? Poste::nettoyerNom($data['nom_windows']) : null;
 
-        $poste = Poste::where('identifiant_unique', $data['identifiant_unique'])->first();
-
-        $retourApresPanne = false;
-        $ancienSigne      = null;
+        $poste      = Poste::where('identifiant_unique', $data['identifiant_unique'])->first();
+        $reinstalle = false;
 
         if ($poste === null) {
             if (!CodeInstallation::verifier($data['code_installation'] ?? null)) {
@@ -50,9 +72,19 @@ class AgentController extends Controller
                 ], 403);
             }
 
+            // Système réinstallé sur le même ordinateur : on rattache au poste existant (aucune alerte)
+            $poste      = IdentiteMaterielle::retrouverPourReinstallation($emp, $mac, (string) $nomWindows, $data['nom_poste']);
+            $reinstalle = $poste !== null;
+        }
+
+        $retourApresPanne = false;
+        $ancienSigne      = null;
+
+        if ($poste === null) {
             try {
                 $poste = Poste::create([
                     'nom_poste'              => Poste::nomPourNouveauPoste($data['nom_poste']),
+                    'nom_windows'            => $nomWindows,
                     'identifiant_unique'     => $data['identifiant_unique'],
                     'adresse_ip'             => $data['adresse_ip'] ?? null,
                     'derniere_ip_vue'        => $ipVue,
@@ -72,18 +104,28 @@ class AgentController extends Controller
                 ], 409);
             }
 
+            IdentiteMaterielle::enregistrer($poste, $emp, $nomWindows);
             Log::info("Nouveau poste enregistré : « {$poste->nom_poste} » (demandé : « {$data['nom_poste']} »).");
             $nouveau = true;
         } else {
-            if ($poste->aConflitIdentite() && $mac !== null && $poste->adresse_mac !== null
-                && $mac !== strtoupper($poste->adresse_mac)) {
-                Log::warning("Poste « {$poste->nom_poste} » : un ordinateur dupliqué (MAC différente) reçoit l'ordre de changer d'identité.");
-                return response()->json([
-                    'ok'                   => false,
-                    'code'                 => 'identifiant_a_regenerer',
-                    'regenerer_identifiant' => true,
-                    'message'              => "Cet ordinateur est un doublon d'un autre poste : il va recevoir une nouvelle identité.",
-                ], 409);
+            if (!$reinstalle) {
+                $verdict = IdentiteMaterielle::memeMachine(IdentiteMaterielle::dePoste($poste), $emp);
+
+                if ($verdict === false && $poste->estEnLigne()) {
+                    // Autre ordinateur ET l'original répond : c'est un clone
+                    Log::warning("Poste « {$poste->nom_poste} » : un ordinateur cloné reçoit l'ordre de changer d'identité.");
+                    return $this->reponseDoublon();
+                }
+                if ($verdict === false) {
+                    Log::info("Poste « {$poste->nom_poste} » : remplacement matériel détecté (l'original est absent), nouvelle empreinte adoptée.");
+                }
+
+                // Séparation manuelle demandée sur un ancien poste (Gardien sans empreinte)
+                if ($emp === null && $poste->aConflitIdentite() && $mac !== null && $poste->adresse_mac !== null
+                    && $mac !== strtoupper($poste->adresse_mac)) {
+                    Log::warning("Poste « {$poste->nom_poste} » : un ordinateur dupliqué (MAC différente) reçoit l'ordre de changer d'identité.");
+                    return $this->reponseDoublon();
+                }
             }
 
             $retourApresPanne = !$poste->estEnLigne();
@@ -102,12 +144,15 @@ class AgentController extends Controller
                     : $poste->etat,
             ];
 
-            if ($this->conflitProbable($poste, $ipVue)) {
-                $maj['conflit_identite_at'] = now();
-                Log::warning("Poste « {$poste->nom_poste} » : deux ordinateurs semblent utiliser la même identité (PC cloné ?).");
+            if ($reinstalle) {
+                $maj['identifiant_unique'] = $data['identifiant_unique'];
+                $maj['agent_token']        = Str::random(64);
+                $maj['conflit_identite_at'] = null;
+                Log::info("Poste « {$poste->nom_poste} » : réinstallation sur le même ordinateur reconnue (aucune alerte).");
             }
 
             $poste->update($maj);
+            IdentiteMaterielle::enregistrer($poste, $emp, $nomWindows);
             $nouveau = false;
         }
 
@@ -140,23 +185,31 @@ class AgentController extends Controller
         $poste = $this->authentifier($request);
         if ($poste === null) return response()->json(['ok' => false, 'message' => 'Token invalide.'], 401);
 
-        $data = $request->validate(['adresse_ip' => ['nullable', 'ip']]);
+        $data = $request->validate(['adresse_ip' => ['nullable', 'ip']] + $this->reglesEmpreinte());
+
+        $emp        = IdentiteMaterielle::normaliser($data['empreinte'] ?? null);
+        $nomWindows = isset($data['nom_windows']) ? Poste::nettoyerNom($data['nom_windows']) : null;
 
         $etaitEnLigne = $poste->estEnLigne();
         $ancienSigne  = $poste->dernier_heartbeat;
 
-        $ipVue   = $this->ipVue($request);
-        $conflit = $this->conflitProbable($poste, $ipVue);
+        // Empreinte différente ET original encore présent = clone ; original absent = remplacement matériel
+        $verdict = IdentiteMaterielle::memeMachine(IdentiteMaterielle::dePoste($poste), $emp);
+        if ($verdict === false) {
+            if ($etaitEnLigne) {
+                Log::warning("Poste « {$poste->nom_poste} » : un ordinateur cloné reçoit l'ordre de changer d'identité.");
+                return $this->reponseDoublon();
+            }
+            Log::info("Poste « {$poste->nom_poste} » : remplacement matériel détecté (l'original est absent), nouvelle empreinte adoptée.");
+        }
+
+        $ipVue = $this->ipVue($request);
 
         $maj = ['dernier_heartbeat' => now(), 'derniere_communication' => now(), 'derniere_ip_vue' => $ipVue];
         if (!empty($data['adresse_ip'])) $maj['adresse_ip'] = $data['adresse_ip'];
 
-        if ($conflit) {
-            if ($poste->conflit_identite_at === null || $poste->conflit_identite_at->lt(now()->subMinute())) {
-                Log::warning("Poste « {$poste->nom_poste} » : deux ordinateurs semblent utiliser la même identité (PC cloné ?).");
-            }
-            $maj['conflit_identite_at'] = now();
-        } elseif ($poste->conflit_identite_at !== null
+        // Anciennes alertes (détection par adresse IP, abandonnée) : elles s'effacent toutes seules
+        if ($poste->conflit_identite_at !== null
             && $poste->conflit_identite_at->lt(now()->subMinutes(Poste::DUREE_CONFLIT_MINUTES))) {
             $maj['conflit_identite_at'] = null;
         }
@@ -165,6 +218,7 @@ class AgentController extends Controller
             $maj['etat'] = $poste->sessionActive() ? Poste::ETAT_OCCUPE : Poste::ETAT_DISPONIBLE;
         }
         $poste->update($maj);
+        IdentiteMaterielle::enregistrer($poste, $emp, $nomWindows);
 
         if ($etaitEnLigne) {
             $sessions->expirerSiNecessaire($poste);
@@ -361,15 +415,6 @@ class AgentController extends Controller
 
         if (str_starts_with($ip, '::ffff:')) $ip = substr($ip, 7);
         return $ip === '::1' ? '127.0.0.1' : $ip;
-    }
-
-    private function conflitProbable(Poste $poste, ?string $ipVue): bool
-    {
-        return $ipVue !== null
-            && $poste->derniere_ip_vue !== null
-            && $poste->derniere_ip_vue !== $ipVue
-            && $poste->dernier_heartbeat !== null
-            && $poste->dernier_heartbeat->gt(now()->subSeconds(Poste::DELAI_CONFLIT));
     }
 
     private function tracer(Poste $poste, string $type, string $resultat, array $payload = []): void
