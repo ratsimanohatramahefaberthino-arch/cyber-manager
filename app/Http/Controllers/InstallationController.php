@@ -4,6 +4,7 @@ namespace App\Http\Controllers;
 
 use App\Models\AgentVersion;
 use App\Models\CyberSetting;
+use App\Models\Poste;
 use App\Services\CodeInstallation;
 use App\Services\ReseauService;
 use Illuminate\Http\JsonResponse;
@@ -22,6 +23,12 @@ class InstallationController extends Controller
     private function chemin(string $f): string
     {
         return Storage::disk('local')->path(self::DOSSIER . '/' . $f);
+    }
+
+    /** Chemin tel qu'on le verrait dans l'Explorateur Windows. */
+    private function cheminAffiche(string $chemin): string
+    {
+        return str_replace('/', DIRECTORY_SEPARATOR, $chemin);
     }
 
     private function versionInstall(): ?AgentVersion
@@ -71,48 +78,69 @@ class InstallationController extends Controller
         $webviewOk = is_file($this->chemin(self::WEBVIEW));
         $zipOk     = class_exists(\ZipArchive::class);
 
+        $absent = 'Absent du serveur. Copiez le fichier exactement à l\'endroit indiqué ci-dessous (ou demandez à votre technicien).';
+
         $fichiers = [
             [
+                'cle'            => 'installateur',
                 'titre'          => 'Installateur Cyber Manager',
                 'description'    => 'Le programme à lancer sur chaque nouveau poste. Il récupère et configure tout le reste tout seul.',
+                'usage'          => 'Télécharge un dossier .zip contenant l\'installateur et l\'adresse de ce serveur, prêt à copier sur une clé USB.',
                 'icone'          => 'download',
                 'present'        => $exeOk,
                 'facultatif'     => false,
-                'telechargeable' => true,
+                'telechargeable' => $exeOk && $zipOk,
+                'url'            => route('parametres.installation.telecharger'),
                 'detail'         => $this->taille($this->chemin(self::EXE)),
-                'manquant'       => 'Absent du serveur. À publier par votre technicien (voir « Dépannage » plus bas).',
+                'manquant'       => $absent,
+                'chemin'         => $this->cheminAffiche($this->chemin(self::EXE)),
             ],
             [
-                'titre'       => 'Gardien du poste',
-                'description' => 'Garde le poste verrouillé et empêche les clients de modifier Windows. Installé automatiquement.',
-                'icone'       => 'lock',
-                'present'     => $gardienOk,
-                'facultatif'  => false,
-                'detail'      => $this->taille($this->chemin(self::GARDIEN)),
-                'manquant'    => 'Absent du serveur. À publier par votre technicien (voir « Dépannage » plus bas).',
+                'cle'            => 'gardien',
+                'titre'          => 'Gardien du poste',
+                'description'    => 'Garde le poste verrouillé et empêche les clients de modifier Windows. Installé automatiquement.',
+                'usage'          => 'Télécharge gardien.zip tel quel : utile pour réparer un poste à la main.',
+                'icone'          => 'lock',
+                'present'        => $gardienOk,
+                'facultatif'     => false,
+                'telechargeable' => $gardienOk,
+                'url'            => route('parametres.installation.fichier', 'gardien'),
+                'detail'         => $this->taille($this->chemin(self::GARDIEN)),
+                'manquant'       => $absent,
+                'chemin'         => $this->cheminAffiche($this->chemin(self::GARDIEN)),
             ],
             [
-                'titre'       => 'Écran de verrouillage',
-                'description' => 'L\'écran plein écran montré aux clients, avec vos couleurs et vos tarifs. Installé automatiquement.',
-                'icone'       => 'desktop',
-                'present'     => $ecranOk,
-                'facultatif'  => false,
-                'detail'      => collect([
+                'cle'            => 'ecran',
+                'titre'          => 'Écran de verrouillage',
+                'description'    => 'L\'écran plein écran montré aux clients, avec vos couleurs et vos tarifs. Installé automatiquement.',
+                'usage'          => 'Télécharge le paquet .zip de la version de l\'écran actuellement proposée aux nouveaux postes.',
+                'icone'          => 'desktop',
+                'present'        => $ecranOk,
+                'facultatif'     => false,
+                'telechargeable' => $ecranOk,
+                'url'            => route('parametres.installation.fichier', 'ecran'),
+                'detail'         => collect([
                     $v ? 'Version ' . $v->version : null,
                     $ecranOk ? $this->taille($v->chemin()) : null,
                 ])->filter()->implode(' · ') ?: null,
-                'manquant'    => 'Aucune version publiée.',
-                'lien'        => route('parametres.versions.index'),
-                'lien_texte'  => 'Ouvrir l\'onglet Versions',
+                'manquant'       => 'Aucune version publiée. Envoyez-en une depuis l\'onglet Versions (aucun chemin à connaître).',
+                'chemin'         => null,
+                'lien'           => route('parametres.versions.index'),
+                'lien_texte'     => 'Ouvrir l\'onglet Versions',
             ],
             [
-                'titre'       => 'WebView2 (hors ligne)',
-                'description' => 'Sert uniquement aux postes sans connexion Internet. Vous pouvez l\'ignorer si vos postes sont connectés.',
-                'icone'       => 'archive',
-                'present'     => $webviewOk,
-                'facultatif'  => true,
-                'detail'      => $this->taille($this->chemin(self::WEBVIEW)),
-                'manquant'    => 'Non fourni : sans importance si les postes ont Internet.',
+                'cle'            => 'webview2',
+                'titre'          => 'WebView2 (hors ligne)',
+                'description'    => 'Sert uniquement aux postes sans connexion Internet. Vous pouvez l\'ignorer si vos postes sont connectés.',
+                'usage'          => 'Télécharge webview2.exe : à lancer à la main sur un poste qui n\'a pas Internet.',
+                'icone'          => 'archive',
+                'present'        => $webviewOk,
+                'facultatif'     => true,
+                'telechargeable' => $webviewOk,
+                'url'            => route('parametres.installation.fichier', 'webview2'),
+                'detail'         => $this->taille($this->chemin(self::WEBVIEW)),
+                'manquant'       => 'Non fourni : sans importance si les postes ont Internet. Sinon, copiez-le à l\'endroit indiqué ci-dessous.',
+                'chemin'         => $this->cheminAffiche($this->chemin(self::WEBVIEW)),
             ],
         ];
 
@@ -127,6 +155,11 @@ class InstallationController extends Controller
             'peutTelecharger' => $exeOk && $zipOk,
             'nomExe'          => self::EXE,
             'code'            => $this->codeInstallation(),
+            'assistant'       => [
+                'maxId'        => (int) Poste::max('id'),
+                'urlPostes'    => route('parametres.installation.postes'),
+                'urlRenommer'  => route('parametres.installation.renommer', ['poste' => '__ID__']),
+            ],
         ]);
     }
 
@@ -134,7 +167,7 @@ class InstallationController extends Controller
     {
         $exe = $this->chemin(self::EXE);
         if (!is_file($exe)) {
-            return back()->withErrors(['global' => 'L\'installateur n\'est pas encore sur le serveur. Demandez à votre technicien de le publier.']);
+            return back()->withErrors(['global' => 'L\'installateur est absent du serveur. Copiez ' . self::EXE . ' ici : ' . $this->cheminAffiche($exe)]);
         }
         if (!class_exists(\ZipArchive::class)) {
             return back()->withErrors(['global' => 'L\'extension PHP « zip » est absente : activez extension=zip dans php.ini, puis redémarrez Apache.']);
@@ -165,6 +198,61 @@ class InstallationController extends Controller
         }
 
         return response()->download($tmp, 'CyberManagerInstallateur.zip')->deleteFileAfterSend(true);
+    }
+
+    /** Téléchargement direct (admin) du gardien, de l'écran ou de WebView2. */
+    public function fichier(string $cle)
+    {
+        if ($cle === 'ecran') {
+            $v = $this->versionInstall();
+            if (!$v || !$v->fichierExiste()) {
+                return back()->withErrors(['global' => 'Aucune version de l\'écran n\'est publiée. Envoyez-en une depuis l\'onglet Versions.']);
+            }
+
+            return response()->download($v->chemin(), $v->fichier);
+        }
+
+        [$chemin, $nom] = match ($cle) {
+            'gardien'  => [$this->chemin(self::GARDIEN), 'gardien.zip'],
+            'webview2' => [$this->chemin(self::WEBVIEW), 'webview2.exe'],
+            default    => abort(404),
+        };
+
+        if (!is_file($chemin)) {
+            return back()->withErrors(['global' => "« {$nom} » est absent du serveur. Copiez-le exactement ici : " . $this->cheminAffiche($chemin)]);
+        }
+
+        return response()->download($chemin, $nom);
+    }
+
+    /** Interrogé par l'assistant (étape « Attendre l'enregistrement »). */
+    public function postes(): JsonResponse
+    {
+        $liste = Poste::orderByDesc('id')->limit(10)->get()->map(fn (Poste $p) => [
+            'id'       => $p->id,
+            'nom'      => $p->nom_poste,
+            'ip'       => $p->adresse_ip,
+            'en_ligne' => $p->estEnLigne(),
+        ])->values();
+
+        return response()->json(['max_id' => (int) Poste::max('id'), 'postes' => $liste]);
+    }
+
+    /** Renommage depuis l'assistant (réponse JSON, la page ne se recharge pas). */
+    public function renommer(Request $request, Poste $poste): JsonResponse
+    {
+        $nom = Poste::nettoyerNom((string) $request->input('nom'));
+
+        if ($nom === '') {
+            return response()->json(['ok' => false, 'message' => 'Le nom est obligatoire.'], 422);
+        }
+        if (Poste::nomExiste($nom, $poste->id)) {
+            return response()->json(['ok' => false, 'message' => "Le nom « {$nom} » est déjà pris par un autre poste."], 422);
+        }
+
+        $poste->update(['nom_poste' => $nom]);
+
+        return response()->json(['ok' => true, 'nom' => $nom]);
     }
 
     // ------------------------------------------------------------------

@@ -5,8 +5,10 @@ use App\Http\Controllers\Api\AgentRestrictionsController;
 use App\Http\Controllers\Api\DecouverteController;
 use App\Http\Controllers\InstallationController;
 use App\Http\Controllers\ParcController;
+use App\Http\Controllers\PersonnelController;
 use App\Http\Controllers\RestrictionsController;
 use App\Http\Controllers\VersionsController;
+use App\Http\Middleware\RoleMiddleware;
 use Illuminate\Support\Facades\Route;
 
 Route::prefix('api/agent')->group(function () {
@@ -29,10 +31,13 @@ Route::prefix('api/agent')->group(function () {
     });
 });
 
-// Administration : Paramètres > Installation, Versions et Parc
-Route::middleware('auth')->prefix('parametres')->group(function () {
-    Route::get('/installation',                   [InstallationController::class, 'index'])->name('parametres.installation.index');
-    Route::get('/installation/telecharger',       [InstallationController::class, 'telecharger'])->name('parametres.installation.telecharger');
+// Administration (ADMIN uniquement) : Installation, Versions, Parc, Personnel
+Route::middleware(['auth', RoleMiddleware::class . ':admin'])->prefix('parametres')->group(function () {
+    Route::get('/installation',                         [InstallationController::class, 'index'])->name('parametres.installation.index');
+    Route::get('/installation/telecharger',             [InstallationController::class, 'telecharger'])->name('parametres.installation.telecharger');
+    Route::get('/installation/fichier/{cle}',           [InstallationController::class, 'fichier'])->whereIn('cle', ['gardien', 'ecran', 'webview2'])->name('parametres.installation.fichier');
+    Route::get('/installation/postes',                  [InstallationController::class, 'postes'])->name('parametres.installation.postes');
+    Route::post('/installation/postes/{poste}/renommer', [InstallationController::class, 'renommer'])->name('parametres.installation.renommer');
 
     Route::get('/versions',                       [VersionsController::class, 'index'])->name('parametres.versions.index');
     Route::post('/versions',                      [VersionsController::class, 'televerser'])->name('parametres.versions.televerser');
@@ -45,4 +50,9 @@ Route::middleware('auth')->prefix('parametres')->group(function () {
     Route::post('/parc/restrictions',             [RestrictionsController::class, 'enregistrer'])->name('parametres.parc.restrictions');
     Route::post('/parc/{poste}/renommer',         [ParcController::class, 'renommer'])->name('parametres.parc.renommer');
     Route::post('/parc/{poste}/maintenance',      [ParcController::class, 'maintenance'])->name('parametres.parc.maintenance');
+
+    Route::get('/personnel',                      [PersonnelController::class, 'index'])->name('parametres.personnel.index');
+    Route::post('/personnel',                     [PersonnelController::class, 'store'])->name('parametres.personnel.store');
+    Route::patch('/personnel/{utilisateur}',      [PersonnelController::class, 'update'])->name('parametres.personnel.update');
+    Route::delete('/personnel/{utilisateur}',     [PersonnelController::class, 'destroy'])->name('parametres.personnel.destroy');
 });

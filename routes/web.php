@@ -2,6 +2,7 @@
 
 use App\Http\Controllers\HotspotController;
 use App\Http\Controllers\ProfileController;
+use App\Http\Middleware\RoleMiddleware;
 use Illuminate\Support\Facades\Route;
 use App\Http\Controllers\DashboardController;
 use App\Http\Controllers\PosteController;
@@ -30,57 +31,36 @@ Route::get('/', function () {
 
 /*
 |--------------------------------------------------------------------------
-| Routes protégées (auth)
+| Routes protégées (auth) — admin ET personnel
+| Les blocs « $admin » sont réservés à l'administrateur.
 |--------------------------------------------------------------------------
 */
 
-Route::middleware('auth')->group(function () {
+$admin = RoleMiddleware::class . ':admin';
 
-    // -----------------------------------------------------------------
+Route::middleware('auth')->group(function () use ($admin) {
+
     // Dashboard
-    // -----------------------------------------------------------------
-    Route::get('/dashboard', [DashboardController::class, 'index'])
-        ->name('dashboard');
+    Route::get('/dashboard', [DashboardController::class, 'index'])->name('dashboard');
 
-    // -----------------------------------------------------------------
-    // Tarifs — règles tarifaires (Ethernet / Wi-Fi)
-    // -----------------------------------------------------------------
-    Route::get('/tarifs', [TarifController::class, 'index'])
-        ->name('tarifs.index');
+    // Tarifs : consultation pour tous, modification réservée à l'admin
+    Route::get('/tarifs', [TarifController::class, 'index'])->name('tarifs.index');
+    Route::post('/tarifs/simuler', [TarifController::class, 'simuler'])->name('tarifs.simuler');
 
-    Route::post('/tarifs/passer-separe', [TarifController::class, 'passerSepare'])
-        ->name('tarifs.passer-separe');
+    Route::middleware($admin)->group(function () {
+        Route::post('/tarifs/passer-separe', [TarifController::class, 'passerSepare'])->name('tarifs.passer-separe');
+        Route::post('/tarifs/passer-unifie', [TarifController::class, 'passerUnifie'])->name('tarifs.passer-unifie');
+        Route::post('/tarifs/reinitialiser', [TarifController::class, 'reinitialiser'])->name('tarifs.reinitialiser');
+        Route::patch('/tarifs/{tarif}', [TarifController::class, 'update'])->name('tarifs.update');
+        Route::post('/tarifs/{tarif}/raccourcis', [TarifController::class, 'storeRaccourci'])->name('tarifs.raccourcis.store');
+        Route::delete('/tarifs/{tarif}/raccourcis/{raccourci}', [TarifController::class, 'destroyRaccourci'])->name('tarifs.raccourcis.destroy');
+    });
 
-    Route::post('/tarifs/passer-unifie', [TarifController::class, 'passerUnifie'])
-        ->name('tarifs.passer-unifie');
-
-    Route::post('/tarifs/reinitialiser', [TarifController::class, 'reinitialiser'])
-        ->name('tarifs.reinitialiser');
-
-    Route::post('/tarifs/simuler', [TarifController::class, 'simuler'])
-        ->name('tarifs.simuler');
-
-    Route::patch('/tarifs/{tarif}', [TarifController::class, 'update'])
-        ->name('tarifs.update');
-
-    Route::post('/tarifs/{tarif}/raccourcis', [TarifController::class, 'storeRaccourci'])
-        ->name('tarifs.raccourcis.store');
-
-    Route::delete('/tarifs/{tarif}/raccourcis/{raccourci}', [TarifController::class, 'destroyRaccourci'])
-        ->name('tarifs.raccourcis.destroy');
-
-    // -----------------------------------------------------------------
     // Sessions
-    // -----------------------------------------------------------------
-    Route::get('/sessions', [SessionController::class, 'index'])
-        ->name('sessions.index');
+    Route::get('/sessions', [SessionController::class, 'index'])->name('sessions.index');
+    Route::post('/sessions', [SessionController::class, 'store'])->name('sessions.store');
 
-    Route::post('/sessions', [SessionController::class, 'store'])
-        ->name('sessions.store');
-
-    // -----------------------------------------------------------------
     // Postes
-    // -----------------------------------------------------------------
     Route::get('/postes',       [PosteController::class, 'index'])->name('postes.index');
     Route::get('/postes/etat',  [PosteController::class, 'etat'])->name('postes.etat');
 
@@ -101,92 +81,51 @@ Route::middleware('auth')->group(function () {
     Route::post('/postes/{poste}/arreter',     [PosteController::class, 'arreter'])->name('postes.arreter');
     Route::post('/postes/{poste}/recharger',   [PosteController::class, 'recharger'])->name('postes.recharger');
 
-    // -----------------------------------------------------------------
-    // Enregistrement des postes (code d'installation, renommer, conflits d'identité)
-    // -----------------------------------------------------------------
-    Route::get('/enregistrement',                              [EnregistrementController::class, 'index'])->name('enregistrement.index');
-    Route::post('/enregistrement/code',                        [EnregistrementController::class, 'regenererCode'])->name('enregistrement.code');
-    Route::post('/enregistrement/postes/{poste}/renommer',     [EnregistrementController::class, 'renommer'])->name('enregistrement.renommer');
-    Route::post('/enregistrement/postes/{poste}/separer',      [EnregistrementController::class, 'separer'])->name('enregistrement.separer');
-    Route::post('/enregistrement/postes/{poste}/ignorer',      [EnregistrementController::class, 'ignorerConflit'])->name('enregistrement.ignorer');
+    // ADMIN : enregistrement des postes (code d'installation, renommer, conflits d'identité)
+    Route::middleware($admin)->group(function () {
+        Route::get('/enregistrement',                          [EnregistrementController::class, 'index'])->name('enregistrement.index');
+        Route::post('/enregistrement/code',                    [EnregistrementController::class, 'regenererCode'])->name('enregistrement.code');
+        Route::post('/enregistrement/postes/{poste}/renommer', [EnregistrementController::class, 'renommer'])->name('enregistrement.renommer');
+        Route::post('/enregistrement/postes/{poste}/separer',  [EnregistrementController::class, 'separer'])->name('enregistrement.separer');
+        Route::post('/enregistrement/postes/{poste}/ignorer',  [EnregistrementController::class, 'ignorerConflit'])->name('enregistrement.ignorer');
 
-    // -----------------------------------------------------------------
-    // Paramètres (identité du cyber : nom, logo, couleur…)
-    // -----------------------------------------------------------------
-    Route::get('/parametres',         [ParametresController::class, 'index'])->name('parametres.index');
-    Route::post('/parametres',        [ParametresController::class, 'update'])->name('parametres.update');
-    Route::delete('/parametres/logo', [ParametresController::class, 'supprimerLogo'])->name('parametres.logo.supprimer');
+        // ADMIN : paramètres (identité du cyber) et mode production
+        Route::get('/parametres',         [ParametresController::class, 'index'])->name('parametres.index');
+        Route::post('/parametres',        [ParametresController::class, 'update'])->name('parametres.update');
+        Route::delete('/parametres/logo', [ParametresController::class, 'supprimerLogo'])->name('parametres.logo.supprimer');
 
-    // Mode production (sans terminal)
-    Route::get('/parametres/production',  [ProductionController::class, 'index'])->name('parametres.production.index');
-    Route::post('/parametres/production', [ProductionController::class, 'appliquer'])->name('parametres.production.appliquer');
+        Route::get('/parametres/production',  [ProductionController::class, 'index'])->name('parametres.production.index');
+        Route::post('/parametres/production', [ProductionController::class, 'appliquer'])->name('parametres.production.appliquer');
+    });
 
-    // -----------------------------------------------------------------
-    // Historique des sessions terminées (liste filtrable + export CSV)
-    // -----------------------------------------------------------------
+    // Historique et statistiques
     Route::get('/historique',        [HistoriqueController::class, 'index'])->name('historique.index');
     Route::get('/historique/export', [HistoriqueController::class, 'export'])->name('historique.export');
+    Route::get('/statistiques',      [StatistiqueController::class, 'index'])->name('statistiques.index');
 
-    // -----------------------------------------------------------------
-    // Statistiques (revenus Postes / Wi-Fi, graphiques)
-    // -----------------------------------------------------------------
-    Route::get('/statistiques', [StatistiqueController::class, 'index'])->name('statistiques.index');
-
-    // -----------------------------------------------------------------
-    // Profil utilisateur
-    // -----------------------------------------------------------------
+    // Profil utilisateur (la suppression de compte est réservée à l'admin)
     Route::get('/profile', [ProfileController::class, 'edit'])->name('profile.edit');
     Route::patch('/profile', [ProfileController::class, 'update'])->name('profile.update');
-    Route::delete('/profile', [ProfileController::class, 'destroy'])->name('profile.destroy');
+    Route::delete('/profile', [ProfileController::class, 'destroy'])->middleware($admin)->name('profile.destroy');
 
-    // -----------------------------------------------------------------
     // MikroTik — statut
-    // -----------------------------------------------------------------
-    Route::get('/mikrotik/statut', [MikroTikStatusController::class, 'show'])
-        ->name('mikrotik.statut');
+    Route::get('/mikrotik/statut', [MikroTikStatusController::class, 'show'])->name('mikrotik.statut');
 
-    // -----------------------------------------------------------------
-    // HotSpot (vouchers)
-    // -----------------------------------------------------------------
-    Route::get('/hotspot', [HotspotController::class, 'index'])
-        ->name('hotspot.index');
+    // HotSpot (vouchers = création de tickets)
+    Route::get('/hotspot', [HotspotController::class, 'index'])->name('hotspot.index');
+    Route::get('/hotspot/etat', [HotspotController::class, 'etat'])->name('hotspot.etat');
+    Route::get('/hotspot/options-mikrotik', [HotspotController::class, 'optionsMikrotik'])->name('hotspot.options-mikrotik');
+    Route::post('/hotspot/generer', [HotspotController::class, 'generer'])->name('hotspot.generer');
+    Route::post('/hotspot/ajouter', [HotspotController::class, 'ajouter'])->name('hotspot.ajouter');
+    Route::get('/hotspot/imprimer/{lot}', [HotspotController::class, 'imprimerLot'])->name('hotspot.imprimer.lot');
+    Route::get('/hotspot/imprimer-disponibles', [HotspotController::class, 'imprimerDisponibles'])->name('hotspot.imprimer.disponibles');
+    Route::post('/hotspot/{voucher}/proteger', [HotspotController::class, 'proteger'])->name('hotspot.proteger');
+    Route::post('/hotspot/appareils/{appareil}/renommer', [HotspotController::class, 'renommerAppareil'])->name('hotspot.appareils.renommer');
+    Route::post('/hotspot/synchroniser-tout', [HotspotController::class, 'synchroniserTout'])->name('hotspot.synchroniser-tout');
+    Route::post('/hotspot/supprimer-masse', [HotspotController::class, 'supprimerMasse'])->name('hotspot.supprimer-masse');
+    Route::post('/hotspot/pool-mode', [HotspotController::class, 'poolMode'])->name('hotspot.pool-mode');
 
-    Route::get('/hotspot/etat', [HotspotController::class, 'etat'])
-        ->name('hotspot.etat');
-
-    Route::get('/hotspot/options-mikrotik', [HotspotController::class, 'optionsMikrotik'])
-        ->name('hotspot.options-mikrotik');
-
-    Route::post('/hotspot/generer', [HotspotController::class, 'generer'])
-        ->name('hotspot.generer');
-
-    Route::post('/hotspot/ajouter', [HotspotController::class, 'ajouter'])
-        ->name('hotspot.ajouter');
-
-    Route::get('/hotspot/imprimer/{lot}', [HotspotController::class, 'imprimerLot'])
-        ->name('hotspot.imprimer.lot');
-
-    Route::get('/hotspot/imprimer-disponibles', [HotspotController::class, 'imprimerDisponibles'])
-        ->name('hotspot.imprimer.disponibles');
-
-    Route::post('/hotspot/{voucher}/proteger', [HotspotController::class, 'proteger'])
-        ->name('hotspot.proteger');
-
-    Route::post('/hotspot/appareils/{appareil}/renommer', [HotspotController::class, 'renommerAppareil'])
-        ->name('hotspot.appareils.renommer');
-
-    Route::post('/hotspot/synchroniser-tout', [HotspotController::class, 'synchroniserTout'])
-        ->name('hotspot.synchroniser-tout');
-
-    Route::post('/hotspot/supprimer-masse', [HotspotController::class, 'supprimerMasse'])
-        ->name('hotspot.supprimer-masse');
-
-    Route::post('/hotspot/pool-mode', [HotspotController::class, 'poolMode'])
-        ->name('hotspot.pool-mode');
-
-    // -----------------------------------------------------------------
     // Wi-Fi
-    // -----------------------------------------------------------------
     Route::get('/wifi', [WifiController::class, 'index'])->name('wifi.index');
     Route::get('/wifi/etat', [WifiController::class, 'etat'])->name('wifi.etat');
 
@@ -208,20 +147,21 @@ Route::middleware('auth')->group(function () {
     Route::post('/wifi/session/{session}/alarme/acquitter',  [WifiController::class, 'acquitterAlarme'])->name('wifi.session.alarme.acquitter');
     Route::post('/wifi/session/{session}/alarme/declencher', [WifiController::class, 'marquerAlarmeDeclenchee'])->name('wifi.session.alarme.declencher');
 
-    Route::get('/wifi/alarme',              [WifiAlarmController::class, 'index'])->name('wifi.alarme.index');
-    Route::post('/wifi/alarme/reglages',    [WifiAlarmController::class, 'reglages'])->name('wifi.alarme.reglages');
-    Route::post('/wifi/alarme/son',         [WifiAlarmController::class, 'uploader'])->name('wifi.alarme.son');
-    Route::post('/wifi/alarme/son/choisir', [WifiAlarmController::class, 'choisirSon'])->name('wifi.alarme.son.choisir');
-    Route::delete('/wifi/alarme/son',       [WifiAlarmController::class, 'supprimerSon'])->name('wifi.alarme.son.supprimer');
-    Route::post('/wifi/alarme/reinitialiser', [WifiAlarmController::class, 'reinitialiser'])->name('wifi.alarme.reinitialiser');
+    // Réglages de l'alarme Wi-Fi : consultation pour tous, modification admin
+    Route::get('/wifi/alarme', [WifiAlarmController::class, 'index'])->name('wifi.alarme.index');
+    Route::middleware($admin)->group(function () {
+        Route::post('/wifi/alarme/reglages',      [WifiAlarmController::class, 'reglages'])->name('wifi.alarme.reglages');
+        Route::post('/wifi/alarme/son',           [WifiAlarmController::class, 'uploader'])->name('wifi.alarme.son');
+        Route::post('/wifi/alarme/son/choisir',   [WifiAlarmController::class, 'choisirSon'])->name('wifi.alarme.son.choisir');
+        Route::delete('/wifi/alarme/son',         [WifiAlarmController::class, 'supprimerSon'])->name('wifi.alarme.son.supprimer');
+        Route::post('/wifi/alarme/reinitialiser', [WifiAlarmController::class, 'reinitialiser'])->name('wifi.alarme.reinitialiser');
 
-    // -----------------------------------------------------------------
-    // Portail Captif (Admin)
-    // -----------------------------------------------------------------
-    Route::get('/admin/portail', [PortailController::class, 'adminIndex'])->name('portail.admin');
-    Route::post('/admin/portail', [PortailController::class, 'adminSave'])->name('portail.admin.save');
-    Route::post('/admin/portail/reset', [PortailController::class, 'adminResetDefaults'])->name('portail.admin.reset');
-    Route::post('/admin/portail/configurer', [PortailController::class, 'configurerRouteur'])->name('portail.admin.configurer');
+        // Portail Captif (Admin)
+        Route::get('/admin/portail', [PortailController::class, 'adminIndex'])->name('portail.admin');
+        Route::post('/admin/portail', [PortailController::class, 'adminSave'])->name('portail.admin.save');
+        Route::post('/admin/portail/reset', [PortailController::class, 'adminResetDefaults'])->name('portail.admin.reset');
+        Route::post('/admin/portail/configurer', [PortailController::class, 'configurerRouteur'])->name('portail.admin.configurer');
+    });
 
 });
 

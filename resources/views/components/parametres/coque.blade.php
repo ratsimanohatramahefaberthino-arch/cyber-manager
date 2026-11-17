@@ -8,18 +8,19 @@
         request()->routeIs('parametres.installation.*') => 'installation',
         request()->routeIs('parametres.versions.*')     => 'versions',
         request()->routeIs('parametres.parc.*')         => 'parc',
+        request()->routeIs('parametres.personnel.*')    => 'personnel',
         request()->routeIs('enregistrement.*')          => 'enregistrement',
         request()->routeIs('portail.*')                 => 'portail',
         default                                         => 'identite',
     };
 
-    // [clé, libellé, icône, infobulle, route (null = pas encore disponible)]
+    // [clé, libellé, icône, infobulle, route]
     $entrees = [
         ['identite',       'Identité',             'tag',          'Nom, logo et couleur du cyber',         'parametres.index'],
         ['installation',   'Installation',         'upload-cloud', 'Ajouter un nouveau poste',              'parametres.installation.index'],
         ['versions',       'Versions',             'archive',      'Mises à jour des postes',               'parametres.versions.index'],
         ['parc',           'Parc et restrictions', 'desktop',      'État des postes et blocages Windows',   'parametres.parc.index'],
-        ['personnel',      'Personnel',            'lock',         'Bientôt disponible',                    null],
+        ['personnel',      'Personnel',            'lock',         'Comptes du personnel et leurs droits',  'parametres.personnel.index'],
         ['enregistrement', 'Enregistrement',       'check',        'Code d\'installation, noms des postes', 'enregistrement.index'],
         ['portail',        'Portail Captif',       'link',         'Page de connexion Wi-Fi',               'portail.admin'],
     ];

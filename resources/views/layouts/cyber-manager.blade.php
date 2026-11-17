@@ -64,6 +64,7 @@
 
 @php
     $cyber = \App\Models\CyberSetting::tous();
+    $estAdmin = Auth::user()?->estAdmin() ?? false;
 
     $liens = [
         ['route' => 'dashboard',          'motif' => 'dashboard',        'label' => 'Dashboard',    'icone' => 'home'],
@@ -76,12 +77,14 @@
         ['route' => 'statistiques.index', 'motif' => 'statistiques.*',   'label' => 'Statistiques', 'icone' => 'chart'],
         ['route' => 'parametres.index',   'motif' => ['parametres.*', 'enregistrement.*', 'portail.*'], 'label' => 'Paramètres', 'icone' => 'tag'],
     ];
+    // Le personnel n'a pas accès aux Paramètres
+    $liens = array_values(array_filter($liens, fn ($l) => $estAdmin || $l['route'] !== 'parametres.index'));
     $bientot = [];
 
     $enParametres = request()->routeIs('parametres.*', 'enregistrement.*', 'portail.*');
 
     try {
-        $nbConflits = \App\Models\Poste::whereNotNull('conflit_identite_at')->count();
+        $nbConflits = $estAdmin ? \App\Models\Poste::whereNotNull('conflit_identite_at')->count() : 0;
     } catch (\Throwable) {
         $nbConflits = 0;
     }
@@ -180,7 +183,10 @@
                         <span x-text="etat === 'ok' ? 'MikroTik connecté' : (etat === 'ko' ? 'MikroTik déconnecté' : 'MikroTik…')"></span>
                         <span x-show="env" x-cloak x-text="env.toUpperCase()" class="rounded bg-white/70 px-1 text-[10px] tracking-wide"></span>
                     </div>
-                    <span class="text-sm text-slate-600">{{ filled($cyber['nom_admin'] ?? null) ? $cyber['nom_admin'] : Auth::user()->name }}</span>
+                    <span class="text-sm text-slate-600">{{ ($estAdmin && filled($cyber['nom_admin'] ?? null)) ? $cyber['nom_admin'] : Auth::user()->name }}</span>
+                    @unless($estAdmin)
+                        <span class="rounded-full bg-sky-50 px-2 py-0.5 text-[11px] font-semibold text-sky-700 ring-1 ring-sky-200">Personnel</span>
+                    @endunless
                     <form method="POST" action="{{ route('logout') }}">
                         @csrf
                         <button type="submit" class="text-sm text-rose-600 hover:text-rose-800">Déconnexion</button>
@@ -189,7 +195,16 @@
             </header>
 
             <main class="flex-1 overflow-y-auto p-4 sm:p-6">
-                @if((config('app.debug') || config('app.env') !== 'production') && !request()->routeIs('parametres.production.*'))
+                @if(session('acces_refuse'))
+                    <div x-data="{ show: true }" x-show="show" x-transition
+                         class="mb-4 flex items-start gap-3 rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-900" role="alert">
+                        <x-icone nom="lock" class="mt-0.5 h-5 w-5 shrink-0" />
+                        <p class="flex-1">{{ session('acces_refuse') }}</p>
+                        <button type="button" @click="show = false" aria-label="Fermer" class="text-amber-700 hover:text-amber-900"><x-icone nom="x" class="h-4 w-4" /></button>
+                    </div>
+                @endif
+
+                @if($estAdmin && (config('app.debug') || config('app.env') !== 'production') && !request()->routeIs('parametres.production.*'))
                     <a href="{{ route('parametres.production.index') }}"
                        class="mb-4 flex items-center gap-2 rounded-xl border border-amber-200 bg-amber-50 px-4 py-2.5 text-sm text-amber-900 hover:bg-amber-100">
                         <span>⚠</span>
