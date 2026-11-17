@@ -16,6 +16,7 @@ use App\Http\Controllers\ParametresController;
 use App\Http\Controllers\HistoriqueController;
 use App\Http\Controllers\StatistiqueController;
 use App\Http\Controllers\EnregistrementController;
+use App\Http\Controllers\ProductionController;
 
 /*
 |--------------------------------------------------------------------------
@@ -77,14 +78,12 @@ Route::middleware('auth')->group(function () {
     Route::post('/sessions', [SessionController::class, 'store'])
         ->name('sessions.store');
 
-// -----------------------------------------------------------------
-    // Postes — REMPLACER l'ancien bloc "Postes Ethernet" par celui-ci
-    // (les routes fixes /postes/etat doivent rester AVANT les routes {poste})
+    // -----------------------------------------------------------------
+    // Postes
     // -----------------------------------------------------------------
     Route::get('/postes',       [PosteController::class, 'index'])->name('postes.index');
     Route::get('/postes/etat',  [PosteController::class, 'etat'])->name('postes.etat');
 
-    // Recharges rapides persistées (doivent rester AVANT les routes {poste})
     Route::post('/postes/raccourcis',                [PosteController::class, 'ajouterRaccourci'])->name('postes.raccourcis.store');
     Route::post('/postes/raccourcis/{id}/supprimer', [PosteController::class, 'supprimerRaccourci'])->name('postes.raccourcis.destroy');
 
@@ -101,7 +100,6 @@ Route::middleware('auth')->group(function () {
     Route::post('/postes/{poste}/activer',     [PosteController::class, 'activer'])->name('postes.activer');
     Route::post('/postes/{poste}/arreter',     [PosteController::class, 'arreter'])->name('postes.arreter');
     Route::post('/postes/{poste}/recharger',   [PosteController::class, 'recharger'])->name('postes.recharger');
-    Route::post('/postes/{poste}/hotspot',     [PosteController::class, 'enregistrerHotspot'])->name('postes.hotspot');
 
     // -----------------------------------------------------------------
     // Enregistrement des postes (code d'installation, renommer, conflits d'identité)
@@ -118,6 +116,10 @@ Route::middleware('auth')->group(function () {
     Route::get('/parametres',         [ParametresController::class, 'index'])->name('parametres.index');
     Route::post('/parametres',        [ParametresController::class, 'update'])->name('parametres.update');
     Route::delete('/parametres/logo', [ParametresController::class, 'supprimerLogo'])->name('parametres.logo.supprimer');
+
+    // Mode production (sans terminal)
+    Route::get('/parametres/production',  [ProductionController::class, 'index'])->name('parametres.production.index');
+    Route::post('/parametres/production', [ProductionController::class, 'appliquer'])->name('parametres.production.appliquer');
 
     // -----------------------------------------------------------------
     // Historique des sessions terminées (liste filtrable + export CSV)
@@ -235,23 +237,21 @@ Route::get('/api/portail/stats', [PortailController::class, 'apiStats'])->name('
 
 /*
 |--------------------------------------------------------------------------
-| API pour les Agents Windows — REMPLACER le bloc Route::prefix('api/agent')
+| API pour les Agents Windows
 |--------------------------------------------------------------------------
 */
 
 Route::prefix('api/agent')->group(function () {
-    // Limite : 30 tentatives par minute et par adresse (freine la recherche du code d'installation)
     Route::post('/handshake', [AgentController::class, 'handshake'])->middleware('throttle:30,1');
     Route::post('/heartbeat', [AgentController::class, 'heartbeat']);
     Route::post('/activer',   [AgentController::class, 'activer']);
     Route::post('/message',   [AgentController::class, 'message']);
     Route::post('/session/suspendre', [AgentController::class, 'suspendreSession']);
-    Route::post('/session/reprendre', [AgentController::class, 'reprendreSession']); // NOUVEAU
+    Route::post('/session/reprendre', [AgentController::class, 'reprendreSession']);
     Route::post('/session/fermer',    [AgentController::class, 'fermerSession']);
     Route::get('/commandes',  [AgentController::class, 'commandes']);
     Route::post('/commandes/{commande}/confirmer', [AgentController::class, 'confirmerCommande']);
     Route::get('/logo',       [AgentController::class, 'logo'])->name('agent.logo');
-    
 });
 
 /*

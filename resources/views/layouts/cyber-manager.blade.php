@@ -65,7 +65,6 @@
 @php
     $cyber = \App\Models\CyberSetting::tous();
 
-    // 'motif' accepte un motif ou une liste de motifs de routes
     $liens = [
         ['route' => 'dashboard',          'motif' => 'dashboard',        'label' => 'Dashboard',    'icone' => 'home'],
         ['route' => 'postes.index',       'motif' => 'postes.*',         'label' => 'Postes',       'icone' => 'desktop'],
@@ -75,15 +74,12 @@
         ['route' => 'tarifs.index',       'motif' => 'tarifs.*',         'label' => 'Tarifs',       'icone' => 'tag'],
         ['route' => 'historique.index',   'motif' => 'historique.*',     'label' => 'Historique',   'icone' => 'archive'],
         ['route' => 'statistiques.index', 'motif' => 'statistiques.*',   'label' => 'Statistiques', 'icone' => 'chart'],
-        // Enregistrement et Portail Captif sont maintenant des onglets de Paramètres
         ['route' => 'parametres.index',   'motif' => ['parametres.*', 'enregistrement.*', 'portail.*'], 'label' => 'Paramètres', 'icone' => 'tag'],
     ];
     $bientot = [];
 
-    // Pages qui reçoivent la navigation Paramètres (voir components/parametres/coque.blade.php)
     $enParametres = request()->routeIs('parametres.*', 'enregistrement.*', 'portail.*');
 
-    // Postes dont l'identité est en conflit (PC cloné) : alerte visible sur toutes les pages
     try {
         $nbConflits = \App\Models\Poste::whereNotNull('conflit_identite_at')->count();
     } catch (\Throwable) {
@@ -103,7 +99,6 @@
 
     <div class="flex h-screen overflow-hidden">
 
-        {{-- Sidebar desktop --}}
         <aside :class="open ? 'w-64' : 'w-[72px]'"
                class="hidden shrink-0 flex-col bg-gradient-to-b from-indigo-950 to-indigo-900 transition-all duration-200 sm:flex">
             <div class="flex h-14 items-center gap-2 border-b border-white/10 px-4">
@@ -141,7 +136,6 @@
             </nav>
         </aside>
 
-        {{-- Sidebar mobile --}}
         <div x-show="mobileOpen" x-cloak class="fixed inset-0 z-50 sm:hidden">
             <div class="absolute inset-0 bg-slate-900/50" @click="mobileOpen = false" x-transition.opacity></div>
             <aside x-show="mobileOpen" x-transition:enter="transition ease-out duration-200"
@@ -195,6 +189,14 @@
             </header>
 
             <main class="flex-1 overflow-y-auto p-4 sm:p-6">
+                @if((config('app.debug') || config('app.env') !== 'production') && !request()->routeIs('parametres.production.*'))
+                    <a href="{{ route('parametres.production.index') }}"
+                       class="mb-4 flex items-center gap-2 rounded-xl border border-amber-200 bg-amber-50 px-4 py-2.5 text-sm text-amber-900 hover:bg-amber-100">
+                        <span>⚠</span>
+                        <span><strong>Mode test actif.</strong> Passez en mode production avant d'utiliser le logiciel avec de vrais clients.</span>
+                    </a>
+                @endif
+
                 @if($enParametres)
                     <x-parametres.coque>
                         @yield('content')

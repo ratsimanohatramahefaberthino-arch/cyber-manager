@@ -55,15 +55,10 @@ class PortailController extends Controller
         private MikroTikStatusService $statutRouteur,
     ) {}
 
-    /** Conservée pour compatibilité avec le reste de l'application. */
     public static function parametresParDefaut(): array
     {
         return PortailConfig::defauts();
     }
-
-    // ------------------------------------------------------------------
-    // Administration
-    // ------------------------------------------------------------------
 
     public function adminIndex(Request $request)
     {
@@ -96,13 +91,11 @@ class PortailController extends Controller
         ]);
     }
 
-    /** « Enregistrer » ou « Enregistrer et diffuser au routeur » (sans redémarrer le HotSpot). */
     public function adminSave(Request $request)
     {
         return $this->traiter($request, $request->boolean('diffuser'), false);
     }
 
-    /** Bouton de l'onglet Réseau : enregistre, synchronise ET redémarre le HotSpot. */
     public function configurerRouteur(Request $request)
     {
         return $this->traiter($request, true, true);
@@ -123,7 +116,6 @@ class PortailController extends Controller
     {
         $d = $request->validate($this->regles(), self::MESSAGES, self::ATTRIBUTS);
 
-        // 1) Réglages d'affichage
         $valeurs = [];
         foreach (PortailConfig::CHAMPS as $cle) {
             $valeurs[$cle] = $d[$cle] ?? ($cle === 'annonce_active' ? '0' : '');
@@ -144,24 +136,29 @@ class PortailController extends Controller
             Storage::disk('public')->delete($ancienLogo);
         }
 
-        // 2) Réglages réseau
         if (filled($d['portail_domaine'] ?? null)) {
             CyberSetting::setReseau('portail_domaine', strtolower(trim($d['portail_domaine'])));
         }
         CyberSetting::setReseau('portail_ip_serveur', filled($d['portail_ip_serveur'] ?? null) ? $d['portail_ip_serveur'] : null);
 
         $routeurModifie = false;
-        foreach (['mikrotik_host', 'mikrotik_port', 'mikrotik_user', 'mikrotik_password'] as $k) {
-            if (filled($d[$k] ?? null)) {
-                CyberSetting::setReseau($k, (string) $d[$k]);
-                $routeurModifie = true;
+        if ($request->boolean('efface_routeur')) {
+            foreach (['mikrotik_host', 'mikrotik_port', 'mikrotik_user', 'mikrotik_password'] as $k) {
+                CyberSetting::setReseau($k, null);
+            }
+            $routeurModifie = true;
+        } else {
+            foreach (['mikrotik_host', 'mikrotik_port', 'mikrotik_user', 'mikrotik_password'] as $k) {
+                if (filled($d[$k] ?? null)) {
+                    CyberSetting::setReseau($k, (string) $d[$k]);
+                    $routeurModifie = true;
+                }
             }
         }
         if ($routeurModifie) {
             Cache::forget('mikrotik.statut');
         }
 
-        // 3) Réponse
         $retour = redirect()->route('portail.admin')->with('onglet', $d['onglet'] ?? 'general');
 
         if (!$diffuser) {
@@ -215,19 +212,18 @@ class PortailController extends Controller
             'mikrotik_port'       => 'nullable|integer|between:1,65535',
             'mikrotik_user'       => 'nullable|string|max:64',
             'mikrotik_password'   => 'nullable|string|max:128',
+            'efface_routeur'      => 'nullable|boolean',
             'onglet'              => 'nullable|in:general,design,reseau',
         ];
     }
 
-    // ------------------------------------------------------------------
-    // Synchronisation du routeur
-    // ------------------------------------------------------------------
-
-    /** @return array{ok:bool, message:string} */
     private function synchroniserRouteur(Request $request, bool $redemarrer): array
     {
-        // Nouvelle instance : elle relit l'adresse et le mot de passe du routeur qui viennent d'être enregistrés.
         $mt = new MikroTikService();
+
+        if (!$mt->estConfigure()) {
+            return $this->noter(false, null, 'Aucun routeur n\'est configuré (onglet Réseau, « Accès au routeur »).');
+        }
 
         $ip = $this->ipServeur($mt);
         if ($ip === null) {
@@ -269,7 +265,6 @@ class PortailController extends Controller
         return $this->noter(true, $ip, $message);
     }
 
-    /** @return array{ok:bool, message:string} */
     private function noter(bool $ok, ?string $ip, string $message): array
     {
         CyberSetting::setReseau('portail_sync_at', now()->toIso8601String());
@@ -316,10 +311,6 @@ class PortailController extends Controller
         ];
     }
 
-    // ------------------------------------------------------------------
-    // Adresse de ce PC
-    // ------------------------------------------------------------------
-
     private function ipServeur(MikroTikService $mt): ?string
     {
         $manuelle = CyberSetting::reseau('portail_ip_serveur');
@@ -351,10 +342,6 @@ class PortailController extends Controller
             && $ip !== '0.0.0.0';
     }
 
-    // ------------------------------------------------------------------
-    // Pages vues par les clients
-    // ------------------------------------------------------------------
-
     private function macValide(?string $mac): ?string
     {
         if (!$mac) return null;
@@ -375,7 +362,6 @@ class PortailController extends Controller
         };
     }
 
-    /** Le formulaire de connexion ne doit jamais envoyer les identifiants vers un site extérieur. */
     private function lienLoginAutorise(string $url): bool
     {
         $p = parse_url($url);
@@ -386,7 +372,6 @@ class PortailController extends Controller
         $hote = $p['host'];
 
         if (filter_var($hote, FILTER_VALIDATE_IP)) {
-            // Accepté seulement si c'est une adresse privée ou réservée (réseau local)
             return !filter_var($hote, FILTER_VALIDATE_IP, FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE);
         }
 
@@ -395,8 +380,8 @@ class PortailController extends Controller
 
     public function login(Request $request)
     {
-        $hote     = CyberSetting::reseau('mikrotik_host', config('mikrotik.host'));
-        $loginUrl = "http://{$hote}/login";
+        $hote     = CyberSetting::reseau('mikrotik_host');
+        $loginUrl = $hote ? "http://{$hote}/login" : url('/portail');
         $lien     = $request->query('link-login-only');
 
         if (is_string($lien) && $this->lienLoginAutorise($lien)) {
@@ -428,7 +413,7 @@ class PortailController extends Controller
 
         return response()->view('portail.dashboard', [
             'mac'           => $mac,
-            'mikrotik_ip'   => CyberSetting::reseau('mikrotik_host', config('mikrotik.host')),
+            'mikrotik_ip'   => CyberSetting::reseau('mikrotik_host'),
             'config'        => $config,
             'logo'          => $config['logo'] ? Storage::url($config['logo']) : null,
             'tarif_minute'  => $tarif?->montant_par_minute ?? 20,

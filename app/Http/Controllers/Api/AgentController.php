@@ -35,7 +35,6 @@ class AgentController extends Controller
         $mac   = isset($data['adresse_mac']) ? strtoupper(str_replace('-', ':', $data['adresse_mac'])) : null;
         $ipVue = $this->ipVue($request);
 
-        // Un poste se reconnaît UNIQUEMENT par son identifiant, jamais par son nom.
         $poste = Poste::where('identifiant_unique', $data['identifiant_unique'])->first();
 
         $retourApresPanne = false;
@@ -43,7 +42,7 @@ class AgentController extends Controller
 
         if ($poste === null) {
             if (!CodeInstallation::verifier($data['code_installation'] ?? null)) {
-                Log::warning("Enregistrement refusé depuis {$ipVue} : code d'installation absent ou invalide. Code reçu : " . ($data['code_installation'] ?? 'null'));
+                Log::warning("Enregistrement refusé depuis {$ipVue} : code d'installation absent ou invalide.");
                 return response()->json([
                     'ok'      => false,
                     'code'    => 'code_installation_invalide',
@@ -131,10 +130,10 @@ class AgentController extends Controller
             'session'              => $session ? $this->resumeSession($session) : null,
             'branding'             => CyberSetting::brandingAgent(),
             'message'              => $nouveau ? 'Poste enregistré.' : 'Poste reconnu.',
+            'delai_hors_ligne_s'   => Poste::DELAI_HORS_LIGNE,
+            'delai_grace_agent_s'  => Poste::DELAI_GRACE_AGENT,
         ]);
     }
-
-    // ... (le reste du fichier est inchangé, je le mets en entier pour éviter toute erreur)
 
     public function heartbeat(Request $request, PosteSessionService $sessions): JsonResponse
     {
@@ -174,6 +173,8 @@ class AgentController extends Controller
         }
         $poste->refresh();
 
+        app(\App\Services\AccesInternetService::class)->reconcilierTous();
+
         $etat    = $poste->etatAffiche();
         $session = $poste->sessionActive();
 
@@ -184,6 +185,8 @@ class AgentController extends Controller
             'doit_etre_verrouille' => $this->doitEtreVerrouille($etat),
             'session'              => $session ? $this->resumeSession($session) : null,
             'branding'             => CyberSetting::brandingAgent(),
+            'delai_hors_ligne_s'   => Poste::DELAI_HORS_LIGNE,
+            'delai_grace_agent_s'  => Poste::DELAI_GRACE_AGENT,
         ]);
     }
 
@@ -218,7 +221,7 @@ class AgentController extends Controller
         });
 
         if ($posteFinal !== null) {
-            $reseau = $sessions->connecterReseau($posteFinal);
+            $reseau = app(\App\Services\AccesInternetService::class)->autoriser($posteFinal);
             if ($reseau === false) $corps['avertissement'] = "Connexion Internet momentanément indisponible.";
         }
 
@@ -242,7 +245,7 @@ class AgentController extends Controller
         if (!$ok) return response()->json(['ok' => false, 'message' => 'Aucune session active à suspendre.'], 409);
 
         $corps = ['ok' => true, 'message' => 'Session suspendue.'];
-        if ($sessions->deconnecterReseau($poste) === false) $corps['avertissement'] = "Coupure Internet non confirmée.";
+        if (app(\App\Services\AccesInternetService::class)->couper($poste) === false) $corps['avertissement'] = "Coupure Internet non confirmée.";
         return response()->json($corps);
     }
 
@@ -261,7 +264,7 @@ class AgentController extends Controller
         if (!$ok) return response()->json(['ok' => false, 'message' => 'Aucune session à reprendre.'], 409);
 
         $corps = ['ok' => true, 'message' => 'Session reprise.'];
-        if ($sessions->connecterReseau($poste) === false) $corps['avertissement'] = "Connexion Internet non confirmée.";
+        if (app(\App\Services\AccesInternetService::class)->autoriser($poste) === false) $corps['avertissement'] = "Connexion Internet non confirmée.";
         return response()->json($corps);
     }
 
@@ -294,7 +297,7 @@ class AgentController extends Controller
         [$posteFinal, $montant] = $resultat;
 
         $corps = ['ok' => true, 'message' => 'Session terminée.', 'montant' => $montant];
-        if ($sessions->deconnecterReseau($posteFinal) === false) $corps['avertissement'] = "Coupure Internet non confirmée.";
+        if (app(\App\Services\AccesInternetService::class)->couper($posteFinal) === false) $corps['avertissement'] = "Coupure Internet non confirmée.";
         return response()->json($corps);
     }
 

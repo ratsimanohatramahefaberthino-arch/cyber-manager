@@ -7,6 +7,7 @@ use App\Models\PosteCommande;
 use App\Models\PosteMessage;
 use App\Models\Session;
 use App\Models\TarifRaccourci;
+use App\Services\AccesInternetService;
 use App\Services\PosteSessionService;
 use App\Services\TarifService;
 use Illuminate\Http\JsonResponse;
@@ -30,7 +31,7 @@ class PosteController extends Controller
         'arreter'     => ['label' => 'Arrêter',      'couleur' => 'rouge', 'confirm' => "Éteindre le PC ?"],
     ];
 
-    public function __construct(private PosteSessionService $sessions) {}
+    public function __construct(private PosteSessionService $sessions, private AccesInternetService $internet) {}
 
     public function index()
     {
@@ -51,6 +52,7 @@ class PosteController extends Controller
 
     public function etat(): JsonResponse
     {
+        $this->internet->reconcilierTous();
         return response()->json(['ok' => true, 'postes' => $this->tousLesPostes()]);
     }
 
@@ -79,7 +81,6 @@ class PosteController extends Controller
             return $this->echec($request, "Le poste n'est pas disponible.");
         }
 
-        // Première activation d'un forfait : le minimum du tarif s'applique (pas aux recharges).
         if ($data['type'] === 'forfait') {
             try {
                 $tarif   = app(TarifService::class)->tarifStandard();
@@ -91,13 +92,12 @@ class PosteController extends Controller
                     return $this->echec($request, "Première activation : minimum {$minimum} Ar ({$dureeMin} min).");
                 }
             } catch (\Throwable) {
-                // tarif introuvable : on ne bloque pas
             }
         }
 
         $duree = $data['type'] === 'forfait' ? (int) $data['duree_minutes'] : null;
         $session = $this->sessions->creerSession($poste, $data['type'], $duree);
-        $reseau  = $this->sessions->connecterReseau($poste);
+        $reseau  = $this->internet->autoriser($poste);
 
         PosteMessage::where('poste_id', $poste->id)->delete();
 
@@ -111,7 +111,7 @@ class PosteController extends Controller
     {
         if (!$poste->sessionActive()) $this->sessions->creerSession($poste, 'libre', null);
         $this->sessions->reprendre($poste);
-        $reseau = $this->sessions->connecterReseau($poste);
+        $reseau = $this->internet->autoriser($poste);
         PosteCommande::create(['poste_id' => $poste->id, 'type' => 'debloquer']);
         return $this->ok($request, "Poste {$poste->nom_poste} débloqué." . $this->avertissementReseau($reseau));
     }
@@ -136,7 +136,7 @@ class PosteController extends Controller
         });
 
         if (!$ok) return $this->echec($request, 'Aucune session active.');
-        $reseau = $this->sessions->deconnecterReseau($poste);
+        $reseau = $this->internet->couper($poste);
         PosteCommande::create(['poste_id' => $poste->id, 'type' => 'suspendre']);
         return $this->ok($request, "Session suspendue." . $this->avertissementReseau($reseau, 'coupé'));
     }
@@ -144,7 +144,7 @@ class PosteController extends Controller
     public function reprendre(Request $request, Poste $poste)
     {
         if (!$this->sessions->reprendre($poste)) return $this->echec($request, 'Aucune session à reprendre.');
-        $reseau = $this->sessions->connecterReseau($poste);
+        $reseau = $this->internet->autoriser($poste);
         PosteCommande::create(['poste_id' => $poste->id, 'type' => 'reprendre']);
         return $this->ok($request, "Session reprise." . $this->avertissementReseau($reseau));
     }
@@ -171,7 +171,7 @@ class PosteController extends Controller
     {
         if ($poste->etat === Poste::ETAT_DESACTIVE) {
             $poste->update(['etat' => Poste::ETAT_DISPONIBLE]);
-            PosteMessage::where('poste_id', $poste->id)->delete();   // nouveau client : on repart d'un chat vide
+            PosteMessage::where('poste_id', $poste->id)->delete();
             PosteCommande::create(['poste_id' => $poste->id, 'type' => 'verrouiller']);
             return $this->ok($request, "Poste activé.");
         }
@@ -229,10 +229,6 @@ class PosteController extends Controller
         return back()->with('success', 'Message envoyé.');
     }
 
-    // ------------------------------------------------------------------
-    // Recharges rapides (persistées côté serveur : table tarif_raccourcis)
-    // ------------------------------------------------------------------
-
     public function ajouterRaccourci(Request $request): JsonResponse
     {
         $data = $request->validate(['montant' => ['required', 'integer', 'min:1', 'max:10000000']]);
@@ -251,7 +247,7 @@ class PosteController extends Controller
             return response()->json(['ok' => false, 'message' => "Montant trop faible : le minimum est de {$tarif->montant_minimum} Ar."], 422);
         }
 
-        $duree = (int) round($montant / $pm);   // même calcul que l'interface
+        $duree = (int) round($montant / $pm);
         if ($duree < 1) return response()->json(['ok' => false, 'message' => 'Durée invalide.'], 422);
 
         $existe = $tarif->raccourcis()
@@ -270,7 +266,7 @@ class PosteController extends Controller
     public function supprimerRaccourci(Request $request, int $id): JsonResponse
     {
         $r = TarifRaccourci::find($id);
-        if ($r === null) return response()->json(['ok' => true]);   // déjà supprimée : rien à faire
+        if ($r === null) return response()->json(['ok' => true]);
 
         $r->delete();
         return response()->json(['ok' => true]);
@@ -309,7 +305,7 @@ class PosteController extends Controller
                 'mode'       => $mode,
                 'etat'       => $s->etat,
                 'debut'      => $s->date_heure_debut?->format('H:i:s'),
-                'debut_iso'  => $s->date_heure_debut?->toIso8601String(),   // horodatage absolu : affiché à l'heure réelle côté navigateur
+                'debut_iso'  => $s->date_heure_debut?->toIso8601String(),
                 'ecoule_s'   => $ecoule,
                 'restant_s'  => $restant,
                 'duree_min'  => $prevue ?: null,
@@ -327,8 +323,7 @@ class PosteController extends Controller
             'version'  => $p->agent_version,
             'session'  => $session,
             'non_lus'  => $estChatActif ? (int) ($p->non_lus ?? 0) : 0,
-            'hotspot_username'  => $p->hotspot_username,
-            'hotspot_configure' => filled($p->hotspot_username) && filled($p->hotspot_password),
+            'internet' => $p->internet_etat,
             'actions'  => $this->actionsPour($etat, $s !== null, $session['mode'] ?? null),
         ];
     }
@@ -356,7 +351,7 @@ class PosteController extends Controller
             $p = Poste::whereKey($poste->id)->lockForUpdate()->first();
             return $p !== null ? $this->sessions->cloturer($p, $motif, $arret) : null;
         });
-        $this->sessions->deconnecterReseau($poste);
+        $this->internet->couper($poste);
         return $session;
     }
 

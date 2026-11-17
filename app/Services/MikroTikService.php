@@ -15,20 +15,29 @@ class MikroTikService
     public function __construct(array $config = [])
     {
         $this->config = [
-            'host'     => $config['host']     ?? CyberSetting::reseau('mikrotik_host', env('MIKROTIK_HOST', '128.0.1.1')),
-            'port'     => $config['port']     ?? (int) CyberSetting::reseau('mikrotik_port', env('MIKROTIK_PORT', '8728')),
-            'user'     => $config['user']     ?? CyberSetting::reseau('mikrotik_user', env('MIKROTIK_USER', 'admin')),
-            'password' => $config['password'] ?? CyberSetting::reseau('mikrotik_password', env('MIKROTIK_PASSWORD', '')),
+            'host'     => $config['host']     ?? CyberSetting::reseau('mikrotik_host'),
+            'port'     => (int) ($config['port'] ?? CyberSetting::reseau('mikrotik_port', '8728')),
+            'user'     => $config['user']     ?? CyberSetting::reseau('mikrotik_user'),
+            'password' => $config['password'] ?? CyberSetting::reseau('mikrotik_password', ''),
             'ssl'      => $config['ssl']      ?? false,
             'timeout'  => $config['timeout']  ?? 5.0,
         ];
     }
 
+    public function estConfigure(): bool
+    {
+        return filled($this->config['host'] ?? null);
+    }
+
     public function connection(): MikrotikConnection
     {
+        if (!$this->estConfigure()) {
+            throw new RuntimeException('Routeur non configuré. Renseignez-le dans Paramètres > Portail Captif > Réseau.');
+        }
+
         if ($this->connection === null) {
             $this->connection = new MikrotikConnection(
-                host:   $this->config['host'],
+                host:   (string) $this->config['host'],
                 port:   (int) $this->config['port'],
                 timeout: (float) $this->config['timeout'],
                 useSsl: (bool) $this->config['ssl'],
@@ -44,8 +53,8 @@ class MikroTikService
         $this->connection()->connect();
         $reply = $this->connection()->sendSentence([
             '/login',
-            '=name='     . $this->config['user'],
-            '=password=' . $this->config['password'],
+            '=name='     . (string) ($this->config['user'] ?? ''),
+            '=password=' . (string) ($this->config['password'] ?? ''),
         ]);
 
         if (!$this->replyHasDone($reply)) {
@@ -396,6 +405,69 @@ class MikroTikService
         } catch (\Throwable) {}
     }
 
+
+        // -----------------------------------------------------------------
+    // Accès Internet d'un poste SANS identifiant (ip-binding par adresse MAC)
+    // -----------------------------------------------------------------
+
+    /** Autorise Internet pour cette MAC (contourne la page de connexion HotSpot). */
+    public function autoriserMac(string $mac, string $commentaire): void
+    {
+        $mac   = strtoupper(str_replace('-', ':', trim($mac)));
+        $liens = $this->queryFiltered('/ip/hotspot/ip-binding/print', ['mac-address' => $mac]);
+
+        if (empty($liens)) {
+            $this->query('/ip/hotspot/ip-binding/add', [
+                'mac-address' => $mac,
+                'type'        => 'bypassed',
+                'comment'     => $commentaire,
+            ]);
+        } else {
+            foreach (array_values($liens) as $i => $l) {
+                if (!isset($l['.id'])) continue;
+                if ($i === 0) {
+                    $this->queryWithId('/ip/hotspot/ip-binding/set', $l['.id'], [
+                        'type' => 'bypassed', 'disabled' => 'no', 'comment' => $commentaire,
+                    ]);
+                } else {
+                    $this->queryWithId('/ip/hotspot/ip-binding/remove', $l['.id']);   // doublons
+                }
+            }
+        }
+
+        $this->retirerHotes($mac);   // le routeur recrée l'entrée avec le contournement
+    }
+
+    /** Coupe Internet pour cette MAC : retire la règle, les sessions HotSpot, l'entrée d'hôte et les cookies. */
+    public function revoquerMac(string $mac): void
+    {
+        $mac = strtoupper(str_replace('-', ':', trim($mac)));
+
+        foreach ($this->queryFiltered('/ip/hotspot/ip-binding/print', ['mac-address' => $mac]) as $l) {
+            if (isset($l['.id'])) $this->queryWithId('/ip/hotspot/ip-binding/remove', $l['.id']);
+        }
+
+        $this->retirerSessionsActives(['mac-address' => $mac]);
+        $this->retirerHotes($mac);
+
+        try {
+            foreach ($this->queryFiltered('/ip/hotspot/cookie/print', ['mac-address' => $mac]) as $c) {
+                if (isset($c['.id'])) $this->queryWithId('/ip/hotspot/cookie/remove', $c['.id']);
+            }
+        } catch (\Throwable) {
+        }
+    }
+
+    private function retirerHotes(string $mac): void
+    {
+        try {
+            foreach ($this->queryFiltered('/ip/hotspot/host/print', ['mac-address' => $mac]) as $h) {
+                if (isset($h['.id'])) $this->queryWithId('/ip/hotspot/host/remove', $h['.id']);
+            }
+        } catch (\Throwable) {
+        }
+    }
+    
     // Helpers
     private function replyHasDone(array $reply): bool
     {

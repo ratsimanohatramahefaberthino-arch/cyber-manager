@@ -27,7 +27,7 @@ const TARIF_ARRONDI = @json($tarif_arrondi ?? ['actif' => false, 'unite' => 0, '
 
 const COULEURS = { disponible: '#22c55e', occupe: '#f59e0b', suspendu: '#8b5cf6', verrouille: '#ef4444', desactive: '#94a3b8', hors_ligne: '#94a3b8' };
 const LIBELLES = { disponible: 'Disponible', occupe: 'Utilisé', suspendu: 'En pause', verrouille: 'Verrouillé', desactive: 'Désactivé', hors_ligne: 'Non présent' };
-const MODES = { forfait: 'Prépayé', postpaye: 'Postpayé', libre: 'Débloqué' };
+const INTERNET = { autorise: 'Autorisé', coupe: 'Coupé', erreur: 'Erreur routeur', non_gere: 'Non contrôlé (routeur non configuré)' };
 
 function svgIcone(etat, taille = 'h-9 w-9') {
     const c = COULEURS[etat] || '#94a3b8';
@@ -52,8 +52,6 @@ function fmtDuree(s) {
 }
 const fmtAr = n => (Number(n) || 0).toLocaleString('fr-FR') + ' Ar';
 
-// Montant temps réel : STRICTEMENT max(minimum, minutes × prix/min), SANS arrondi.
-// Même formule que TarifService::montantTempsReel() (Laravel) et que le widget C#.
 function montantPourMinutes(minutes) {
     return Math.max(TARIF_MIN, Math.max(0, Math.floor(minutes)) * TARIF_MINUTE);
 }
@@ -86,7 +84,6 @@ function postesApp() {
             document.addEventListener('click', () => this.menu.ouvert = false);
             document.addEventListener('keydown', e => {
                 if (e.key === 'Escape') {
-                    // Escape ferme d'abord la confirmation (au premier plan), pas la modale dessous
                     if (this.confirm.ouvert) { this.confirm.ouvert = false; return; }
                     this.menu.ouvert = false; this.modal = null;
                 }
@@ -101,6 +98,7 @@ function postesApp() {
         get totalNonLus() { return this.postes.filter(p => p.id !== this.selId).reduce((t, p) => t + (p.non_lus || 0), 0); },
 
         icone: svgIcone, libelle(e) { return LIBELLES[e] || e; }, mode(m) { return MODES[m] || m; },
+        internet(v) { return INTERNET[v] || 'En attente'; },
         classeBouton(c) { return BOUTONS[c] || BOUTONS.gris; }, fmtAr,
 
         decalage(p) { if (!p.session || !['occupe', 'verrouille'].includes(p.etat)) return 0; return Math.floor((this.maintenant - this.recuLe) / 1000); },
@@ -108,18 +106,16 @@ function postesApp() {
         restant(p) { if (!p.session || p.session.restant_s === null) return '—'; return fmtDuree(p.session.restant_s - this.decalage(p)); },
         tempsListe(p) { if (!p.session) return ''; return p.session.restant_s !== null ? this.restant(p) : this.ecoule(p); },
 
-        // Montant temps réel (forfait ET postpayé) : même formule que le serveur et le widget client
         montantActuel(p) {
             if (!p.session) return '—';
             if (p.session.mode === 'libre') return 'Sans facturation';
-            if (p.session.etat === 'terminee') return fmtAr(p.session.montant);   // montant final figé
+            if (p.session.etat === 'terminee') return fmtAr(p.session.montant);
 
             let sec = p.session.ecoule_s + this.decalage(p);
             if (p.session.mode === 'forfait' && p.session.duree_min) sec = Math.min(sec, p.session.duree_min * 60);
             return fmtAr(montantPourMinutes(Math.floor(sec / 60)));
         },
 
-        // Heure de début : horodatage ISO du serveur affiché à l'heure réelle (plus de décalage d'1 h)
         debutAffiche(p) {
             const s = p?.session;
             if (!s) return '—';
@@ -130,7 +126,6 @@ function postesApp() {
             return s.debut || '—';
         },
 
-        // Durée minimale (min) correspondant au montant minimum du tarif
         dureeMinimale() { return TARIF_MINUTE > 0 ? Math.ceil(TARIF_MIN / TARIF_MINUTE) : 0; },
 
         async rafraichir() {
@@ -147,7 +142,6 @@ function postesApp() {
                 this.horsServeur = false;
                 if (this.selId && !this.sel) this.selId = null;
 
-                // Nouvelle session (ou plus de session) sur le poste sélectionné : on repart d'un chat propre
                 if (this.selId) {
                     const sidNow = this.sel?.session?.id ?? null;
                     if (sidNow !== this.chatSession) {
@@ -209,7 +203,6 @@ function postesApp() {
             await this.rafraichir();
         },
 
-        // Gestion modale forfait
         async ajouterLigne() {
             this.erreurLigne = '';
             let m = 0;
@@ -227,7 +220,6 @@ function postesApp() {
             if (this.enregLigne) return;
             this.enregLigne = true;
 
-            // Enregistrement côté serveur : la recharge persiste jusqu'à suppression manuelle
             try {
                 const r = await cmFetch(POSTES_URL + '/raccourcis', {
                     method: 'POST',
@@ -302,7 +294,6 @@ function postesApp() {
             if (montant <= 0) { this.afficher("Veuillez sélectionner ou saisir un montant.", false); return; }
             const duree = Math.round(montant / TARIF_MINUTE);
 
-            // Minimum : uniquement à la PREMIÈRE activation (Démarrer). Les recharges n'ont pas cette restriction.
             if (this.modal === 'demarrer') {
                 const dMin = this.dureeMinimale();
                 if (montant < TARIF_MIN || duree < dMin) {
@@ -324,7 +315,6 @@ function postesApp() {
                 if (id !== this.selId) return;
                 if (reset) this.chat = [];
                 if (d.messages?.length) {
-                    // Anti-doublon : un message n'est ajouté que si son id n'est pas déjà présent
                     const existants = new Set(this.chat.map(m => m.id));
                     d.messages.forEach(m => { if (!existants.has(m.id)) { this.chat.push(m); existants.add(m.id); } });
                     this.chat.sort((a, b) => a.id - b.id);
@@ -336,7 +326,7 @@ function postesApp() {
 
         async envoyerMessage() {
             const t = this.texte.trim();
-            if (!t || !this.selId || this.envoiChat) return;   // anti double-clic
+            if (!t || !this.selId || this.envoiChat) return;
             const id = this.selId;
             this.envoiChat = true;
             try {
@@ -344,7 +334,6 @@ function postesApp() {
                 const d = await r.json().catch(() => ({}));
                 if (r.ok && d.ok) {
                     this.texte = '';
-                    // On ajoute avec l'ID RÉEL du serveur : si le polling l'a déjà apporté, il n'est pas dupliqué
                     if (id === this.selId && d.id && !this.chat.some(m => m.id === d.id)) {
                         this.chat.push({ id: d.id, sens: 'admin', contenu: t, heure: d.heure || new Date().toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' }) });
                         this.chat.sort((a, b) => a.id - b.id);
@@ -420,7 +409,7 @@ function postesApp() {
                                     <div class="flex items-center gap-3" x-show="sel.session.mode === 'forfait'"><span class="w-40 shrink-0 text-right text-sm text-slate-500">Temps restant</span><span class="flex-1 rounded border border-amber-100 bg-amber-50/70 px-3 py-1.5 font-mono text-sm text-slate-900 font-bold" x-text="restant(sel)"></span></div>
                                     <div class="flex items-center gap-3" x-show="sel.session.mode !== 'forfait'"><span class="w-40 shrink-0 text-right text-sm text-slate-500">Temps écoulé</span><span class="flex-1 rounded border border-amber-100 bg-amber-50/70 px-3 py-1.5 font-mono text-sm text-slate-900" x-text="ecoule(sel)"></span></div>
                                     <div class="flex items-center gap-3"><span class="w-40 shrink-0 text-right text-sm text-slate-500" x-text="sel.session.etat === 'terminee' ? 'Montant final' : 'Montant actuel'"></span><span class="flex-1 rounded border border-amber-100 bg-amber-50/70 px-3 py-1.5 font-mono text-sm text-slate-900 font-bold" x-text="montantActuel(sel)"></span></div>
-                                    <div class="flex items-center gap-3"><span class="w-40 shrink-0 text-right text-sm text-slate-500">HotSpot</span><span class="flex-1 rounded border border-amber-100 bg-amber-50/70 px-3 py-1.5 font-mono text-sm text-slate-900" x-text="sel.hotspot_username || 'Non configuré'"></span></div>
+                                    <div class="flex items-center gap-3"><span class="w-40 shrink-0 text-right text-sm text-slate-500">Internet</span><span class="flex-1 rounded border border-amber-100 bg-amber-50/70 px-3 py-1.5 font-mono text-sm text-slate-900" x-text="internet(sel.internet)"></span></div>
                                 </div>
                             </template>
                         </div>
@@ -469,7 +458,6 @@ function postesApp() {
         </template>
     </div>
 
-    {{-- Modale Démarrer / Recharger (z-index 9300) --}}
     <div x-show="modal === 'demarrer' || modal === 'recharger'" x-cloak class="cm-overlay" style="z-index: 9300;">
         <div class="cm-backdrop" @click="modal = null"></div>
         <div class="relative w-full max-w-3xl rounded-2xl bg-white shadow-2xl flex flex-col" style="max-width: 48rem;">
@@ -548,7 +536,6 @@ function postesApp() {
         </div>
     </div>
 
-    {{-- Confirmation : placée APRÈS la modale dans le DOM et avec un z-index supérieur (9600) → toujours au premier plan --}}
     <div x-show="confirm.ouvert" x-cloak class="cm-overlay" style="z-index: 9600;">
         <div class="cm-backdrop" @click="confirm.ouvert = false"></div>
         <div class="cm-confirm">

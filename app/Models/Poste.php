@@ -27,6 +27,9 @@ class Poste extends Model
     /** Un conflit signalé s'efface tout seul après ce nombre de minutes sans nouveau signalement. */
     public const DUREE_CONFLIT_MINUTES = 10;
 
+    /** Délai (s) sans réponse du serveur avant que l'AGENT verrouille le poste. DOIT rester < DELAI_HORS_LIGNE. */
+    public const DELAI_GRACE_AGENT = 15;
+
     protected $fillable = [
         'nom_poste', 'nom_windows', 'adresse_mac', 'adresse_ip',
         'type_connexion', 'etat', 'actif', 'derniere_communication',
@@ -34,6 +37,7 @@ class Poste extends Model
         'dernier_heartbeat', 'agent_version',
         'hotspot_username', 'hotspot_password',
         'derniere_ip_vue', 'conflit_identite_at',
+        'internet_etat', 'internet_maj_at',
     ];
 
     protected $casts = [
@@ -41,6 +45,7 @@ class Poste extends Model
         'derniere_communication' => 'datetime',
         'dernier_heartbeat' => 'datetime',
         'conflit_identite_at' => 'datetime',
+        'internet_maj_at' => 'datetime',
     ];
 
     protected $hidden = ['agent_token', 'hotspot_password'];

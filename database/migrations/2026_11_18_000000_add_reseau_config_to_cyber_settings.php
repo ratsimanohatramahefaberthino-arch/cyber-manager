@@ -6,30 +6,13 @@ use Illuminate\Support\Facades\Schema;
 
 return new class extends Migration
 {
+    /**
+     * Aucune valeur par défaut : adresse, utilisateur et mot de passe du routeur
+     * sont saisis par le gérant (Paramètres > Portail Captif > Réseau).
+     */
     public function up(): void
     {
-        if (!Schema::hasTable('cyber_settings')) {
-            return;
-        }
-
-        $defauts = [
-            'mikrotik_host'       => '128.0.1.1',
-            'mikrotik_user'       => 'admin',
-            'mikrotik_password'   => 'RootAdmin',
-            'mikrotik_port'       => '8728',
-            'portail_ip_serveur'  => null,
-        ];
-
-        foreach ($defauts as $cle => $valeur) {
-            if (!DB::table('cyber_settings')->where('cle', $cle)->exists()) {
-                DB::table('cyber_settings')->insert([
-                    'cle'    => $cle,
-                    'valeur' => $valeur,
-                    'created_at' => now(),
-                    'updated_at' => now(),
-                ]);
-            }
-        }
+        // volontairement vide
     }
 
     public function down(): void
@@ -38,7 +21,7 @@ return new class extends Migration
             return;
         }
         DB::table('cyber_settings')->whereIn('cle', [
-            'mikrotik_host', 'mikrotik_user', 'mikrotik_password', 'mikrotik_port', 'portail_ip_serveur'
+            'mikrotik_host', 'mikrotik_user', 'mikrotik_password', 'mikrotik_port', 'portail_ip_serveur',
         ])->delete();
     }
 };

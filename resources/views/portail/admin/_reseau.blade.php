@@ -8,7 +8,6 @@
                 Le routeur y redirige automatiquement chaque nouveau client.
             </p>
 
-            {{-- Nom de la page --}}
             <div>
                 <label for="f-domaine" class="{{ $label }}">Nom de la page (facultatif)</label>
                 <div class="flex">
@@ -19,7 +18,6 @@
                 <p class="mt-1 text-xs text-slate-500">Un nom facile à retenir, enregistré dans le routeur. N'utilisez pas le nom d'un vrai site (google.com, facebook.com…).</p>
             </div>
 
-            {{-- Adresse de ce PC --}}
             <div>
                 <span class="{{ $label }}">Adresse de ce PC sur le réseau</span>
                 <input type="text" readonly value="{{ $ipServeur ?? 'Non détectée' }}"
@@ -34,7 +32,6 @@
                 </details>
             </div>
 
-            {{-- Adresses du portail --}}
             <div class="space-y-2">
                 @if ($urlIp)
                     <div>
@@ -57,6 +54,15 @@
 
     <x-portail.carte titre="Accès au routeur" aide="Pour que Cyber Manager puisse configurer le MikroTik." icone="key">
         <div class="space-y-4">
+            <p class="rounded-lg bg-slate-50 px-3 py-2 text-xs text-slate-600">
+                Aucune valeur n'est pré-remplie : saisissez les accès de <strong>votre</strong> routeur.
+                Le contrôle d'Internet par poste fonctionne avec un routeur MikroTik (HotSpot).
+                Sans routeur configuré, Internet des postes n'est pas contrôlé.
+            </p>
+            <label class="flex items-start gap-2 text-xs text-slate-600">
+                <input type="checkbox" name="efface_routeur" value="1" class="mt-0.5 rounded border-slate-300 text-violet-600 focus:ring-violet-500">
+                <span>Effacer l'accès au routeur à l'enregistrement (changement de routeur ou de marque).</span>
+            </label>
             <div class="grid grid-cols-1 gap-3 sm:grid-cols-3">
                 <div class="sm:col-span-2">
                     <label for="mt-host" class="{{ $label }}">Adresse du routeur</label>
