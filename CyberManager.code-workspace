@@ -14,6 +14,9 @@
 		},
 		{
 			"path": "../cyber-manager-installateur"
+		},
+		{
+			"path": "../cyber-manager-desinstalleur"
 		}
 	],
 	"settings": {}

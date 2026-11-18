@@ -21,6 +21,18 @@
         @endif
     </div>
 
+    {{-- Compteur de postes (Étape 9) --}}
+    <div class="grid gap-3 sm:grid-cols-2">
+        <div class="rounded-2xl border border-violet-100 bg-gradient-to-br from-violet-50 to-white p-4 shadow-sm">
+            <p class="text-xs font-bold uppercase tracking-wider text-violet-700">Postes déjà installés</p>
+            <p class="mt-1 text-2xl font-extrabold text-slate-900">{{ $totalPostes }}</p>
+        </div>
+        <div class="rounded-2xl border border-emerald-100 bg-gradient-to-br from-emerald-50 to-white p-4 shadow-sm">
+            <p class="text-xs font-bold uppercase tracking-wider text-emerald-700">Installés cette semaine</p>
+            <p class="mt-1 text-2xl font-extrabold text-slate-900">+{{ $postesCetteSemaine }}</p>
+        </div>
+    </div>
+
     <x-flash />
 
     @include('parametres.installation._adresse')

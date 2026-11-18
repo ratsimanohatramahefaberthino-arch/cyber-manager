@@ -12,12 +12,48 @@ use Illuminate\Support\Facades\Storage;
 
 class VersionsController extends Controller
 {
-    public function index()
+    public function index(Request $request)
     {
+        $filtre = $request->query('statut');
+        
+        $query = AgentVersion::orderByDesc('id');
+        if ($filtre && in_array($filtre, ['brouillon', 'pilote', 'general', 'archivee'])) {
+            $query->where('statut', $filtre);
+        }
+        
+        $versions = $query->get();
+        
+        // Statistiques
+        $stats = [
+            'brouillon' => AgentVersion::where('statut', 'brouillon')->count(),
+            'pilote'    => AgentVersion::where('statut', 'pilote')->count(),
+            'general'   => AgentVersion::where('statut', 'general')->count(),
+            'archivee'  => AgentVersion::where('statut', 'archivee')->count(),
+        ];
+
+        $generale = AgentVersion::generale();
+        $pilote = AgentVersion::pilote();
+
+        // Pourcentage à jour
+        $totalPostes = Poste::count();
+        $postesAJour = 0;
+        if ($generale && $totalPostes > 0) {
+            $postesAJour = AgentMiseAJour::where('version', $generale->version)
+                ->where('succes', true)
+                ->distinct('poste_id')
+                ->count('poste_id');
+        }
+        $pourcentageAJour = $totalPostes > 0 ? round(($postesAJour / $totalPostes) * 100) : 0;
+
         return view('parametres.versions', [
-            'versions'   => AgentVersion::orderByDesc('id')->get(),
-            'postes'     => Poste::orderBy('nom_poste')->get(['id', 'nom_poste']),
-            'historique' => AgentMiseAJour::with('poste:id,nom_poste')->orderByDesc('id')->limit(30)->get(),
+            'versions'    => $versions,
+            'postes'      => Poste::orderBy('nom_poste')->get(['id', 'nom_poste']),
+            'historique'  => AgentMiseAJour::with('poste:id,nom_poste')->orderByDesc('id')->limit(30)->get(),
+            'filtre'      => $filtre,
+            'stats'       => $stats,
+            'pourcentageAJour' => $pourcentageAJour,
+            'postesAJour' => $postesAJour,
+            'totalPostes' => $totalPostes,
         ]);
     }
 
@@ -79,7 +115,6 @@ class VersionsController extends Controller
         return back()->with('success', "Version {$version->version} en test sur " . count($data['postes']) . ' poste(s) pilote(s).');
     }
 
-    /** Publie pour tous. Sur une ancienne version, c'est le retour arrière. */
     public function general(AgentVersion $version): RedirectResponse
     {
         if (!$version->fichierExiste()) {
@@ -112,5 +147,40 @@ class VersionsController extends Controller
         $version->delete();
 
         return back()->with('success', "Version {$nom} supprimée.");
+    }
+
+    /** Télécharger une version archivée ou n'importe quelle version */
+    public function telecharger(AgentVersion $version)
+    {
+        if (!$version->fichierExiste()) {
+            return back()->withErrors(['Le fichier est introuvable sur le serveur.']);
+        }
+        return response()->download($version->chemin(), 'ecran-' . $version->version . '.zip');
+    }
+
+    /** Forcer la mise à jour immédiate de tous les postes */
+    public function forcerMiseAJour(Request $request): RedirectResponse
+    {
+        $generale = AgentVersion::generale();
+        if (!$generale) {
+            return back()->withErrors(['Aucune version publiée pour le moment. Publiez une version d\'abord.']);
+        }
+
+        // On crée un événement de mise à jour pour chaque poste actif
+        $postes = Poste::where('actif', true)->get();
+        $count = 0;
+        foreach ($postes as $poste) {
+            // On utilise la table AgentMiseAJour pour dire "ce poste doit se mettre à jour"
+            // Le service de mise à jour (côté agent) va lire ceci.
+            AgentMiseAJour::create([
+                'poste_id' => $poste->id,
+                'version'  => $generale->version,
+                'succes'   => false,
+                'message'  => 'Mise à jour immédiate demandée par l\'administrateur.',
+            ]);
+            $count++;
+        }
+
+        return back()->with('success', "Ordre de mise à jour envoyé à {$count} poste(s). Ils vont se mettre à jour dès qu'ils seront libres.");
     }
 }

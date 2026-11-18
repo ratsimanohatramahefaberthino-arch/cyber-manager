@@ -11,6 +11,7 @@ use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Storage;
+use Carbon\Carbon;
 
 class InstallationController extends Controller
 {
@@ -79,6 +80,10 @@ class InstallationController extends Controller
         $zipOk     = class_exists(\ZipArchive::class);
 
         $absent = 'Absent du serveur. Copiez le fichier exactement à l\'endroit indiqué ci-dessous (ou demandez à votre technicien).';
+
+        // Statistiques postes
+        $totalPostes = Poste::count();
+        $postesCetteSemaine = Poste::where('created_at', '>=', Carbon::now()->startOfWeek())->count();
 
         $fichiers = [
             [
@@ -155,6 +160,8 @@ class InstallationController extends Controller
             'peutTelecharger' => $exeOk && $zipOk,
             'nomExe'          => self::EXE,
             'code'            => $this->codeInstallation(),
+            'totalPostes'     => $totalPostes,          // NOUVEAU
+            'postesCetteSemaine' => $postesCetteSemaine, // NOUVEAU
             'assistant'       => [
                 'maxId'        => (int) Poste::max('id'),
                 'urlPostes'    => route('parametres.installation.postes'),
@@ -273,7 +280,6 @@ class InstallationController extends Controller
         ]);
     }
 
-    /** Le service normalise le code (tirets, espaces, majuscules). */
     private function codeValide(Request $request): bool
     {
         $code = $request->header('X-Install-Code');

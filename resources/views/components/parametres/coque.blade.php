@@ -5,6 +5,7 @@
 --}}
 @php
     $actif = match (true) {
+        request()->routeIs('parametres.profil')         => 'mon-profil',
         request()->routeIs('parametres.installation.*') => 'installation',
         request()->routeIs('parametres.versions.*')     => 'versions',
         request()->routeIs('parametres.parc.*')         => 'parc',
@@ -23,6 +24,7 @@
         ['personnel',      'Personnel',            'lock',         'Comptes du personnel et leurs droits',  'parametres.personnel.index'],
         ['enregistrement', 'Enregistrement',       'check',        'Code d\'installation, noms des postes', 'enregistrement.index'],
         ['portail',        'Portail Captif',       'link',         'Page de connexion Wi-Fi',               'portail.admin'],
+        ['mon-profil',     'Mon profil',           'pencil',       'Vos informations personnelles',         'parametres.profil'],
     ];
 
     $courant = collect($entrees)->firstWhere(0, $actif);

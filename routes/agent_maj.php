@@ -16,13 +16,10 @@ Route::prefix('api/agent')->group(function () {
     Route::get('/paquet/{version}',            [AgentMiseAJourController::class, 'paquet']);
     Route::post('/mise-a-jour/resultat',       [AgentMiseAJourController::class, 'resultat']);
 
-    // Restrictions Windows : profil + maintenance du poste (jeton du poste requis)
     Route::get('/restrictions',                [AgentRestrictionsController::class, 'show']);
 
-    // Découverte du serveur par les postes : signature + identifiant du serveur (public, sans secret)
     Route::get('/decouverte',                  [DecouverteController::class, 'show'])->middleware('throttle:60,1');
 
-    // Installateur (avant le premier jeton) : info publique, fichiers protégés par le code d'installation
     Route::middleware('throttle:60,1')->prefix('installation')->group(function () {
         Route::get('/info',     [InstallationController::class, 'info']);
         Route::get('/gardien',  [InstallationController::class, 'gardien']);
@@ -31,7 +28,6 @@ Route::prefix('api/agent')->group(function () {
     });
 });
 
-// Administration (ADMIN uniquement) : Installation, Versions, Parc, Personnel
 Route::middleware(['auth', RoleMiddleware::class . ':admin'])->prefix('parametres')->group(function () {
     Route::get('/installation',                         [InstallationController::class, 'index'])->name('parametres.installation.index');
     Route::get('/installation/telecharger',             [InstallationController::class, 'telecharger'])->name('parametres.installation.telecharger');
@@ -51,8 +47,12 @@ Route::middleware(['auth', RoleMiddleware::class . ':admin'])->prefix('parametre
     Route::post('/parc/{poste}/renommer',         [ParcController::class, 'renommer'])->name('parametres.parc.renommer');
     Route::post('/parc/{poste}/maintenance',      [ParcController::class, 'maintenance'])->name('parametres.parc.maintenance');
 
+    // Personnel
     Route::get('/personnel',                      [PersonnelController::class, 'index'])->name('parametres.personnel.index');
     Route::post('/personnel',                     [PersonnelController::class, 'store'])->name('parametres.personnel.store');
     Route::patch('/personnel/{utilisateur}',      [PersonnelController::class, 'update'])->name('parametres.personnel.update');
     Route::delete('/personnel/{utilisateur}',     [PersonnelController::class, 'destroy'])->name('parametres.personnel.destroy');
+    Route::post('/personnel/{utilisateur}/reinitialiser', [PersonnelController::class, 'reinitialiserMotDePasse'])->name('parametres.personnel.reinitialiser');
+    Route::post('/personnel/{utilisateur}/deconnecter-partout', [PersonnelController::class, 'deconnecterPartout'])->name('parametres.personnel.deconnecter-partout');
+    Route::delete('/personnel/{utilisateur}/avatar', [PersonnelController::class, 'supprimerAvatar'])->name('parametres.personnel.avatar.supprimer');
 });

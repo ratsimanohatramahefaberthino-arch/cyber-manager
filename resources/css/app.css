@@ -1,3 +1,12 @@
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
+
+/* Cache la barre de défilement de la sidebar tout en gardant le défilement */
+.sidebar-scroll {
+    scrollbar-width: none; /* Firefox */
+    -ms-overflow-style: none; /* IE et Edge */
+}
+.sidebar-scroll::-webkit-scrollbar {
+    display: none; /* Chrome, Safari et Opera */
+}

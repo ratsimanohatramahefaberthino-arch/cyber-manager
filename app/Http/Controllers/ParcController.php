@@ -4,9 +4,11 @@ namespace App\Http\Controllers;
 
 use App\Models\AgentVersion;
 use App\Models\Poste;
+use App\Models\PosteCommande;
 use App\Services\RestrictionsService;
 use Illuminate\Http\RedirectResponse;
 use Illuminate\Http\Request;
+use Illuminate\Http\JsonResponse;
 
 class ParcController extends Controller
 {
@@ -44,7 +46,6 @@ class ParcController extends Controller
         return back()->with('success', "Poste renommé en « {$nom} ».");
     }
 
-    /** Le Gardien du poste lit ce drapeau (GET /api/agent/restrictions) et lève / remet les restrictions. */
     public function maintenance(Poste $poste): RedirectResponse
     {
         $nouveau = !((bool) $poste->mode_maintenance);
@@ -53,5 +54,41 @@ class ParcController extends Controller
         return back()->with('success', $nouveau
             ? "Mode maintenance activé pour « {$poste->nom_poste} » : restrictions levées dans quelques secondes."
             : "Mode maintenance désactivé pour « {$poste->nom_poste} » : restrictions remises.");
+    }
+
+    /** Récupérer les 30 derniers logs d'un poste (Modal) */
+    public function logs(Poste $poste): JsonResponse
+    {
+        $logs = PosteCommande::where('poste_id', $poste->id)
+            ->orderByDesc('created_at')
+            ->limit(30)
+            ->get()
+            ->map(function($c) {
+                return [
+                    'date' => $c->created_at->timezone('Indian/Antananarivo')->format('d/m/Y H:i:s'),
+                    'commande' => $c->type_commande ?? 'Inconnu',
+                    'statut' => $c->statut,
+                    'resultat' => $c->resultat ?? 'Aucun retour',
+                ];
+            });
+
+        return response()->json(['logs' => $logs]);
+    }
+
+    /** Envoyer un ordre de redémarrage au poste via la file d'attente */
+    public function redemarrer(Poste $poste): JsonResponse
+    {
+        if (!$poste->estEnLigne()) {
+            return response()->json(['ok' => false, 'message' => 'Le poste est hors ligne, impossible de le redémarrer.'], 422);
+        }
+
+        PosteCommande::create([
+            'poste_id' => $poste->id,
+            'type_commande' => 'redemarrer',
+            'statut' => 'en_attente',
+            'donnees' => json_encode([]),
+        ]);
+
+        return response()->json(['ok' => true, 'message' => "Ordre de redémarrage envoyé à « {$poste->nom_poste} »."]);
     }
 }

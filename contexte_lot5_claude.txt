@@ -1,0 +1,2762 @@
+================================================================================
+   CONTEXTE COMPLET POUR LE LOT 5 (VOYANT RÉSEAU ET FINITIONS)
+================================================================================
+
+================================================================================
+📄 FICHIER : cyber-manager-agent/Program.cs
+================================================================================
+
+// ============================================================================
+//  Cyber Manager Écran — fenêtre de verrouillage, widget, notifications.
+//  Lancé et relancé par le Gardien dans la session du client. Aucun secret ici.
+//  Variable : AGENT_DEV=1  → mode développement (fenêtre normale, pas de blocage clavier)
+// ============================================================================
+
+using CyberManager.Agent;
+
+// --- Instance unique -------------------------------------------------------
+using var mutexUnique = new Mutex(true, @"Global\CyberManagerAgent", out var premiereInstance);
+if (!premiereInstance) return;
+
+// --- Journal (dossier de l'utilisateur, jamais de secret) -------------------
+var dossierDonnees = Path.GetDirectoryName(AgentConfig.ConfigPath)!;
+var logPath = Path.Combine(dossierDonnees, "ecran.log");
+var logVerrou = new object();
+
+try
+{
+    if (File.Exists(logPath) && new FileInfo(logPath).Length > 1_000_000)
+        File.Move(logPath, logPath + ".old", overwrite: true);
+}
+catch { }
+
+void Log(string msg)
+{
+    var ligne = $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] {msg}";
+    Console.WriteLine(ligne);
+    lock (logVerrou)
+    {
+        try { File.AppendAllText(logPath, ligne + Environment.NewLine); } catch { }
+    }
+}
+
+// Lecture d'un champ du payload JSON d'une commande (jamais journalisé)
+static string? LireTexte(string? json, string champ)
+{
+    if (string.IsNullOrWhiteSpace(json)) return null;
+    try
+    {
+        using var doc = System.Text.Json.JsonDocument.Parse(json);
+        return doc.RootElement.TryGetProperty(champ, out var v) && v.ValueKind == System.Text.Json.JsonValueKind.String
+            ? v.GetString() : null;
+    }
+    catch { return null; }
+}
+
+static int? LireEntier(string? json, string champ)
+{
+    if (string.IsNullOrWhiteSpace(json)) return null;
+    try
+    {
+        using var doc = System.Text.Json.JsonDocument.Parse(json);
+        return doc.RootElement.TryGetProperty(champ, out var v) && v.ValueKind == System.Text.Json.JsonValueKind.Number
+            ? v.GetInt32() : null;
+    }
+    catch { return null; }
+}
+
+const int DelaiArretSecondes = 5;
+
+var devMode = Environment.GetEnvironmentVariable("AGENT_DEV") == "1";
+
+try
+{
+    Log($">>> Démarrage de l'Écran Cyber Manager {ApiClient.Version} — mode {(devMode ? "DEV" : "PRODUCTION")}");
+    Log($"Dossier de données : {dossierDonnees}");
+
+    // --- Thread UI (WinForms STA) instrumenté pour diagnostic précis ------
+    var fenetrePrete = new ManualResetEventSlim(false);
+    var uiThread = new Thread(() =>
+    {
+        try
+        {
+            Log("[Diagnostic UI 1/6] Démarrage du thread UI STA");
+            ApplicationConfiguration.Initialize();
+            Log("[Diagnostic UI 2/6] ApplicationConfiguration.Initialize terminé");
+
+            ClientWindow.Journal = Log;
+            Log("[Diagnostic UI 3/6] Début instanciation ClientWindow");
+            var fenetre = new ClientWindow(devMode);
+            Log("[Diagnostic UI 4/6] Fin instanciation ClientWindow");
+
+            fenetrePrete.Set();
+            Log("[Diagnostic UI 5/6] fenetrePrete.Set() signalé");
+
+            Application.Run(fenetre);
+            Log("[Diagnostic UI 6/6] Application.Run terminé");
+        }
+        catch (Exception ex)
+        {
+            Log($">>> ERREUR UI : {ex}");
+            fenetrePrete.Set();
+        }
+    });
+    uiThread.SetApartmentState(ApartmentState.STA);
+    uiThread.Start();
+
+    Log("Attente de la création de la fenêtre (peut prendre du temps au premier lancement)...");
+    if (!fenetrePrete.Wait(TimeSpan.FromMinutes(5)) || ClientWindow.Instance is null)
+    {
+        Log(">>> La fenêtre n'a pas pu être créée dans le délai imparti. Arrêt.");
+        return;
+    }
+    var fenetreUi = ClientWindow.Instance;
+    Log("Fenêtre prête. Connexion au Gardien.");
+
+    // --- Liaison avec le Gardien ---------------------------------------------
+    var gardien = new ApiClient(Log);
+
+    // État partagé (alimenté par le Gardien)
+    var poste = "";
+    var ip = "";
+    var etatServeur = "serveur_injoignable";
+
+    void PousserInfos() => fenetreUi.MettreAJourInfos(poste, ip, etatServeur);
+
+    // --- Surveillance de la liaison avec le serveur ----------------------------
+    // Grâce de 15 s (< tolérance du serveur : Poste::DELAI_HORS_LIGNE = 30 s). Au-delà : poste verrouillé,
+    // usage gratuit impossible. Reprise automatique : le prochain état frais du Gardien déverrouille.
+    using var liaison = new SurveillanceLiaison();
+    liaison.EtatChange += (etat, message) =>
+    {
+        Log($"Liaison avec le serveur : {etat} — {message}");
+        switch (etat)
+        {
+            case EtatLiaison.CableDebranche:
+                etatServeur = "cable_debranche";
+                PousserInfos();
+                fenetreUi.LockScreen();
+                break;
+            case EtatLiaison.ServeurInjoignable:
+                etatServeur = "serveur_injoignable";
+                PousserInfos();
+                fenetreUi.LockScreen();
+                break;
+        }
+    };
+    liaison.Demarrer();
+
+    // Heartbeat immédiat demandé (recharge, désactivation, fin de forfait…)
+    void Reveiller() => gardien.Envoyer(new MessageCanal { Type = "reveil" });
+    fenetreUi.ReveillerHeartbeat = Reveiller;
+
+    // Clic sur ACTIVER → Gardien → serveur
+    fenetreUi.ActivationHandler = () => gardien.ActiverAsync();
+
+    // Widget : Suspendre / Reprendre / Quitter → Gardien → serveur
+    fenetreUi.SuspendreHandler = async () =>
+    {
+        // Le client n'a que le bouton Reprendre quand le poste est suspendu
+        if (etatServeur == "suspendu") return await gardien.ReprendreSessionAsync();
+        return await gardien.SuspendreSessionAsync();
+    };
+
+    fenetreUi.QuitterHandler = () => gardien.FermerSessionAsync();
+
+    // Chat client → accueil
+    fenetreUi.MessageHandler = texte => gardien.EnvoyerMessageAsync(texte);
+
+    // Fin du décompte : c'est le Gardien qui éteint réellement Windows (et seulement si le serveur l'a demandé)
+    fenetreUi.ExtinctionHandler = () =>
+    {
+        Log("Décompte terminé : demande d'extinction envoyée au Gardien.");
+        return gardien.Envoyer(new MessageCanal { Type = "extinction" });
+    };
+
+    // Affichage immédiat avec l'identité par défaut ; le Gardien envoie la vraie dès la connexion
+    fenetreUi.MettreAJourBranding(AgentConfig.BrandingParDefaut);
+    PousserInfos();
+
+    // --- Messages du Gardien ---------------------------------------------------
+    gardien.Connecte += () => { /* le Gardien répond en poussant branding + état */ };
+
+    gardien.Deconnecte += () =>
+    {
+        etatServeur = liaison.Etat == EtatLiaison.CableDebranche ? "cable_debranche" : "serveur_injoignable";
+        PousserInfos();
+    };
+
+    gardien.MessageRecu += m =>
+    {
+        switch (m.Type)
+        {
+            case "etat":
+                poste = m.Poste ?? poste;
+                ip = m.Ip ?? ip;
+                etatServeur = m.Etat ?? "serveur_injoignable";
+                if (etatServeur == "serveur_injoignable" && liaison.Etat == EtatLiaison.CableDebranche)
+                    etatServeur = "cable_debranche";   // on distingue « câble débranché » de « serveur injoignable »
+                PousserInfos();
+                // Verrou absent = serveur injoignable : on garde l'état courant (mode dégradé)
+                if (m.Verrou is bool doitEtreVerrouille)
+                {
+                    liaison.SignalerSucces();   // donnée fraîche du serveur : la liaison est bonne
+                    fenetreUi.MettreAJourSession(m.Session);
+                    fenetreUi.SyncFromServer(doitEtreVerrouille);
+                }
+                break;
+
+            case "branding":
+                fenetreUi.MettreAJourBranding(AgentConfig.DepuisMessage(m));
+                break;
+
+            case "cmd":
+            {
+                var (ok, detail) = Executer(m.Commande ?? "", m.Payload, fenetreUi);
+                gardien.Envoyer(new MessageCanal { Type = "repcmd", Id = m.Id, Succes = ok, Message = detail });
+                break;
+            }
+        }
+    };
+
+    _ = Task.Run(gardien.BoucleAsync);
+
+    // Exécution d'une commande reçue du serveur (via le Gardien)
+    (bool ok, string detail) Executer(string type, string? payload, ClientWindow fenetre)
+    {
+        Log($"Commande reçue : {type}");
+        try
+        {
+            switch (type)
+            {
+                case "demarrer":
+                case "debloquer":
+                case "reprendre":
+                    fenetre.UnlockScreen();
+                    return (true, "Poste déverrouillé");
+
+                case "verrouiller":
+                case "suspendre":
+                case "fermer":
+                    fenetre.LockScreen();
+                    return (true, "Poste verrouillé");
+
+                case "desactiver":
+                    // L'écran affiche tout de suite « Poste désactivé » (ACTIVER devient INDISPONIBLE)
+                    etatServeur = "desactive";
+                    PousserInfos();
+                    fenetre.LockScreen();   // ferme aussi le widget s'il est ouvert
+                    Reveiller();
+                    return (true, "Poste désactivé et verrouillé");
+
+                case "arreter":
+                    fenetre.DemanderArret(DelaiArretSecondes);
+                    return (true, $"Extinction dans {DelaiArretSecondes} s");
+
+                case "recharger":
+                {
+                    var minutes = LireEntier(payload, "minutes_ajoutees");
+                    fenetre.NotifierRecharge(minutes);
+                    Reveiller();   // le widget se recale tout de suite sur le temps du serveur
+                    return (true, "Temps ajouté");
+                }
+
+                case "message":
+                {
+                    var texte = LireTexte(payload, "message");
+                    if (string.IsNullOrWhiteSpace(texte)) return (false, "Message vide");
+                    fenetre.RecevoirMessage(texte.Trim());
+                    return (true, "Message affiché");
+                }
+
+                default:
+                    return (false, $"Commande inconnue : {type}");
+            }
+        }
+        catch (Exception ex)
+        {
+            Log($"Exécution de '{type}' échouée : {ex.Message}");
+            return (false, "Erreur d'exécution");
+        }
+    }
+
+    uiThread.Join();
+    Log(">>> Application terminée.");
+}
+catch (Exception ex)
+{
+    Log($">>> ERREUR FATALE : {ex}");
+}
+
+================================================================================
+📄 FICHIER : cyber-manager-agent/AgentConfig.cs
+================================================================================
+
+/// <summary>Identité visuelle du cyber telle qu'affichée par l'Écran (envoyée par le Gardien).</summary>
+public record BrandingData(string Nom, string Slogan, string Couleur, byte[]? Logo);
+
+/// <summary>
+/// L'Écran ne contient AUCUN secret : le jeton et l'adresse du serveur sont chez le Gardien (ProgramData).
+/// Cette classe ne donne plus que le dossier de travail de l'utilisateur (journal, données WebView2).
+/// </summary>
+public static class AgentConfig
+{
+    /// <summary>Chemin « fictif » dont seul le dossier est utilisé (compatibilité ClientWindow / Program).</summary>
+    public static string ConfigPath
+    {
+        get
+        {
+            var dir = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                "CyberManagerAgent");
+            Directory.CreateDirectory(dir);
+            return Path.Combine(dir, "ecran.dat");
+        }
+    }
+
+    public static BrandingData BrandingParDefaut => new("Cyber Manager", "Gestion de cybercafé", "#7c3aed", null);
+
+    /// <summary>Convertit le message « branding » du Gardien (logo en base64) en données d'affichage.</summary>
+    public static BrandingData DepuisMessage(MessageCanal m)
+    {
+        byte[]? logo = null;
+        try { if (!string.IsNullOrEmpty(m.Logo)) logo = Convert.FromBase64String(m.Logo); } catch { }
+
+        return new BrandingData(
+            string.IsNullOrWhiteSpace(m.Nom) ? "Cyber Manager" : m.Nom,
+            m.Slogan ?? "",
+            string.IsNullOrWhiteSpace(m.Couleur) ? "#7c3aed" : m.Couleur,
+            logo);
+    }
+}
+
+================================================================================
+📄 FICHIER : cyber-manager-agent/ApiClient.cs
+================================================================================
+
+using System.Collections.Concurrent;
+using System.IO.Pipes;
+using System.Text;
+
+/// <summary>
+/// Client du Gardien (canal local). Remplace l'ancien client HTTP : le serveur et le jeton
+/// ne sont connus que du Gardien. Se reconnecte tout seul si le Gardien redémarre.
+/// </summary>
+public class ApiClient
+{
+    public const string Version = Constantes.VersionEcran;
+
+    private readonly Action<string> _journal;
+    private readonly object _verrou = new();
+    private StreamWriter? _ecrivain;
+    private readonly ConcurrentDictionary<int, TaskCompletionSource<MessageCanal>> _attentes = new();
+    private int _prochainId;
+
+    /// <summary>Message du Gardien : etat, branding ou cmd.</summary>
+    public event Action<MessageCanal>? MessageRecu;
+    public event Action? Connecte;
+    public event Action? Deconnecte;
+
+    public ApiClient(Action<string> journal) { _journal = journal; }
+
+    public async Task BoucleAsync()
+    {
+        while (true)
+        {
+            var etaitConnecte = false;
+            try
+            {
+                using var pipe = new NamedPipeClientStream(".", Constantes.NomPipe, PipeDirection.InOut, PipeOptions.Asynchronous);
+                await pipe.ConnectAsync(3000);
+
+                var utf8 = new UTF8Encoding(false);
+                using var lecteur = new StreamReader(pipe, utf8);
+                var ecrivain = new StreamWriter(pipe, utf8) { AutoFlush = true };
+                lock (_verrou) _ecrivain = ecrivain;
+                etaitConnecte = true;
+
+                _journal("Connecté au Gardien.");
+                Envoyer(new MessageCanal { Type = "pret", Texte = Version });
+                try { Connecte?.Invoke(); } catch { }
+
+                string? ligne;
+                while ((ligne = await lecteur.ReadLineAsync()) != null) Traiter(ligne);
+            }
+            catch { /* Gardien absent ou redémarrage : on réessaie */ }
+            finally
+            {
+                lock (_verrou) _ecrivain = null;
+                foreach (var a in _attentes.Values)
+                    a.TrySetResult(new MessageCanal { Succes = false, Message = "Liaison avec le Gardien perdue." });
+                if (etaitConnecte)
+                {
+                    _journal("Liaison avec le Gardien perdue.");
+                    try { Deconnecte?.Invoke(); } catch { }
+                }
+            }
+
+            await Task.Delay(1000);
+        }
+    }
+
+    private void Traiter(string ligne)
+    {
+        var m = ProtocoleCanal.Decoder(ligne);
+        if (m == null) return;
+
+        if (m.Type == "rep")
+        {
+            if (_attentes.TryRemove(m.Id, out var a)) a.TrySetResult(m);
+            return;
+        }
+        try { MessageRecu?.Invoke(m); } catch (Exception ex) { _journal($"Message du Gardien : {ex.Message}"); }
+    }
+
+    public bool Envoyer(MessageCanal message)
+    {
+        try
+        {
+            lock (_verrou)
+            {
+                if (_ecrivain == null) return false;
+                _ecrivain.WriteLine(ProtocoleCanal.Encoder(message));
+                return true;
+            }
+        }
+        catch { return false; }
+    }
+
+    private async Task<MessageCanal> RequeteAsync(string action, string? texte = null)
+    {
+        var id = Interlocked.Increment(ref _prochainId);
+        var tcs = new TaskCompletionSource<MessageCanal>(TaskCreationOptions.RunContinuationsAsynchronously);
+        _attentes[id] = tcs;
+
+        if (!Envoyer(new MessageCanal { Type = "req", Id = id, Action = action, Texte = texte }))
+        {
+            _attentes.TryRemove(id, out _);
+            return new MessageCanal { Succes = false, Message = "Le Gardien n'est pas joignable. Réessayez dans quelques instants." };
+        }
+
+        var fini = await Task.WhenAny(tcs.Task, Task.Delay(TimeSpan.FromSeconds(75)));
+        _attentes.TryRemove(id, out _);
+        return fini == tcs.Task ? tcs.Task.Result : new MessageCanal { Succes = false, Message = "Le Gardien ne répond pas." };
+    }
+
+    public async Task<ActivationResult> ActiverAsync()
+    {
+        var r = await RequeteAsync("activer");
+        return new ActivationResult(r.Succes == true, r.Message ?? (r.Succes == true ? "Poste activé." : "Activation refusée."), r.Avertissement);
+    }
+
+    public Task<ResultatAction> SuspendreSessionAsync() => ActionAsync("suspendre", "Session suspendue.");
+    public Task<ResultatAction> FermerSessionAsync() => ActionAsync("fermer", "Session terminée.");
+    public Task<ResultatAction> ReprendreSessionAsync() => ActionAsync("reprendre", "Session reprise.");
+    public Task<ResultatAction> EnvoyerMessageAsync(string texte) => ActionAsync("message", "Message envoyé.", texte);
+
+    private async Task<ResultatAction> ActionAsync(string action, string messageParDefaut, string? texte = null)
+    {
+        var r = await RequeteAsync(action, texte);
+        return new ResultatAction(r.Succes == true, r.Message ?? (r.Succes == true ? messageParDefaut : "Action refusée."), r.Montant);
+    }
+}
+
+================================================================================
+📄 FICHIER : cyber-manager-agent/ClientWindow.cs
+================================================================================
+
+using Microsoft.Web.WebView2.Core;
+using Microsoft.Web.WebView2.WinForms;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+using System.Text.Json;
+
+/// <summary>
+/// Fenêtre plein écran de verrouillage.
+/// </summary>
+public class ClientWindow : Form
+{
+    public static ClientWindow? Instance { get; private set; }
+    public static Action<string> Journal { get; set; } = Console.WriteLine;
+
+    public Func<Task<ActivationResult>>? ActivationHandler { get; set; }
+    public Func<Task<ResultatAction>>? SuspendreHandler { get; set; }
+    public Func<Task<ResultatAction>>? QuitterHandler { get; set; }
+    public Func<string, Task<ResultatAction>>? MessageHandler { get; set; }
+    public Func<bool>? ExtinctionHandler { get; set; }
+    public Action? ReveillerHeartbeat { get; set; }
+
+    public bool IsLocked => _locked;
+
+    private const int MaxHistorique = 60;
+
+    private readonly bool _devMode;
+    private readonly WebView2 _web;
+    private readonly Label _attente;
+    private readonly VoyantServeur? _voyant;
+    private readonly System.Windows.Forms.Timer _garde;
+    private readonly System.Windows.Forms.Timer _finTimer;
+    private readonly System.Windows.Forms.Timer _arretTimer;
+
+    private volatile bool _desiredLocked = true;
+    private bool _locked;
+    private bool _webReady;
+    private bool _activationEnCours;
+    private long _graceTicks;
+    private long _graceVerrouTicks;
+
+    private SessionWidget? _widget;
+    private SessionInfo? _session;
+
+    private readonly List<MessageChat> _historique = new();
+    private string? _messageVerrou;
+
+    private volatile bool _arretEnCours;
+    private int _arretRestant;
+
+    private string _poste = "", _ip = "", _etat = "serveur_injoignable";
+    private BrandingData _brand = new("Cyber Manager", "Gestion de cybercafé", "#7c3aed", null);
+
+    private readonly LowLevelKeyboardProc? _proc;
+    private IntPtr _hook = IntPtr.Zero;
+
+    public ClientWindow(bool devMode)
+    {
+        Instance = this;
+        _devMode = devMode;
+
+        Text = "Cyber Manager Agent";
+        BackColor = Color.FromArgb(11, 18, 38);
+
+        if (devMode)
+        {
+            FormBorderStyle = FormBorderStyle.Sizable;
+            StartPosition = FormStartPosition.CenterScreen;
+            ClientSize = new Size(1100, 700);
+            ShowInTaskbar = true;
+            TopMost = false;
+        }
+        else
+        {
+            FormBorderStyle = FormBorderStyle.None;
+            StartPosition = FormStartPosition.Manual;
+            Bounds = SystemInformation.VirtualScreen;
+            ShowInTaskbar = false;
+            TopMost = true;
+        }
+
+        _web = new WebView2 { Dock = DockStyle.Fill, DefaultBackgroundColor = Color.FromArgb(11, 18, 38) };
+        
+        _attente = new Label
+        {
+            Dock = DockStyle.Fill, BackColor = Color.FromArgb(11, 18, 38), ForeColor = Color.FromArgb(148, 163, 184),
+            Font = new Font("Segoe UI", 16), TextAlign = ContentAlignment.MiddleCenter, Text = "Cyber Manager — démarrage…"
+        };
+        Controls.Add(_web);
+        Controls.Add(_attente);
+        _attente.BringToFront();
+
+        // Voyant « Serveur : connecté / injoignable » : contrôle natif au-dessus du WebView2 (en haut, au centre)
+        var k = Math.Max(1f, DeviceDpi / 96f);
+        _voyant = new VoyantServeur(11f) { Size = new Size((int)Math.Round(270 * k), (int)Math.Round(38 * k)) };
+        Controls.Add(_voyant);
+        _voyant.BringToFront();
+        PlacerVoyant();
+
+        _garde = new System.Windows.Forms.Timer { Interval = 1500 };
+        _garde.Tick += (_, _) =>
+        {
+            if (_locked && !_devMode)
+            {
+                if (!TopMost) TopMost = true;
+                if (!ContainsFocus) { BringToFront(); Activate(); }
+            }
+        };
+        _garde.Start();
+
+        _finTimer = new System.Windows.Forms.Timer { Interval = 6000 };
+        _finTimer.Tick += (_, _) =>
+        {
+            _finTimer.Stop();
+            if (!_desiredLocked && _session?.Mode == "forfait")
+            {
+                Journal("[Session] Forfait terminé : verrouillage local.");
+                LockScreen();
+            }
+        };
+
+        _arretTimer = new System.Windows.Forms.Timer { Interval = 1000 };
+        _arretTimer.Tick += (_, _) => TickArret();
+
+        if (!devMode)
+        {
+            _proc = HookCallback;
+            _hook = PoserHook(_proc);
+        }
+    }
+
+    private void PlacerVoyant()
+    {
+        if (_voyant is null) return;
+        var k = Math.Max(1f, DeviceDpi / 96f);
+        _voyant.Location = new Point(Math.Max(0, (ClientSize.Width - _voyant.Width) / 2), (int)Math.Round(18 * k));
+    }
+
+    protected override void OnResize(EventArgs e)
+    {
+        base.OnResize(e);
+        PlacerVoyant();
+    }
+
+    /// <summary>Le serveur est joignable tant que le Gardien n'annonce ni « serveur injoignable » ni « câble débranché ».</summary>
+    private bool ServeurJoignable => _etat is not ("serveur_injoignable" or "cable_debranche");
+
+    private void AppliquerVoyant()
+    {
+        _voyant?.Definir(ServeurJoignable);
+        if (_widget is { IsDisposed: false } w) w.DefinirServeur(ServeurJoignable);
+    }
+
+    public void LockScreen()
+    {
+        _desiredLocked = true;
+        Interlocked.Exchange(ref _graceVerrouTicks, DateTime.UtcNow.AddSeconds(6).Ticks);
+        DemanderApplication();
+    }
+
+    public void UnlockScreen()
+    {
+        _desiredLocked = false;
+        Interlocked.Exchange(ref _graceTicks, DateTime.UtcNow.AddSeconds(6).Ticks);
+        DemanderApplication();
+    }
+
+    public void SyncFromServer(bool doitEtreVerrouille)
+    {
+        if (doitEtreVerrouille)
+        {
+            if (DateTime.UtcNow.Ticks < Interlocked.Read(ref _graceTicks)) return;
+            _desiredLocked = true;
+            DemanderApplication();
+        }
+        else if (_desiredLocked)
+        {
+            if (DateTime.UtcNow.Ticks < Interlocked.Read(ref _graceVerrouTicks)) return;
+            UnlockScreen();
+        }
+    }
+
+    public void MettreAJourInfos(string poste, string ip, string etat)
+    {
+        _poste = poste; _ip = ip; _etat = etat;
+        SurUi(() => { PousserInfos(); AppliquerVoyant(); });
+    }
+
+    /// <summary>Applique nom, slogan, couleur et logo du cyber (écran de verrouillage, widget, icônes).</summary>
+    public void MettreAJourBranding(BrandingData b)
+    {
+        // Mémorisé tout de suite (même si la fenêtre n'a pas encore de handle) : repoussé au chargement de la page.
+        _brand = b;
+        SessionWidget.DefinirBranding(b.Nom, b.Couleur, b.Logo);
+
+        SurUi(() =>
+        {
+            Text = b.Nom + " — Agent";
+            try { Icon = SessionWidget.IconeApp(); } catch { }
+            if (_widget is { IsDisposed: false } w) w.AppliquerBranding();
+            PousserBranding();
+        });
+    }
+
+    private void PousserBranding()
+    {
+        var b = _brand;
+        string? logo = null;
+        if (b.Logo is { Length: > 0 })
+            logo = "data:" + MimeLogo(b.Logo) + ";base64," + Convert.ToBase64String(b.Logo);
+
+        Poster(new { type = "branding", nom = b.Nom, slogan = b.Slogan, couleur = b.Couleur, logo });
+    }
+
+    private static string MimeLogo(byte[] o) =>
+        o.Length > 3 && o[0] == 0x89 && o[1] == 0x50 ? "image/png" : "image/jpeg";
+
+    public void MettreAJourSession(SessionInfo? session)
+    {
+        var precedente = _session;
+        _session = session;
+        SurUi(() =>
+        {
+            if (session?.RestantS is > 0) AnnulerFinForfait();
+            if (precedente != null && session == null) ViderHistorique();
+            MettreAJourWidget();
+        });
+    }
+
+    public void RecevoirMessage(string texte) => SurUi(() => SurMessageRecu(texte));
+
+    public void NotifierRecharge(int? minutes) => SurUi(() =>
+    {
+        if (_desiredLocked) return;
+        var texte = minutes is > 0 ? $"{minutes} minute(s) ont été ajoutées." : "Votre forfait a été rechargé.";
+        ToastForm.Afficher("Temps ajouté", texte, NiveauToast.Info, 7000);
+    });
+
+    public void DemanderArret(int secondes)
+    {
+        _arretRestant = Math.Max(1, secondes);
+        _arretEnCours = true;
+        Journal($"[Arrêt] Extinction dans {_arretRestant} s.");
+        SurUi(DemarrerArret);
+    }
+
+    private void SurUi(Action action)
+    {
+        if (IsDisposed || !IsHandleCreated) return;
+        if (InvokeRequired) BeginInvoke(action);
+        else action();
+    }
+
+    private void DemanderApplication()
+    {
+        if (IsDisposed || !IsHandleCreated) return;
+        if (InvokeRequired) BeginInvoke(new Action(AppliquerEtatSouhaite));
+        else AppliquerEtatSouhaite();
+    }
+
+    private void AppliquerEtatSouhaite()
+    {
+        if (IsDisposed) return;
+
+        if (_desiredLocked)
+        {
+            var etaitVerrouille = _locked;
+            var etaitCache = !Visible;
+            
+            if (!_devMode)
+            {
+                var cible = SystemInformation.VirtualScreen;
+                if (Bounds != cible) Bounds = cible;
+                TopMost = true;
+            }
+            
+            if (etaitCache) Show();
+            _locked = true;
+
+            if (etaitCache || !_devMode)
+            {
+                BringToFront();
+                Activate();
+                if (_webReady) _web.Focus();
+            }
+
+            if (!etaitVerrouille)
+            {
+                ToastForm.FermerTous();
+                PousserInfos();
+            }
+        }
+        else
+        {
+            _locked = false;
+            _messageVerrou = null;
+            TopMost = false;
+            if (Visible) Hide();
+        }
+
+        MettreAJourWidget();
+    }
+
+    protected override async void OnShown(EventArgs e)
+    {
+        base.OnShown(e);
+        AppliquerEtatSouhaite();
+        if (_arretEnCours) DemarrerArret();
+        await InitialiserWebViewAsync();
+    }
+
+    protected override void OnFormClosing(FormClosingEventArgs e)
+    {
+        if (_locked && !_devMode && e.CloseReason == CloseReason.UserClosing)
+            e.Cancel = true;
+        base.OnFormClosing(e);
+    }
+
+    protected override void Dispose(bool disposing)
+    {
+        if (disposing)
+        {
+            _garde.Dispose(); _finTimer.Dispose(); _arretTimer.Dispose();
+            if (_hook != IntPtr.Zero) { UnhookWindowsHookEx(_hook); _hook = IntPtr.Zero; }
+            if (_widget is { IsDisposed: false }) _widget.Dispose();
+            _widget = null;
+        }
+        base.Dispose(disposing);
+    }
+
+    private void MettreAJourWidget()
+    {
+        if (IsDisposed) return;
+
+        var session = _session;
+        if (_desiredLocked || session == null)
+        {
+            FermerWidget();
+            return;
+        }
+
+        if (_widget == null || _widget.IsDisposed)
+        {
+            var w = new SessionWidget
+            {
+                SuspendreHandler = SuspendreDepuisWidgetAsync,
+                QuitterHandler = QuitterDepuisWidgetAsync,
+                MessageHandler = EnvoyerMessageClientAsync
+            };
+            w.CinqMinutes += SurCinqMinutes;
+            w.ForfaitTermine += SurForfaitTermine;
+            foreach(var m in _historique) w.AjouterMessageChat(m);
+            w.FormClosed += (_, _) => { if (ReferenceEquals(_widget, w)) _widget = null; };
+            w.DefinirServeur(ServeurJoignable, immediat: true);   // état connu dès l'ouverture : pas de « vérification… »
+            _widget = w;
+        }
+        _widget.MettreAJour(session);
+    }
+
+    private void FermerWidget()
+    {
+        var w = _widget;
+        _widget = null;
+        if (w != null && !w.IsDisposed) w.Fermer();
+    }
+
+    private async Task<ResultatAction> SuspendreDepuisWidgetAsync()
+    {
+        var handler = SuspendreHandler;
+        if (handler == null) return new ResultatAction(false, "L'agent n'est pas prêt.");
+
+        var r = await handler();
+        if (r.Succes)
+        {
+            _session = null;
+            LockScreen();
+        }
+        return r;
+    }
+
+    private async Task<ResultatAction> QuitterDepuisWidgetAsync()
+    {
+        var handler = QuitterHandler;
+        if (handler == null) return new ResultatAction(false, "L'agent n'est pas prêt.");
+
+        var r = await handler();
+        if (r.Succes)
+        {
+            if (r.Montant is > 0)
+            {
+                var texte = $"Session terminée.\n\nMontant à payer : {SessionWidget.FormaterAr(r.Montant.Value)}\n\nMerci de régler à l'accueil.";
+                if (_widget is { IsDisposed: false } w) MessageBox.Show(w, texte, "Cyber Manager", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                else MessageBox.Show(texte, "Cyber Manager", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            }
+            _session = null;
+            ViderHistorique();
+            LockScreen();
+        }
+        return r;
+    }
+
+    private void SurCinqMinutes() => ToastForm.Afficher("Il reste 5 minutes", "Votre forfait se termine bientôt.", NiveauToast.Alerte, 10000);
+
+    private void SurForfaitTermine()
+    {
+        _messageVerrou = "Votre forfait est terminé.";
+        ToastForm.Afficher("Forfait terminé", "Le poste va être verrouillé.", NiveauToast.Danger, 6000);
+        _finTimer.Stop();
+        _finTimer.Start();
+        ReveillerHeartbeat?.Invoke();
+    }
+
+    private void AnnulerFinForfait()
+    {
+        _finTimer.Stop();
+        if (!_desiredLocked) _messageVerrou = null;
+    }
+
+    private void SurMessageRecu(string texte)
+    {
+        var m = new MessageChat(false, texte, DateTime.Now.ToString("HH:mm"));
+        AjouterHistorique(m);
+
+        if (_desiredLocked) return; 
+        ToastForm.Afficher("Message de l'accueil", texte, NiveauToast.Message, 9000);
+    }
+
+    private void AjouterHistorique(MessageChat m)
+    {
+        _historique.Add(m);
+        if (_historique.Count > MaxHistorique) _historique.RemoveAt(0);
+        if (_widget is { IsDisposed: false } w) w.AjouterMessageChat(m);
+        Poster(new { type = "message", moi = m.DeMoi, texte = m.Texte, heure = m.Heure });
+    }
+
+    private void ViderHistorique()
+    {
+        _historique.Clear();
+        Poster(new { type = "historique_vide" });
+    }
+
+    private async Task<ResultatAction> EnvoyerMessageClientAsync(string texte)
+    {
+        texte = (texte ?? "").Trim();
+        if (texte.Length == 0) return new ResultatAction(false, "Message vide.");
+        if (texte.Length > 500) texte = texte[..500];
+
+        var handler = MessageHandler;
+        if (handler == null) return new ResultatAction(false, "L'agent n'est pas prêt.");
+
+        var r = await handler(texte);
+        if (r.Succes) AjouterHistorique(new MessageChat(true, texte, DateTime.Now.ToString("HH:mm")));
+        return r;
+    }
+
+    private void DemarrerArret()
+    {
+        if (!_arretEnCours || IsDisposed) return;
+        _desiredLocked = true;
+        Interlocked.Exchange(ref _graceVerrouTicks, DateTime.UtcNow.AddSeconds(6).Ticks);
+        AppliquerEtatSouhaite();
+        Poster(new { type = "arret", restant = _arretRestant });
+        _arretTimer.Stop();
+        _arretTimer.Start();
+    }
+
+    private void TickArret()
+    {
+        if (!_arretEnCours) { _arretTimer.Stop(); return; }
+        _arretRestant--;
+        if (_arretRestant > 0) { Poster(new { type = "arret", restant = _arretRestant }); return; }
+        _arretTimer.Stop();
+        _arretEnCours = false;
+        Poster(new { type = "arret", restant = 0 });
+        var ok = false;
+        try { ok = ExtinctionHandler?.Invoke() ?? false; } catch { }
+        if (!ok) Poster(new { type = "arret", restant = -2 });
+    }
+
+    private void AnnulerArret()
+    {
+        if (!_arretEnCours) return;
+        _arretTimer.Stop();
+        _arretEnCours = false;
+        Poster(new { type = "arret", restant = -1 });
+    }
+
+    private async Task InitialiserWebViewAsync()
+    {
+        while (!IsDisposed)
+        {
+            try
+            {
+                var dossier = Path.Combine(Path.GetDirectoryName(AgentConfig.ConfigPath)!, "WebView2");
+                var env = await CoreWebView2Environment.CreateAsync(null, dossier);
+                await _web.EnsureCoreWebView2Async(env);
+
+                var s = _web.CoreWebView2.Settings;
+                s.AreDefaultContextMenusEnabled = false; s.AreDevToolsEnabled = _devMode; s.AreBrowserAcceleratorKeysEnabled = false;
+                s.IsZoomControlEnabled = false; s.IsStatusBarEnabled = false; s.IsPasswordAutosaveEnabled = false; s.IsGeneralAutofillEnabled = false;
+
+                _web.CoreWebView2.NewWindowRequested += (_, a) => a.Handled = true;
+                _web.CoreWebView2.NavigationStarting += (_, a) => { if (a.IsUserInitiated) a.Cancel = true; };
+                _web.CoreWebView2.WebMessageReceived += OnWebMessage;
+                _web.NavigationCompleted += (_, a) =>
+                {
+                    if (!a.IsSuccess) return;
+                    _webReady = true;
+                    _attente.Visible = false;
+                    PousserInfos();
+                    PousserBranding();
+                    foreach (var m in _historique) Poster(new { type = "message", moi = m.DeMoi, texte = m.Texte, heure = m.Heure });
+                    if (_arretEnCours) Poster(new { type = "arret", restant = _arretRestant });
+                    _voyant?.BringToFront();
+                    if (_desiredLocked) _web.Focus();
+                };
+
+                _web.NavigateToString(LockScreenHtml.Page);
+                return;
+            }
+            catch
+            {
+                _attente.Text = "Cyber Manager\nInitialisation de l'écran…";
+                await Task.Delay(5000);
+            }
+        }
+    }
+
+    private void PousserInfos() => Poster(new { type = "infos", poste = _poste, ip = _ip, etat = _etat, bandeau = _messageVerrou });
+
+    private void Poster(object donnees)
+    {
+        try
+        {
+            if (_webReady && _web.CoreWebView2 != null) _web.CoreWebView2.PostWebMessageAsJson(JsonSerializer.Serialize(donnees));
+        }
+        catch { }
+    }
+
+    private async void OnWebMessage(object? sender, CoreWebView2WebMessageReceivedEventArgs e)
+    {
+        string message;
+        try { message = e.TryGetWebMessageAsString(); } catch { return; }
+
+        if (message == "activer") { await ActiverAsync(); return; }
+        if (message == "annuler_arret") { AnnulerArret(); return; }
+        if (message.StartsWith("msg:", StringComparison.Ordinal)) await EnvoyerDepuisVerrouAsync(message[4..]);
+        
+        if (message == "reprendre" && SuspendreHandler != null) { await SuspendreHandler(); return; }
+        if (message == "quitter" && QuitterHandler != null)
+        {
+            var r = await QuitterHandler();
+            if (r.Succes && r.Montant is > 0) MessageBox.Show($"Montant à payer : {SessionWidget.FormaterAr(r.Montant.Value)}", "Session terminée");
+            return;
+        }
+    }
+
+    private async Task EnvoyerDepuisVerrouAsync(string texte)
+    {
+        try
+        {
+            var r = await EnvoyerMessageClientAsync(texte);
+            Poster(new { type = "message_statut", ok = r.Succes, erreur = r.Succes ? "" : r.Message });
+        }
+        catch { Poster(new { type = "message_statut", ok = false, erreur = "Erreur inattendue." }); }
+    }
+
+    private async Task ActiverAsync()
+    {
+        if (_activationEnCours) return;
+        _activationEnCours = true;
+        try
+        {
+            Poster(new { type = "activation", statut = "encours" });
+            var handler = ActivationHandler;
+            var res = handler == null ? ActivationResult.Echec("L'agent n'est pas prêt.") : await handler();
+
+            if (res.Succes) { Poster(new { type = "activation", statut = "ok", message = res.Message }); await Task.Delay(700); UnlockScreen(); }
+            else Poster(new { type = "activation", statut = "erreur", message = res.Message });
+        }
+        catch { Poster(new { type = "activation", statut = "erreur", message = "Erreur inattendue." }); }
+        finally { _activationEnCours = false; }
+    }
+
+    private delegate IntPtr LowLevelKeyboardProc(int nCode, IntPtr wParam, IntPtr lParam);
+    private const int WH_KEYBOARD_LL = 13;
+    private const int WM_KEYDOWN = 0x0100, WM_KEYUP = 0x0101, WM_SYSKEYDOWN = 0x0104, WM_SYSKEYUP = 0x0105;
+
+    private static IntPtr PoserHook(LowLevelKeyboardProc proc)
+    {
+        using var p = System.Diagnostics.Process.GetCurrentProcess();
+        using var m = p.MainModule;
+        return SetWindowsHookEx(WH_KEYBOARD_LL, proc, GetModuleHandle(m!.ModuleName), 0);
+    }
+
+    private IntPtr HookCallback(int nCode, IntPtr wParam, IntPtr lParam)
+    {
+        if (nCode >= 0 && _locked)
+        {
+            var msg = (int)wParam;
+            if (msg is WM_KEYDOWN or WM_KEYUP or WM_SYSKEYDOWN or WM_SYSKEYUP)
+            {
+                var vk = Marshal.ReadInt32(lParam);
+                var flags = Marshal.ReadInt32(lParam, 8);
+                var alt = (flags & 0x20) != 0;
+                var ctrl = (GetAsyncKeyState(0x11) & 0x8000) != 0;
+
+                var bloquer = vk is 0x5B or 0x5C or 0x5D || (alt && vk is (0x09 or 0x1B or 0x73 or 0x20)) || (ctrl && vk == 0x1B);
+                if (bloquer) return (IntPtr)1;
+            }
+        }
+        return CallNextHookEx(IntPtr.Zero, nCode, wParam, lParam);
+    }
+
+    [DllImport("user32.dll")] private static extern IntPtr SetWindowsHookEx(int idHook, LowLevelKeyboardProc lpfn, IntPtr hMod, uint dwThreadId);
+    [DllImport("user32.dll")] private static extern bool UnhookWindowsHookEx(IntPtr hhk);
+    [DllImport("user32.dll")] private static extern IntPtr CallNextHookEx(IntPtr hhk, int nCode, IntPtr wParam, IntPtr lParam);
+    [DllImport("user32.dll")] private static extern short GetAsyncKeyState(int vKey);
+    [DllImport("kernel32.dll")] private static extern IntPtr GetModuleHandle(string? lpModuleName);
+}
+
+================================================================================
+📄 FICHIER : cyber-manager-agent/SessionWidget.cs
+================================================================================
+
+using System.Drawing.Drawing2D;
+using System.Globalization;
+using System.Runtime.InteropServices;
+
+public class SessionWidget : Form
+{
+    public Func<Task<ResultatAction>>? SuspendreHandler { get; set; }
+    public Func<Task<ResultatAction>>? QuitterHandler { get; set; }
+    public Func<string, Task<ResultatAction>>? MessageHandler { get; set; }
+
+    public event Action? CinqMinutes;
+    public event Action? ForfaitTermine;
+
+    private static readonly Color Fond = Color.FromArgb(11, 18, 38);
+    private static readonly Color Texte = Color.FromArgb(226, 232, 240);
+    private static readonly Color Discret = Color.FromArgb(148, 163, 184);
+    private static readonly Color Ambre = Color.FromArgb(245, 158, 11);
+    private static readonly Color VioletClair = Color.FromArgb(167, 139, 250);
+    private static readonly Color Violet = Color.FromArgb(124, 58, 237);
+    private static readonly Color Rouge = Color.FromArgb(220, 38, 38);
+    private static readonly Color Ardoise = Color.FromArgb(51, 65, 85);
+
+    private readonly float _k;
+    private readonly Label _lblCaption, _lblTemps, _lblMontant, _lblDebut;
+    private readonly Button _btnCacher, _btnSuspendre, _btnQuitter, _btnEnvoyer;
+    private readonly RichTextBox _chatBox;
+    private readonly TextBox _chatSaisie;
+    private readonly VoyantServeur _voyant;
+    private readonly System.Windows.Forms.Timer _timer;
+    private readonly NotifyIcon _tray;
+
+    private int _sessionId = -1;
+    private string _mode = "postpaye";
+    private int _ecouleBase;
+    private int? _restantBase;
+    private int _montant;
+    private int _forfaitTotal;
+    private TarifInfo _tarif = new();
+    private string _debut = "—";
+    private long _recuTick = Environment.TickCount64;
+
+    private bool _modeReduit, _occupe, _positionne, _fermetureAutorisee;
+    private bool _alerte5, _finSignalee;
+    private int _ticks;
+
+    private static Icon? _iconeApp;
+    
+    private static string _nomCyber = "Cyber Manager";
+    private static string _couleurHex = "#7c3aed";
+    private static byte[]? _logoOctets;
+    private Label? _lblTitre;
+
+    public SessionWidget()
+    {
+        _k = Math.Max(1f, DeviceDpi / 96f);
+
+        Text = _nomCyber;
+        FormBorderStyle = FormBorderStyle.None;
+        StartPosition = FormStartPosition.Manual;
+        ShowInTaskbar = true;                      // icône dans la barre des tâches (clic = ramener le widget)
+        Icon = IconeApp();                         // icône personnalisée (écran violet) au lieu de l'engrenage par défaut
+        MinimizeBox = true;
+        TopMost = false;                           // ne passe jamais devant Word, Chrome, etc.
+        BackColor = Fond;
+        ClientSize = new Size(S(240), S(250));
+        DoubleBuffered = true;
+        Deplacable(this);
+
+        _lblTitre = Etiquette(_nomCyber.ToUpperInvariant(), 8f, FontStyle.Bold, VioletClair, 0, 4, 240, 18);
+        _lblCaption = Etiquette("TEMPS ÉCOULÉ", 8f, FontStyle.Bold, Discret, 0, 24, 240, 16);
+        _lblTemps = Etiquette("00:00:00", 16f, FontStyle.Bold, Ambre, 0, 42, 240, 30, "Consolas");
+        _lblMontant = Etiquette("", 10f, FontStyle.Bold, Texte, 0, 74, 240, 20);
+        _lblDebut = Etiquette("", 8f, FontStyle.Regular, Discret, 0, 96, 240, 16);
+
+        // Voyant « Serveur : connecté / injoignable » (visible aussi en mode réduit)
+        _voyant = new VoyantServeur(7.5f) { Bounds = new Rectangle(S(6), S(114), S(228), S(20)) };
+        Controls.Add(_voyant);
+
+        _chatBox = new RichTextBox
+        {
+            ReadOnly = true, BorderStyle = BorderStyle.None, DetectUrls = false, TabStop = false,
+            ScrollBars = RichTextBoxScrollBars.Vertical, Font = new Font("Segoe UI", 8f),
+            Bounds = new Rectangle(S(6), S(138), S(228), S(42))
+        };
+        _chatBox.BackColor = Color.FromArgb(19, 28, 58);
+        _chatBox.ForeColor = Texte;
+        Deplacable(_chatBox);
+        Controls.Add(_chatBox);
+
+        _chatSaisie = new TextBox
+        {
+            BorderStyle = BorderStyle.FixedSingle, BackColor = Color.FromArgb(19, 28, 58), ForeColor = Color.White,
+            Font = new Font("Segoe UI", 8f), PlaceholderText = "Écrire...",
+            Bounds = new Rectangle(S(6), S(184), S(180), S(22))
+        };
+        _chatSaisie.KeyDown += async (_, e) => {
+            if (e.KeyCode == Keys.Enter) { e.SuppressKeyPress = true; await EnvoyerChatAsync(); }
+        };
+        Controls.Add(_chatSaisie);
+
+        _btnEnvoyer = new Button
+        {
+            Text = "➤", FlatStyle = FlatStyle.Flat, BackColor = Violet, ForeColor = Color.White,
+            Font = new Font("Segoe UI", 8f, FontStyle.Bold), Bounds = new Rectangle(S(188), S(184), S(46), S(22)),
+            TabStop = false, Cursor = Cursors.Hand, UseVisualStyleBackColor = false
+        };
+        _btnEnvoyer.FlatAppearance.BorderSize = 0;
+        _btnEnvoyer.Click += async (_, _) => await EnvoyerChatAsync();
+        Controls.Add(_btnEnvoyer);
+
+        _btnCacher = Bouton("Réduire", Ardoise, 6, (_, _) => BasculerReduction());
+        _btnSuspendre = Bouton("Suspendre", Violet, 82, async (_, _) => await ExecuterAsync(SuspendreHandler, "Suspendre votre session ?", "Suspendre"));
+        _btnQuitter = Bouton("Quitter", Rouge, 158, async (_, _) => await ExecuterAsync(QuitterHandler, "Terminer votre session ?", "Quitter"));
+
+        var menu = new ContextMenuStrip();
+        menu.Items.Add("Afficher le compteur", null, (_, _) => BasculerReduction(false));
+        _tray = new NotifyIcon
+        {
+            Icon = IconeApp(), Text = "Cyber Manager", ContextMenuStrip = menu, Visible = false
+        };
+        _tray.DoubleClick += (_, _) => BasculerReduction(false);
+
+        _timer = new System.Windows.Forms.Timer { Interval = 1000 };
+        _timer.Tick += (_, _) => { Rafraichir(); if (Visible) PlacerBasDroite(); };
+        _timer.Start();
+
+        Rafraichir();
+    }
+
+    /// <summary>État de la liaison avec le serveur (voyant). « immediat » : pas de délai avant le rouge.</summary>
+    public void DefinirServeur(bool connecte, bool immediat = false)
+    {
+        if (IsDisposed) return;
+        _voyant.Definir(connecte, immediat);
+    }
+
+    /// <summary>Applique l'identité du cyber (appelé par ClientWindow, une seule fois par changement).</summary>
+    public static void DefinirBranding(string nom, string couleurHex, byte[]? logo)
+    {
+        _nomCyber = string.IsNullOrWhiteSpace(nom) ? "Cyber Manager" : nom;
+        _couleurHex = string.IsNullOrWhiteSpace(couleurHex) ? "#7c3aed" : couleurHex;
+        _logoOctets = logo;
+        _iconeApp = null;   // l'icône sera redessinée au prochain appel
+    }
+
+    /// <summary>Met à jour un widget déjà ouvert (titre, icône barre des tâches et zone de notification).</summary>
+    public void AppliquerBranding()
+    {
+        if (IsDisposed) return;
+        Text = _nomCyber;
+        if (_lblTitre != null) _lblTitre.Text = _nomCyber.ToUpperInvariant();
+        try { Icon = IconeApp(); _tray.Icon = IconeApp(); } catch { }
+    }
+
+    private static Color CouleurAccent()
+    {
+        try { return ColorTranslator.FromHtml(_couleurHex); }
+        catch { return Color.FromArgb(124, 58, 237); }
+    }
+
+    private static Color Assombrir(Color c, float f) =>
+        Color.FromArgb(c.A, (int)(c.R * f), (int)(c.G * f), (int)(c.B * f));
+
+    /// <summary>
+    /// Icône de l'application : le logo du cyber (sur fond blanc arrondi) s'il existe,
+    /// sinon un écran blanc sur fond dégradé à la couleur du cyber. Mise en cache.
+    /// </summary>
+    public static Icon IconeApp()
+    {
+        if (_iconeApp != null) return _iconeApp;
+        try
+        {
+            using var bmp = new Bitmap(64, 64);
+            using (var g = Graphics.FromImage(bmp))
+            {
+                g.SmoothingMode = SmoothingMode.AntiAlias;
+                g.InterpolationMode = InterpolationMode.HighQualityBicubic;
+                g.Clear(Color.Transparent);
+
+                var rect = new Rectangle(2, 2, 60, 60);
+                const int r = 14;
+                using var path = new GraphicsPath();
+                path.AddArc(rect.X, rect.Y, r * 2, r * 2, 180, 90);
+                path.AddArc(rect.Right - r * 2, rect.Y, r * 2, r * 2, 270, 90);
+                path.AddArc(rect.Right - r * 2, rect.Bottom - r * 2, r * 2, r * 2, 0, 90);
+                path.AddArc(rect.X, rect.Bottom - r * 2, r * 2, r * 2, 90, 90);
+                path.CloseFigure();
+
+                var logoDessine = false;
+                if (_logoOctets is { Length: > 0 })
+                {
+                    try
+                    {
+                        using var ms = new MemoryStream(_logoOctets);
+                        using var img = Image.FromStream(ms);
+                        using (var blanc = new SolidBrush(Color.White)) g.FillPath(blanc, path);
+                        var ratio = Math.Min(52f / img.Width, 52f / img.Height);
+                        var w = img.Width * ratio;
+                        var h = img.Height * ratio;
+                        g.DrawImage(img, (64 - w) / 2f, (64 - h) / 2f, w, h);
+                        logoDessine = true;
+                    }
+                    catch { logoDessine = false; }
+                }
+
+                if (!logoDessine)
+                {
+                    var accent = CouleurAccent();
+                    using (var fond = new LinearGradientBrush(rect, accent, Assombrir(accent, 0.65f), 45f))
+                        g.FillPath(fond, path);
+
+                    using var stylo = new Pen(Color.White, 4f) { StartCap = LineCap.Round, EndCap = LineCap.Round };
+                    g.DrawRectangle(stylo, 14, 15, 36, 24);   // écran
+                    g.DrawLine(stylo, 32, 40, 32, 47);        // pied
+                    g.DrawLine(stylo, 22, 48, 42, 48);        // socle
+                }
+            }
+
+            var hIcone = bmp.GetHicon();
+            try
+            {
+                using var temporaire = Icon.FromHandle(hIcone);
+                _iconeApp = (Icon)temporaire.Clone();
+            }
+            finally { DestroyIcon(hIcone); }
+        }
+        catch
+        {
+            _iconeApp = SystemIcons.Application;
+        }
+        return _iconeApp;
+    }
+
+    public void MettreAJour(SessionInfo s)
+    {
+        var nouvelle = s.Id != _sessionId;
+        var premiereFois = _sessionId == -1;   // widget tout juste créé : son historique vient d'être rechargé
+        _sessionId = s.Id;
+        _mode = s.Mode ?? "postpaye";
+        _ecouleBase = Math.Max(0, s.EcouleS);
+        _restantBase = s.RestantS;
+        _montant = Math.Max(0, s.MontantActuel);
+        _forfaitTotal = s.ForfaitTotal;
+        _tarif = s.Tarif ?? new TarifInfo();
+        _debut = FormaterHeure(s.DateHeureDebut);
+        _recuTick = Environment.TickCount64;
+
+        if (nouvelle)
+        {
+            _modeReduit = false; _alerte5 = false; _finSignalee = false;
+            // CORRECTIF : on n'efface PAS le chat quand le widget vient d'être (re)créé
+            // (reprise après suspension) : l'historique conservé par ClientWindow vient d'y être injecté.
+            if (!premiereFois) _chatBox.Clear();
+            _positionne = false;
+            Afficher();
+        }
+        Rafraichir();
+        if (!_modeReduit) Afficher();
+    }
+
+    public void AjouterMessageChat(MessageChat m)
+    {
+        _chatBox.Select(_chatBox.TextLength, 0);
+        _chatBox.SelectionFont = new Font("Segoe UI", 7.5f, FontStyle.Bold);
+        _chatBox.SelectionColor = Discret;
+        _chatBox.SelectedText = (m.DeMoi ? "Moi" : "Accueil") + " · " + m.Heure + "\n";
+
+        _chatBox.SelectionFont = new Font("Segoe UI", 8f);
+        _chatBox.SelectionColor = m.DeMoi ? VioletClair : Texte;
+        _chatBox.SelectedText = m.Texte + "\n\n";
+        _chatBox.ScrollToCaret();
+    }
+
+    public static string FormaterAr(int montant) =>
+        montant.ToString("N0", CultureInfo.GetCultureInfo("fr-FR"))
+            .Replace('\u202f', ' ').Replace('\u00a0', ' ') + " Ar";
+
+    public void Fermer() { _fermetureAutorisee = true; Close(); }
+
+    protected override bool ShowWithoutActivation => true;   // à l'apparition, ne vole pas le focus
+
+    protected override CreateParams CreateParams
+    {
+        get
+        {
+            var cp = base.CreateParams;
+            cp.Style |= 0x00020000;       // WS_MINIMIZEBOX : le clic sur l'icône de la barre des tâches peut réduire / restaurer
+            cp.ExStyle |= 0x00040000;     // WS_EX_APPWINDOW : bouton dans la barre des tâches
+            cp.ExStyle &= ~0x80;          // retire WS_EX_TOOLWINDOW (qui cachait le widget de la barre des tâches)
+            return cp;
+        }
+    }
+
+    protected override void OnFormClosing(FormClosingEventArgs e) { if (!_fermetureAutorisee && e.CloseReason == CloseReason.UserClosing) { e.Cancel = true; return; } base.OnFormClosing(e); }
+    protected override void OnSizeChanged(EventArgs e) { base.OnSizeChanged(e); if (IsHandleCreated) PlacerBasDroite(); }
+    protected override void OnPaint(PaintEventArgs e) { base.OnPaint(e); using var pen = new Pen(Color.FromArgb(110, 139, 92, 246)); e.Graphics.DrawRectangle(pen, 0, 0, Width - 1, Height - 1); }
+    protected override void Dispose(bool disposing) { if (disposing) { _timer.Dispose(); _tray.Visible = false; _tray.Dispose(); } base.Dispose(disposing); }
+
+    /// <summary>Position fixe : coin inférieur DROIT de la zone de travail (au-dessus de la barre des tâches).</summary>
+    private void PlacerBasDroite()
+    {
+        if (IsDisposed || WindowState != FormWindowState.Normal) return;
+        var zone = Screen.PrimaryScreen?.WorkingArea ?? SystemInformation.WorkingArea;
+        var cible = new Point(zone.Right - Width, zone.Bottom - Height);
+        if (Location != cible) Location = cible;
+    }
+
+    private void Afficher()
+    {
+        if (IsDisposed) return;
+        if (!_positionne)
+        {
+            PlacerBasDroite();
+            _positionne = true;
+        }
+        _tray.Visible = false;
+        if (!Visible) Show();
+    }
+
+    private void BasculerReduction(bool? forceReduit = null)
+    {
+        _modeReduit = forceReduit ?? !_modeReduit;
+
+        _lblCaption.Visible = !_modeReduit;
+        _lblTemps.Visible = !_modeReduit;
+        _lblDebut.Visible = !_modeReduit;
+        _chatBox.Visible = !_modeReduit;
+        _chatSaisie.Visible = !_modeReduit;
+        _btnEnvoyer.Visible = !_modeReduit;
+
+        _lblMontant.Visible = true;
+        _voyant.Visible = true;   // le voyant reste visible, même réduit
+        _btnCacher.Text = _modeReduit ? "Afficher" : "Réduire";
+
+        if (_modeReduit)
+        {
+            ClientSize = new Size(S(240), S(102));
+            _lblMontant.Bounds = new Rectangle(S(0), S(6), S(240), S(24));
+            _lblMontant.TextAlign = ContentAlignment.MiddleCenter;
+            _voyant.Bounds = new Rectangle(S(6), S(32), S(228), S(20));
+
+            _btnCacher.Bounds = new Rectangle(S(6), S(58), S(72), S(35));
+            _btnSuspendre.Bounds = new Rectangle(S(82), S(58), S(72), S(35));
+            _btnQuitter.Bounds = new Rectangle(S(158), S(58), S(72), S(35));
+        }
+        else
+        {
+            ClientSize = new Size(S(240), S(250));
+            _lblMontant.Bounds = new Rectangle(S(0), S(74), S(240), S(20));
+            _lblMontant.TextAlign = ContentAlignment.MiddleCenter;
+            _voyant.Bounds = new Rectangle(S(6), S(114), S(228), S(20));
+
+            _btnCacher.Bounds = new Rectangle(S(6), S(210), S(72), S(35));
+            _btnSuspendre.Bounds = new Rectangle(S(82), S(210), S(72), S(35));
+            _btnQuitter.Bounds = new Rectangle(S(158), S(210), S(72), S(35));
+        }
+
+        PlacerBasDroite();
+        if (!Visible) Afficher();
+    }
+
+    /// <summary>
+    /// Montant temps réel : STRICTEMENT max(minimum, minutes × prix/minute).
+    /// Le paramètre « arrondi » des tarifs n'est volontairement PAS appliqué ici
+    /// (même formule que le panneau admin et que PosteSessionService::montant() côté Laravel).
+    /// </summary>
+    private int MontantPourMinutes(int minutes)
+    {
+        var t = _tarif;
+        long brut = (long)Math.Max(0, minutes) * t.ParMinute;
+        return (int)Math.Max((long)t.Minimum, brut);
+    }
+
+    private void Rafraichir()
+    {
+        var delta = (int)Math.Max(0, (Environment.TickCount64 - _recuTick) / 1000);
+        var forfait = _mode == "forfait" && _restantBase.HasValue;
+
+        _lblCaption.Text = forfait ? "TEMPS RESTANT" : "TEMPS ÉCOULÉ";
+        var secondes = forfait ? Math.Max(0, _restantBase!.Value - delta) : _ecouleBase + delta;
+        _lblTemps.Text = Duree(secondes);
+        _lblTemps.ForeColor = forfait && secondes <= 300 ? Color.FromArgb(248, 113, 113) : Ambre;
+
+        if (_mode == "libre") _lblMontant.Text = "Sans facturation";
+        else if (_mode == "forfait") _lblMontant.Text = $"Forfait : {FormaterAr(_forfaitTotal)}";
+        else {
+            var min = secondes / 60;
+            _lblMontant.Text = "À payer : " + FormaterAr(MontantPourMinutes(min));
+        }
+
+        _lblDebut.Text = "Début : " + _debut;
+
+        if (!forfait) return;
+
+        if (secondes > 300) _alerte5 = false;
+        else if (secondes > 0 && !_alerte5) { _alerte5 = true; CinqMinutes?.Invoke(); }
+
+        if (secondes > 0) _finSignalee = false;
+        else if (!_finSignalee) { _finSignalee = true; ForfaitTermine?.Invoke(); }
+    }
+
+    private static string Duree(int secondes) { var t = TimeSpan.FromSeconds(Math.Max(0, secondes)); return $"{(int)t.TotalHours:00}:{t.Minutes:00}:{t.Seconds:00}"; }
+    private static string FormaterHeure(string? iso) => DateTimeOffset.TryParse(iso, CultureInfo.InvariantCulture, DateTimeStyles.None, out var d) ? d.ToLocalTime().ToString("HH:mm", CultureInfo.InvariantCulture) : "—";
+
+    private async Task EnvoyerChatAsync()
+    {
+        var texte = _chatSaisie.Text.Trim();
+        if (texte.Length == 0 || MessageHandler == null || _occupe) return;
+        _chatSaisie.Clear();
+        await MessageHandler(texte);
+    }
+
+    private async Task ExecuterAsync(Func<Task<ResultatAction>>? handler, string question, string titre)
+    {
+        if (_occupe || handler == null) return;
+        var choix = MessageBox.Show(this, question, titre, MessageBoxButtons.YesNo, MessageBoxIcon.Question, MessageBoxDefaultButton.Button2);
+        if (choix != DialogResult.Yes || IsDisposed) return;
+
+        _occupe = true;
+        try {
+            var r = await handler();
+            if (!IsDisposed && !r.Succes) MessageBox.Show(this, r.Message, titre, MessageBoxButtons.OK, MessageBoxIcon.Warning);
+        } catch (Exception ex) { ClientWindow.Journal($"[Widget] Erreur : {ex.Message}"); }
+        finally { if (!IsDisposed) _occupe = false; }
+    }
+
+    private int S(int valeur) => (int)Math.Round(valeur * _k);
+
+    private Label Etiquette(string texte, float taille, FontStyle style, Color couleur, int x, int y, int l, int h, string famille = "Segoe UI")
+    {
+        var lbl = new Label { Text = texte, AutoSize = false, Bounds = new Rectangle(S(x), S(y), S(l), S(h)), TextAlign = ContentAlignment.MiddleCenter, ForeColor = couleur, BackColor = Color.Transparent, Font = new Font(famille, taille, style) };
+        Deplacable(lbl); Controls.Add(lbl); return lbl;
+    }
+
+    private Button Bouton(string texte, Color fond, int x, EventHandler clic)
+    {
+        var b = new Button { Text = texte, FlatStyle = FlatStyle.Flat, BackColor = fond, ForeColor = Color.White, Font = new Font("Segoe UI", 8f, FontStyle.Bold), Bounds = new Rectangle(S(x), S(210), S(72), S(35)), TabStop = false, Cursor = Cursors.Hand, UseVisualStyleBackColor = false };
+        b.FlatAppearance.BorderSize = 0; b.Click += clic; Controls.Add(b); return b;
+    }
+
+    // Le widget est FIXE (bas-droite) : le déplacement par glisser-déposer est volontairement désactivé.
+    private void Deplacable(Control c) { }
+
+    [DllImport("user32.dll")] private static extern bool ReleaseCapture();
+    [DllImport("user32.dll")] private static extern IntPtr SendMessage(IntPtr hWnd, int msg, int wParam, int lParam);
+    [DllImport("user32.dll", CharSet = CharSet.Auto)] private static extern bool DestroyIcon(IntPtr hIcon);
+}
+
+================================================================================
+📄 FICHIER : cyber-manager-agent/SurveillanceLiaison.cs
+================================================================================
+
+using System.Net.NetworkInformation;
+using System.Net.Sockets;
+
+namespace CyberManager.Agent;
+
+public enum EtatLiaison { Ok, CableDebranche, ServeurInjoignable }
+
+/// <summary>
+/// Surveille la liaison avec le serveur. Le délai de grâce (15 s par défaut, fourni par le serveur
+/// dans « delai_grace_agent_s ») est inférieur à la tolérance du serveur (30 s).
+/// L'événement EtatChange est levé sur un thread du pool : le consommateur doit repasser sur le thread UI.
+/// </summary>
+public sealed class SurveillanceLiaison : IDisposable
+{
+    private readonly object _verrou = new();
+    private DateTime _dernierSucces = DateTime.UtcNow;
+    private EtatLiaison _etat = EtatLiaison.Ok;
+    private System.Threading.Timer? _minuteur;
+
+    public TimeSpan DelaiGrace { get; set; } = TimeSpan.FromSeconds(15);
+
+    public event Action<EtatLiaison, string>? EtatChange;
+
+    public EtatLiaison Etat { get { lock (_verrou) return _etat; } }
+
+    /// <summary>Faux dès que la grâce est dépassée : chrono et montant figés, poste verrouillé.</summary>
+    public bool UsageAutorise => Etat == EtatLiaison.Ok;
+
+    public void Demarrer() => _minuteur ??= new System.Threading.Timer(_ => Evaluer(), null, 1000, 1000);
+
+    /// <summary>À appeler après chaque heartbeat réussi (en passant delai_grace_agent_s de la réponse).</summary>
+    public void SignalerSucces(int? delaiGraceServeurSecondes = null)
+    {
+        lock (_verrou) _dernierSucces = DateTime.UtcNow;
+        if (delaiGraceServeurSecondes is int s && s > 0) DelaiGrace = TimeSpan.FromSeconds(s);
+        Evaluer();
+    }
+
+    private void Evaluer()
+    {
+        TimeSpan silence;
+        lock (_verrou) silence = DateTime.UtcNow - _dernierSucces;
+
+        var nouveau = silence < DelaiGrace
+            ? EtatLiaison.Ok
+            : (ReseauLocalPresent() ? EtatLiaison.ServeurInjoignable : EtatLiaison.CableDebranche);
+
+        lock (_verrou)
+        {
+            if (nouveau == _etat) return;
+            _etat = nouveau;
+        }
+
+        var message = nouveau switch
+        {
+            EtatLiaison.CableDebranche     => "Câble réseau débranché ou Wi-Fi coupé. Le poste est verrouillé, votre temps est suspendu. Reprise automatique au retour du réseau.",
+            EtatLiaison.ServeurInjoignable => "Le serveur de la caisse ne répond pas. Le poste est verrouillé, votre temps est suspendu. Reprise automatique au retour du serveur.",
+            _                              => "Connexion rétablie.",
+        };
+        EtatChange?.Invoke(nouveau, message);
+    }
+
+    private static bool ReseauLocalPresent()
+    {
+        try
+        {
+            foreach (var ni in NetworkInterface.GetAllNetworkInterfaces())
+            {
+                if (ni.OperationalStatus != OperationalStatus.Up) continue;
+                if (ni.NetworkInterfaceType is NetworkInterfaceType.Loopback or NetworkInterfaceType.Tunnel) continue;
+
+                foreach (var a in ni.GetIPProperties().UnicastAddresses)
+                {
+                    if (a.Address.AddressFamily == AddressFamily.InterNetwork
+                        && !a.Address.ToString().StartsWith("169.254.", StringComparison.Ordinal))
+                        return true;
+                }
+            }
+        }
+        catch { /* en cas de doute : on considère le réseau présent */ return true; }
+        return false;
+    }
+
+    public void Dispose() => _minuteur?.Dispose();
+}
+
+================================================================================
+📄 FICHIER : cyber-manager-agent/VoyantServeur.cs
+================================================================================
+
+using System.Drawing.Drawing2D;
+using System.Drawing.Text;
+
+/// <summary>
+/// Voyant « Serveur : connecté ✓ / injoignable ». Alimenté UNIQUEMENT par l'état que le Gardien tire du heartbeat :
+/// il ne dépend jamais de la sonde NCSI de Windows.
+/// Anti-clignotement : vert immédiat ; rouge seulement après 3 s d'injoignabilité ; redessin uniquement si l'état change.
+/// </summary>
+public sealed class VoyantServeur : Control
+{
+    private enum Etat { Inconnu, Connecte, Injoignable }
+
+    private static readonly Color Fond = Color.FromArgb(19, 28, 58);
+    private static readonly Color Vert = Color.FromArgb(34, 197, 94);
+    private static readonly Color Rouge = Color.FromArgb(239, 68, 68);
+    private static readonly Color Gris = Color.FromArgb(148, 163, 184);
+
+    private readonly Font _police;
+    private readonly System.Windows.Forms.Timer _delai = new() { Interval = 3000 };
+    private Etat _etat = Etat.Inconnu;
+    private bool _dernierConnecte;
+
+    public VoyantServeur(float taillePolice)
+    {
+        SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw, true);
+        _police = new Font("Segoe UI", taillePolice, FontStyle.Bold);
+        TabStop = false;
+        AccessibleName = "État de la liaison avec le serveur";
+        _delai.Tick += (_, _) =>
+        {
+            _delai.Stop();
+            if (!_dernierConnecte) Appliquer(Etat.Injoignable);
+        };
+    }
+
+    /// <summary>À appeler sur le thread UI. « immediat » : pas de délai avant le rouge (création du widget).</summary>
+    public void Definir(bool connecte, bool immediat = false)
+    {
+        _dernierConnecte = connecte;
+        if (connecte) { _delai.Stop(); Appliquer(Etat.Connecte); return; }
+        if (immediat) { _delai.Stop(); Appliquer(Etat.Injoignable); return; }
+        if (_etat != Etat.Injoignable && !_delai.Enabled) _delai.Start();
+    }
+
+    private void Appliquer(Etat e)
+    {
+        if (_etat == e) return;
+        _etat = e;
+        Invalidate();
+    }
+
+    private static GraphicsPath Pilule(Rectangle r)
+    {
+        var p = new GraphicsPath();
+        var d = Math.Max(2, r.Height);
+        p.AddArc(r.X, r.Y, d, d, 90, 180);
+        p.AddArc(r.Right - d, r.Y, d, d, 270, 180);
+        p.CloseFigure();
+        return p;
+    }
+
+    protected override void OnResize(EventArgs e)
+    {
+        base.OnResize(e);
+        if (Width <= 0 || Height <= 0) return;
+        using var chemin = Pilule(new Rectangle(0, 0, Width, Height));
+        var ancienne = Region;
+        Region = new Region(chemin);
+        ancienne?.Dispose();
+    }
+
+    protected override void OnPaint(PaintEventArgs e)
+    {
+        var g = e.Graphics;
+        g.SmoothingMode = SmoothingMode.AntiAlias;
+        g.TextRenderingHint = TextRenderingHint.ClearTypeGridFit;
+        g.Clear(Fond);
+
+        var couleur = _etat switch { Etat.Connecte => Vert, Etat.Injoignable => Rouge, _ => Gris };
+        var texte = _etat switch
+        {
+            Etat.Connecte => "Serveur : connecté",
+            Etat.Injoignable => "Serveur : injoignable",
+            _ => "Serveur : vérification…",
+        };
+
+        using (var bordure = new Pen(couleur, 2f))
+        using (var chemin = Pilule(new Rectangle(1, 1, Width - 3, Height - 3)))
+            g.DrawPath(bordure, chemin);
+
+        var d = Math.Max(8, Height - 10);
+        var cercle = new Rectangle(8, (Height - d) / 2, d, d);
+
+        if (_etat == Etat.Inconnu)
+        {
+            using var p = new Pen(couleur, 2f);
+            g.DrawEllipse(p, cercle);
+        }
+        else
+        {
+            using (var b = new SolidBrush(couleur)) g.FillEllipse(b, cercle);
+            using var trait = new Pen(Color.White, Math.Max(1.5f, d / 9f)) { StartCap = LineCap.Round, EndCap = LineCap.Round, LineJoin = LineJoin.Round };
+            if (_etat == Etat.Connecte)
+            {
+                g.DrawLines(trait, new[]
+                {
+                    new PointF(cercle.X + d * 0.26f, cercle.Y + d * 0.52f),
+                    new PointF(cercle.X + d * 0.43f, cercle.Y + d * 0.70f),
+                    new PointF(cercle.X + d * 0.74f, cercle.Y + d * 0.32f),
+                });
+            }
+            else
+            {
+                g.DrawLine(trait, cercle.X + d * 0.3f, cercle.Y + d * 0.3f, cercle.X + d * 0.7f, cercle.Y + d * 0.7f);
+                g.DrawLine(trait, cercle.X + d * 0.7f, cercle.Y + d * 0.3f, cercle.X + d * 0.3f, cercle.Y + d * 0.7f);
+            }
+        }
+
+        var zone = new Rectangle(cercle.Right + 8, 0, Math.Max(10, Width - cercle.Right - 14), Height);
+        using var format = new StringFormat { LineAlignment = StringAlignment.Center, Alignment = StringAlignment.Near, Trimming = StringTrimming.EllipsisCharacter, FormatFlags = StringFormatFlags.NoWrap };
+        using var pinceau = new SolidBrush(_etat == Etat.Inconnu ? Gris : Color.White);
+        g.DrawString(texte, _police, pinceau, zone, format);
+    }
+
+    protected override void Dispose(bool disposing)
+    {
+        if (disposing) { _delai.Dispose(); _police.Dispose(); }
+        base.Dispose(disposing);
+    }
+}
+
+================================================================================
+📄 FICHIER : cyber-manager-agent/cyber-manager-agent.csproj
+================================================================================
+
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <RootNamespace>cyber_manager_agent</RootNamespace>
+    <UseWindowsForms>true</UseWindowsForms>
+    <UseWPF>false</UseWPF>
+    <NoWarn>$(NoWarn);MSB3277;WFO1000</NoWarn>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Include="..\cyber-manager-commun\*.cs" LinkBase="Commun" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Web.WebView2" Version="1.0.2903.40" />
+  </ItemGroup>
+
+</Project>
+
+================================================================================
+📄 FICHIER : cyber-manager-commun/Modeles.cs
+================================================================================
+
+using System.Text.Json.Serialization;
+
+public enum ApiStatut { Ok, NonAutorise, Injoignable, Erreur }
+
+public record ApiReponse<T>(ApiStatut Statut, T? Donnees = default);
+
+public record ActivationResult(bool Succes, string Message, string? Avertissement = null)
+{
+    public static ActivationResult Echec(string message) => new(false, message);
+}
+
+/// <summary>Résultat d'une action de session demandée depuis le widget (suspendre / quitter).</summary>
+public record ResultatAction(bool Succes, string Message, int? Montant = null);
+
+/// <summary>
+/// Résultat du handshake. Code : « code_installation_invalide » (code absent ou faux),
+/// « identifiant_a_regenerer » (ordinateur dupliqué), ou null.
+/// </summary>
+public record HandshakeResultat(ApiStatut Statut, string? Code = null, string? Message = null);
+
+public record InfosReseau(string Ip, string Mac);
+
+/// <summary>Version proposée par le serveur pour ce poste (empreinte SHA-256 du paquet).</summary>
+public record PropositionMaj(string Version, string Sha256);
+
+public class HeartbeatResponse
+{
+    [JsonPropertyName("ok")] public bool Ok { get; set; }
+    [JsonPropertyName("nom_poste")] public string? NomPoste { get; set; }
+    [JsonPropertyName("etat")] public string? Etat { get; set; }
+    [JsonPropertyName("doit_etre_verrouille")] public bool DoitEtreVerrouille { get; set; }
+    [JsonPropertyName("session")] public SessionInfo? Session { get; set; }
+    [JsonPropertyName("branding")] public BrandingInfo? Branding { get; set; }
+}
+
+public class SessionInfo
+{
+    [JsonPropertyName("id")] public int Id { get; set; }
+    [JsonPropertyName("mode")] public string? Mode { get; set; }
+    [JsonPropertyName("date_heure_debut")] public string? DateHeureDebut { get; set; }
+    [JsonPropertyName("date_heure_fin")] public string? DateHeureFin { get; set; }
+    [JsonPropertyName("duree_prevue")] public int DureePrevue { get; set; }
+    [JsonPropertyName("forfait_total")] public int ForfaitTotal { get; set; }
+    [JsonPropertyName("montant_actuel")] public int MontantActuel { get; set; }
+    [JsonPropertyName("etat")] public string? Etat { get; set; }
+    [JsonPropertyName("ecoule_s")] public int EcouleS { get; set; }
+    [JsonPropertyName("restant_s")] public int? RestantS { get; set; }
+    [JsonPropertyName("tarif")] public TarifInfo? Tarif { get; set; }
+}
+
+public class AgentCommand
+{
+    public int Id { get; set; }
+    public string Type { get; set; } = "";
+    public string? Payload { get; set; }
+}
+
+public class TarifInfo
+{
+    [JsonPropertyName("par_minute")] public int ParMinute { get; set; } = 20;
+    [JsonPropertyName("minimum")] public int Minimum { get; set; } = 300;
+    [JsonPropertyName("arrondi_actif")] public bool ArrondiActif { get; set; }
+    [JsonPropertyName("unite")] public int Unite { get; set; }
+    [JsonPropertyName("seuil")] public int Seuil { get; set; }
+}
+
+public class BrandingInfo
+{
+    [JsonPropertyName("nom_cyber")] public string? NomCyber { get; set; }
+    [JsonPropertyName("slogan")] public string? Slogan { get; set; }
+    [JsonPropertyName("couleur")] public string? Couleur { get; set; }
+    [JsonPropertyName("avec_logo")] public bool AvecLogo { get; set; }
+    [JsonPropertyName("logo_version")] public string? LogoVersion { get; set; }
+}
+
+================================================================================
+📄 FICHIER : cyber-manager-commun/Protocole.cs
+================================================================================
+
+using System.Text.Json;
+using System.Text.Json.Serialization;
+
+public static class Constantes
+{
+    /// <summary>Version de l'Écran : DOIT correspondre au nom du dossier/paquet (lue par fabriquer.ps1).</summary>
+    public const string VersionEcran = "2.2.0";
+    public const string VersionGardien = "1.1.0";
+    public const string NomPipe = "CyberManagerGardien";
+}
+
+/// <summary>
+/// Message unique (champs optionnels) du canal local.
+/// Gardien → Écran : etat, branding, cmd.     Écran → Gardien : pret, req, extinction, reveil, repcmd.
+/// Gardien → Écran (réponse à req) : rep.
+/// </summary>
+public class MessageCanal
+{
+    [JsonPropertyName("t")] public string Type { get; set; } = "";
+    [JsonPropertyName("id")] public int Id { get; set; }
+
+    // Écran → Gardien : requête (activer, suspendre, reprendre, fermer, message)
+    [JsonPropertyName("action")] public string? Action { get; set; }
+    [JsonPropertyName("texte")] public string? Texte { get; set; }
+
+    // Gardien → Écran : état du poste
+    [JsonPropertyName("poste")] public string? Poste { get; set; }
+    [JsonPropertyName("ip")] public string? Ip { get; set; }
+    [JsonPropertyName("etat")] public string? Etat { get; set; }
+    [JsonPropertyName("verrou")] public bool? Verrou { get; set; }
+    [JsonPropertyName("session")] public SessionInfo? Session { get; set; }
+
+    // Gardien → Écran : identité du cyber (logo en base64)
+    [JsonPropertyName("nom")] public string? Nom { get; set; }
+    [JsonPropertyName("slogan")] public string? Slogan { get; set; }
+    [JsonPropertyName("couleur")] public string? Couleur { get; set; }
+    [JsonPropertyName("logo")] public string? Logo { get; set; }
+
+    // Gardien → Écran : commande du serveur
+    [JsonPropertyName("commande")] public string? Commande { get; set; }
+    [JsonPropertyName("payload")] public string? Payload { get; set; }
+
+    // Réponses (rep, repcmd)
+    [JsonPropertyName("succes")] public bool? Succes { get; set; }
+    [JsonPropertyName("message")] public string? Message { get; set; }
+    [JsonPropertyName("montant")] public int? Montant { get; set; }
+    [JsonPropertyName("avertissement")] public string? Avertissement { get; set; }
+}
+
+public static class ProtocoleCanal
+{
+    private static readonly JsonSerializerOptions Options = new() { DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull };
+
+    public static string Encoder(MessageCanal m) => JsonSerializer.Serialize(m, Options);
+
+    public static MessageCanal? Decoder(string ligne)
+    {
+        try { return JsonSerializer.Deserialize<MessageCanal>(ligne, Options); }
+        catch { return null; }
+    }
+}
+
+================================================================================
+📄 FICHIER : cyber-manager-commun/cyber-manager-commun.csproj
+================================================================================
+
+[Fichier introuvable à l'emplacement : E:\xampp\htdocs\cyber-manager-commun\cyber-manager-commun.csproj]
+
+
+================================================================================
+📄 FICHIER : cyber-manager-gardien/RestrictionsWindows.cs
+================================================================================
+
+using System.Diagnostics;
+using System.Runtime.InteropServices;
+using System.Security.Principal;
+using System.Text.Json.Serialization;
+using Microsoft.Win32;
+
+/// <summary>Profil reçu du serveur. Par défaut (jamais reçu) : tout est bloqué, maintenance éteinte.</summary>
+public sealed class RestrictionsInfo
+{
+    [JsonPropertyName("maintenance")] public bool Maintenance { get; set; }
+    [JsonPropertyName("gestionnaire_taches")] public bool GestionnaireTaches { get; set; } = true;
+    [JsonPropertyName("verrouiller")] public bool Verrouiller { get; set; } = true;
+    [JsonPropertyName("deconnexion")] public bool Deconnexion { get; set; } = true;
+    [JsonPropertyName("cmd")] public bool Cmd { get; set; } = true;
+    [JsonPropertyName("powershell")] public bool PowerShell { get; set; } = true;
+    [JsonPropertyName("regedit")] public bool Regedit { get; set; } = true;
+    [JsonPropertyName("executer")] public bool Executer { get; set; } = true;
+    [JsonPropertyName("panneau")] public bool Panneau { get; set; } = true;
+
+    public string Empreinte() =>
+        string.Concat(new[] { Maintenance, GestionnaireTaches, Verrouiller, Deconnexion, Cmd, PowerShell, Regedit, Executer, Panneau }
+            .Select(b => b ? '1' : '0'));
+}
+
+public enum ResultatRestrictions { Applique, CompteAbsent, ProfilAbsent, Refuse, Erreur }
+
+/// <summary>
+/// Applique les restrictions dans le registre du compte client UNIQUEMENT (ruche HKU\SID de ce compte).
+/// Le compte client est celui choisi à l'installation (installation.json) ; « Client » pour les anciennes installations.
+/// Aucune écriture dans HKLM, aucune écriture dans la ruche d'un administrateur.
+/// </summary>
+public static class RestrictionsWindows
+{
+    /// <summary>Nom du compte client (lu dans installation.json, jamais en dur).</summary>
+    public static string CompteClient => CompteClientConfig.Nom();
+
+    private const string PolSysteme = @"Software\Microsoft\Windows\CurrentVersion\Policies\System";
+    private const string PolExplorateur = @"Software\Microsoft\Windows\CurrentVersion\Policies\Explorer";
+    private const string PolCmd = @"Software\Policies\Microsoft\Windows\System";
+    private static readonly string[] ProgrammesPowerShell = { "powershell.exe", "powershell_ise.exe", "pwsh.exe" };
+
+    [DllImport("netapi32.dll", CharSet = CharSet.Unicode)]
+    private static extern int NetLocalGroupGetMembers(string? serveur, string groupe, int niveau, out IntPtr tampon, int max, out int lus, out int total, IntPtr reprise);
+
+    [DllImport("netapi32.dll")]
+    private static extern int NetApiBufferFree(IntPtr tampon);
+
+    public static (ResultatRestrictions, string) Appliquer(RestrictionsInfo r)
+    {
+        var compte = CompteClient;
+
+        SecurityIdentifier sid;
+        try { sid = (SecurityIdentifier)new NTAccount(Environment.MachineName, compte).Translate(typeof(SecurityIdentifier)); }
+        catch (IdentityNotMappedException) { return (ResultatRestrictions.CompteAbsent, $"Le compte « {compte} » n'existe pas sur ce PC : aucune restriction appliquée."); }
+        catch (Exception ex) { return (ResultatRestrictions.Erreur, $"Compte « {compte} » introuvable : {ex.Message}"); }
+
+        // GARDE-FOU : jamais un administrateur (en cas de doute, on refuse)
+        if (EstAdministrateur(sid))
+            return (ResultatRestrictions.Refuse, $"Le compte « {compte} » est administrateur : restrictions REFUSÉES (le compte administrateur n'est jamais touché).");
+
+        var profil = CheminProfil(sid);
+        var ntuser = profil == null ? null : Path.Combine(profil, "NTUSER.DAT");
+        if (ntuser == null || !File.Exists(ntuser))
+            return (ResultatRestrictions.ProfilAbsent, $"Le compte « {compte} » ne s'est encore jamais connecté (pas de profil) : nouvel essai plus tard.");
+
+        var nomRuche = sid.Value;
+        var chargeParNous = false;
+        try
+        {
+            using var hu = RegistryKey.OpenBaseKey(RegistryHive.Users, RegistryView.Registry64);
+            var racine = hu.OpenSubKey(nomRuche, true);   // présente si une session du Client est ouverte
+
+            if (racine == null)
+            {
+                nomRuche = "CM_Client_Restrictions";
+                if (Reg("load", @"HKU\" + nomRuche, ntuser) != 0)
+                    return (ResultatRestrictions.Erreur, "Chargement du profil du Client impossible.");
+                chargeParNous = true;
+                racine = hu.OpenSubKey(nomRuche, true);
+                if (racine == null) return (ResultatRestrictions.Erreur, "Ruche du Client illisible après chargement.");
+            }
+
+            try { Ecrire(racine, r); }
+            finally { racine.Dispose(); }
+        }
+        catch (Exception ex) { return (ResultatRestrictions.Erreur, $"Écriture des restrictions impossible : {ex.Message}"); }
+        finally
+        {
+            if (chargeParNous)
+            {
+                GC.Collect(); GC.WaitForPendingFinalizers();
+                for (var i = 0; i < 4 && Reg("unload", @"HKU\" + nomRuche, null) != 0; i++) Thread.Sleep(500);
+            }
+        }
+
+        return (ResultatRestrictions.Applique,
+            r.Maintenance ? "MAINTENANCE : restrictions levées sur le compte Client." : "Restrictions appliquées sur le compte Client.");
+    }
+
+    // ------------------------------------------------------------------
+
+    private static void Ecrire(RegistryKey racine, RestrictionsInfo r)
+    {
+        var bloquer = !r.Maintenance;   // maintenance = tout levé
+
+        Valeur(racine, PolSysteme, "DisableTaskMgr", bloquer && r.GestionnaireTaches);
+        Valeur(racine, PolSysteme, "DisableLockWorkstation", bloquer && r.Verrouiller);
+        Valeur(racine, PolSysteme, "DisableRegistryTools", bloquer && r.Regedit);
+
+        Valeur(racine, PolExplorateur, "NoLogoff", bloquer && r.Deconnexion);
+        Valeur(racine, PolExplorateur, "NoRun", bloquer && r.Executer);
+        Valeur(racine, PolExplorateur, "NoControlPanel", bloquer && r.Panneau);
+
+        Valeur(racine, PolCmd, "DisableCMD", bloquer && r.Cmd, 2);   // 2 = invite bloquée, scripts .bat autorisés
+
+        // PowerShell : liste « programmes interdits » de l'Explorateur
+        var interdire = bloquer && r.PowerShell;
+        Valeur(racine, PolExplorateur, "DisallowRun", interdire);
+        if (interdire)
+        {
+            using var k = racine.CreateSubKey(PolExplorateur + @"\DisallowRun", true);
+            for (var i = 0; i < ProgrammesPowerShell.Length; i++)
+                k.SetValue((i + 1).ToString(), ProgrammesPowerShell[i], RegistryValueKind.String);
+        }
+        else
+        {
+            try { racine.DeleteSubKeyTree(PolExplorateur + @"\DisallowRun", false); } catch { }
+        }
+    }
+
+    private static void Valeur(RegistryKey racine, string chemin, string nom, bool actif, int valeur = 1)
+    {
+        if (actif)
+        {
+            using var k = racine.CreateSubKey(chemin, true);
+            k.SetValue(nom, valeur, RegistryValueKind.DWord);
+        }
+        else
+        {
+            using var k = racine.OpenSubKey(chemin, true);
+            k?.DeleteValue(nom, false);
+        }
+    }
+
+    private static string? CheminProfil(SecurityIdentifier sid)
+    {
+        try
+        {
+            using var k = Registry.LocalMachine.OpenSubKey(@"SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\" + sid.Value);
+            var p = k?.GetValue("ProfileImagePath") as string;
+            return string.IsNullOrWhiteSpace(p) ? null : Environment.ExpandEnvironmentVariables(p);
+        }
+        catch { return null; }
+    }
+
+    /// <summary>Vrai si le compte est « Administrateur » (RID 500) ou membre du groupe Administrateurs. En cas de doute : vrai.</summary>
+    private static bool EstAdministrateur(SecurityIdentifier sid)
+    {
+        if (sid.Value.EndsWith("-500", StringComparison.Ordinal)) return true;
+        try
+        {
+            var admins = new SecurityIdentifier(WellKnownSidType.BuiltinAdministratorsSid, null);
+            var nom = ((NTAccount)admins.Translate(typeof(NTAccount))).Value;   // nom localisé : « Administrateurs »
+            nom = nom[(nom.IndexOf('\\') + 1)..];
+
+            if (NetLocalGroupGetMembers(null, nom, 0, out var tampon, -1, out var lus, out _, IntPtr.Zero) != 0) return true;
+            try
+            {
+                for (var i = 0; i < lus; i++)
+                {
+                    var psid = Marshal.ReadIntPtr(tampon, i * IntPtr.Size);   // LOCALGROUP_MEMBERS_INFO_0 = un pointeur vers un SID
+                    if (new SecurityIdentifier(psid).Equals(sid)) return true;
+                }
+            }
+            finally { NetApiBufferFree(tampon); }
+            return false;
+        }
+        catch { return true; }
+    }
+
+    private static int Reg(string verbe, string cle, string? fichier)
+    {
+        var psi = new ProcessStartInfo("reg.exe") { UseShellExecute = false, CreateNoWindow = true, RedirectStandardOutput = true, RedirectStandardError = true };
+        psi.ArgumentList.Add(verbe);
+        psi.ArgumentList.Add(cle);
+        if (fichier != null) psi.ArgumentList.Add(fichier);
+        using var p = Process.Start(psi)!;
+        p.StandardOutput.ReadToEnd(); p.StandardError.ReadToEnd();
+        if (!p.WaitForExit(15000)) { try { p.Kill(); } catch { } return -1; }
+        return p.ExitCode;
+    }
+}
+
+================================================================================
+📄 FICHIER : cyber-manager-gardien/RestrictionsWorker.cs
+================================================================================
+
+using System.Net.Http;
+using System.Text.Json;
+using Microsoft.Extensions.Hosting;
+
+/// <summary>
+/// Lit le profil de restrictions + le drapeau maintenance du poste (toutes les 10 s), en garde une copie locale
+/// (restrictions.json : le poste reste protégé serveur éteint) et l'applique sur le compte Client.
+/// Application LOCALE par le Gardien (SYSTEM) : jamais de registre à distance.
+/// </summary>
+public sealed class RestrictionsWorker : BackgroundService
+{
+    private static string FichierLocal => Path.Combine(Chemins.Donnees, "restrictions.json");
+
+    private readonly GardienConfig _config;
+
+    public RestrictionsWorker(GardienConfig config) => _config = config;
+
+    protected override async Task ExecuteAsync(CancellationToken ct)
+    {
+        try { await Boucle(ct); }
+        catch (OperationCanceledException) { }
+        catch (Exception ex) { Journal.Ecrire($">>> ERREUR FATALE (restrictions) : {ex}"); }
+    }
+
+    private async Task Boucle(CancellationToken ct)
+    {
+        await Task.Delay(2000, ct);
+        using var http = new HttpClient { Timeout = TimeSpan.FromSeconds(10) };
+
+        var voulu = ChargerLocal() ?? new RestrictionsInfo();   // jamais reçu = tout bloqué
+        string? empreinteAppliquee = null;
+        var dernierEssai = DateTime.MinValue;
+        var dernierResultat = ResultatRestrictions.Erreur;
+        string? dernierLog = null;
+
+        while (!ct.IsCancellationRequested)
+        {
+            try
+            {
+                var recu = await LireServeurAsync(http, ct);
+                if (recu != null && recu.Empreinte() != voulu.Empreinte())
+                {
+                    voulu = recu;
+                    SauverLocal(voulu);
+                    Journal.Ecrire($"Restrictions : nouveau profil reçu (maintenance = {(voulu.Maintenance ? "OUI" : "non")}).");
+                }
+
+                var emp = voulu.Empreinte();
+                var delaiRepeat = dernierResultat == ResultatRestrictions.Applique ? TimeSpan.FromMinutes(5) : TimeSpan.FromSeconds(30);
+                if (emp != empreinteAppliquee || DateTime.UtcNow - dernierEssai > delaiRepeat)
+                {
+                    var (res, detail) = RestrictionsWindows.Appliquer(voulu);
+                    dernierEssai = DateTime.UtcNow;
+                    dernierResultat = res;
+                    empreinteAppliquee = emp;
+
+                    var ligne = $"{res}|{emp}|{detail}";
+                    if (ligne != dernierLog) { Journal.Ecrire("Restrictions : " + detail); dernierLog = ligne; }
+                }
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException) { Journal.Ecrire($"Restrictions : erreur inattendue : {ex.Message}"); }
+
+            await Task.Delay(10_000, ct);
+        }
+    }
+
+    private async Task<RestrictionsInfo?> LireServeurAsync(HttpClient http, CancellationToken ct)
+    {
+        if (string.IsNullOrEmpty(_config.AgentToken)) return null;
+        try
+        {
+            using var req = new HttpRequestMessage(HttpMethod.Get, _config.ServerUrl.TrimEnd('/') + "/api/agent/restrictions");
+            req.Headers.Add("X-Agent-Token", _config.AgentToken);
+            req.Headers.Add("Accept", "application/json");
+            using var rep = await http.SendAsync(req, ct);
+            if (!rep.IsSuccessStatusCode) return null;
+            return JsonSerializer.Deserialize<RestrictionsInfo>(await rep.Content.ReadAsStringAsync(ct));
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException) { return null; }   // serveur injoignable : on garde la copie locale
+    }
+
+    private static RestrictionsInfo? ChargerLocal()
+    {
+        try { return File.Exists(FichierLocal) ? JsonSerializer.Deserialize<RestrictionsInfo>(File.ReadAllText(FichierLocal)) : null; }
+        catch { return null; }
+    }
+
+    private static void SauverLocal(RestrictionsInfo r)
+    {
+        try
+        {
+            Directory.CreateDirectory(Chemins.Donnees);
+            File.WriteAllText(FichierLocal, JsonSerializer.Serialize(r));
+        }
+        catch (Exception ex) { Journal.Ecrire($"Copie locale des restrictions impossible : {ex.Message}"); }
+    }
+}
+
+================================================================================
+📄 FICHIER : cyber-manager-gardien/GardienWorker.cs
+================================================================================
+
+using Microsoft.Extensions.Hosting;
+
+public sealed class GardienWorker : BackgroundService
+{
+    private const int DelaiArretSecondes = 5;
+    private const string ArgsExtinction = "/s /t 0";   // ajouter /f pour forcer la fermeture des applications bloquantes
+
+    private readonly GardienConfig _config;
+    private readonly ServeurClient _api;
+    private readonly CanalEcran _canal = new();
+    private readonly LanceurEcran _lanceur = new();
+    private readonly MiseAJour _maj;
+    private readonly bool _console = Environment.UserInteractive;
+
+    private CancellationToken _ct;
+    private volatile bool _serveurOk;
+    private string _etat = "serveur_injoignable";
+    private bool _verrou = true;
+    private bool _donneesFraiches;
+    private SessionInfo? _session;
+    private int _reveil;
+    private long _arretDemandeTicks;
+    private bool _brandingOccupe;
+
+    public GardienWorker(GardienConfig config)
+    {
+        _config = config;
+        _api = new ServeurClient(config, () => _maj?.VersionCourante() ?? Constantes.VersionEcran);
+        _maj = new MiseAJour(config, _api, _lanceur, _canal, _console);
+    }
+
+    protected override async Task ExecuteAsync(CancellationToken ct)
+    {
+        _ct = ct;
+        Journal.Ecrire($">>> Gardien {Constantes.VersionGardien} démarré — Écran {_maj.VersionCourante() ?? "non installé"} — mode {(_console ? "CONSOLE" : "SERVICE")}");
+        Journal.Ecrire($"Config : poste='{_config.NomPoste}', serveur='{_config.ServerUrl}', id='{_config.IdentifiantUnique[..8]}…'");
+
+        _canal.MessageRecu += SurMessageEcran;
+        _canal.EcranPret += version =>
+        {
+            Journal.Ecrire($"Écran connecté (version {version}).");
+            _maj.MarquerValidee(version);
+            PousserBranding();
+            PousserEtat();
+        };
+
+        var taches = new[]
+        {
+            Proteger(_canal.ExecuterAsync, ct),
+            Proteger(BoucleEcranAsync, ct),
+            Proteger(BoucleHeartbeatAsync, ct),
+            Proteger(BoucleCommandesAsync, ct),
+            Proteger(BoucleMiseAJourAsync, ct)
+        };
+        await Task.WhenAll(taches);
+        Journal.Ecrire(">>> Gardien arrêté.");
+    }
+
+    private static async Task Proteger(Func<CancellationToken, Task> travail, CancellationToken ct)
+    {
+        try { await travail(ct); }
+        catch (OperationCanceledException) { }
+        catch (Exception ex) { Journal.Ecrire($">>> ERREUR FATALE dans une boucle : {ex}"); }
+    }
+
+    // ------------------------------------------------------------------
+    // Supervision de l'Écran : il revient en 1-2 s s'il est fermé
+    // ------------------------------------------------------------------
+
+    private async Task BoucleEcranAsync(CancellationToken ct)
+    {
+        await _maj.ValiderAuDemarrageAsync(ct);
+
+        while (!ct.IsCancellationRequested)
+        {
+            try
+            {
+                if (!_maj.EnCours && !_lanceur.EnCours)
+                {
+                    var version = _maj.VersionCourante();
+                    if (version != null) _lanceur.Lancer(Chemins.ExeEcran(version), _console);
+                }
+            }
+            catch (Exception ex) { Journal.Ecrire($"Supervision de l'Écran : {ex.Message}"); }
+
+            await Task.Delay(1000, ct);
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Heartbeat + handshake (5 s, backoff si panne)
+    // ------------------------------------------------------------------
+
+    private static int Backoff(int echecs) => Math.Min(30_000, 2_000 << Math.Min(echecs, 4));   // 4s, 8s, 16s, 30s…
+
+    private void DefinirServeur(bool ok)
+    {
+        if (ok != _serveurOk)
+        {
+            _serveurOk = ok;
+            Journal.Ecrire(ok ? "Serveur joignable." : "Serveur injoignable — nouvelles tentatives avec délai croissant.");
+        }
+    }
+
+    private async Task BoucleHeartbeatAsync(CancellationToken ct)
+    {
+        await Task.Delay(1000, ct);
+        var echecs = 0;
+
+        while (!ct.IsCancellationRequested)
+        {
+            var delai = 5_000;
+            try
+            {
+                if (string.IsNullOrEmpty(_config.AgentToken))
+                {
+                    var hs = await _api.HandshakeAsync();
+                    if (hs.Statut == ApiStatut.Ok)
+                    {
+                        Journal.Ecrire($"Handshake OK (poste '{_config.NomPoste}').");
+                        echecs = 0;
+                        delai = 300;
+                    }
+                    else if (hs.Code == "identifiant_a_regenerer")
+                    {
+                        Journal.Ecrire("Cet ordinateur est un doublon d'un autre poste : nouvelle identité générée, réenregistrement.");
+                        _config.RegenererIdentifiant();
+                        DefinirServeur(true);
+                        echecs = 0;
+                        delai = 300;
+                    }
+                    else if (hs.Code == "code_installation_invalide")
+                    {
+                        DefinirServeur(true);
+                        _etat = "enregistrement_refuse";
+                        _donneesFraiches = false;
+                        echecs++;
+                        delai = 30_000;
+                        Journal.Ecrire("Enregistrement refusé : code d'installation absent ou invalide. Relancez : cyber-manager-gardien.exe --configurer --code=XXXX-XXXX (code affiché dans la page « Enregistrement » du serveur), puis redémarrez le service.");
+                    }
+                    else
+                    {
+                        echecs++;
+                        if (hs.Statut == ApiStatut.Injoignable) DefinirServeur(false);
+                        delai = Backoff(echecs);
+                        Journal.Ecrire($"Handshake échoué ({hs.Statut}{(string.IsNullOrWhiteSpace(hs.Message) ? "" : " : " + hs.Message)}). Nouvel essai dans {delai / 1000}s.");
+                    }
+                }
+                else
+                {
+                    var r = await _api.SendHeartbeatAsync();
+                    switch (r.Statut)
+                    {
+                        case ApiStatut.Ok:
+                            echecs = 0;
+                            DefinirServeur(true);
+                            _etat = r.Donnees!.Etat ?? "disponible";
+                            _verrou = r.Donnees.DoitEtreVerrouille;
+                            _session = r.Donnees.Session;
+                            _donneesFraiches = true;
+
+                            if (!string.IsNullOrWhiteSpace(r.Donnees.NomPoste) && r.Donnees.NomPoste != _config.NomPoste)
+                            {
+                                _config.NomPoste = r.Donnees.NomPoste;
+                                _config.Save();
+                            }
+                            await AppliquerBrandingAsync(r.Donnees.Branding);
+                            break;
+
+                        case ApiStatut.NonAutorise:
+                            Journal.Ecrire("Token refusé par le serveur : nouveau handshake.");
+                            _config.AgentToken = "";
+                            _config.Save();
+                            delai = 200;
+                            break;
+
+                        default:   // injoignable ou erreur serveur : on garde l'état courant (mode dégradé)
+                            echecs++;
+                            DefinirServeur(false);
+                            _donneesFraiches = false;
+                            delai = Backoff(echecs);
+                            break;
+                    }
+                }
+                PousserEtat();
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException) { Journal.Ecrire($"Heartbeat : erreur inattendue : {ex.Message}"); }
+
+            // Un réveil (demande de l'Écran) déclenche un heartbeat immédiat
+            for (var attente = 0; attente < delai && Volatile.Read(ref _reveil) == 0; attente += 250)
+                await Task.Delay(250, ct);
+            Interlocked.Exchange(ref _reveil, 0);
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Commandes du serveur (3 s, backoff si panne)
+    // ------------------------------------------------------------------
+
+    private async Task BoucleCommandesAsync(CancellationToken ct)
+    {
+        await Task.Delay(3_000, ct);
+        var echecs = 0;
+
+        while (!ct.IsCancellationRequested)
+        {
+            var delai = 3_000;
+            try
+            {
+                if (!string.IsNullOrEmpty(_config.AgentToken))
+                {
+                    var r = await _api.GetCommandsAsync();
+                    if (r.Statut == ApiStatut.Ok)
+                    {
+                        echecs = 0;
+                        foreach (var cmd in r.Donnees!)
+                        {
+                            Journal.Ecrire($"Commande reçue : {cmd.Type} (id={cmd.Id})");
+                            var (ok, detail) = await ExecuterCommandeAsync(cmd);
+                            await _api.ConfirmerCommandeAsync(cmd.Id, ok, detail);
+                        }
+                    }
+                    else if (r.Statut != ApiStatut.NonAutorise)
+                    {
+                        echecs++;
+                        delai = Backoff(echecs);
+                    }
+                }
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException) { Journal.Ecrire($"Commandes : erreur inattendue : {ex.Message}"); }
+
+            await Task.Delay(delai, ct);
+        }
+    }
+
+    private async Task<(bool ok, string detail)> ExecuterCommandeAsync(AgentCommand cmd)
+    {
+        try
+        {
+            switch (cmd.Type)
+            {
+                case "retour_arriere":
+                    return _maj.RetourArriere();
+
+                case "arreter":
+                    Interlocked.Exchange(ref _arretDemandeTicks, DateTime.UtcNow.Ticks);
+                    if (!_canal.Connecte)
+                    {
+                        // Pas d'Écran pour afficher le décompte : le Gardien éteint lui-même
+                        _ = Task.Run(async () => { await Task.Delay(DelaiArretSecondes * 1000); Eteindre(); });
+                        return (true, $"Extinction dans {DelaiArretSecondes} s (Écran absent)");
+                    }
+                    return await _canal.EnvoyerCommandeAsync(cmd.Id, cmd.Type, cmd.Payload, TimeSpan.FromSeconds(10));
+
+                default:
+                    return await _canal.EnvoyerCommandeAsync(cmd.Id, cmd.Type, cmd.Payload, TimeSpan.FromSeconds(10));
+            }
+        }
+        catch (Exception ex)
+        {
+            Journal.Ecrire($"Exécution de '{cmd.Type}' échouée : {ex.Message}");
+            return (false, "Erreur d'exécution");
+        }
+    }
+
+    private void Eteindre()
+    {
+        try
+        {
+            Journal.Ecrire($"Extinction du poste : shutdown {ArgsExtinction}");
+            System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo("shutdown", ArgsExtinction)
+            {
+                CreateNoWindow = true,
+                UseShellExecute = false
+            });
+        }
+        catch (Exception ex) { Journal.Ecrire($"Extinction impossible : {ex.Message}"); }
+    }
+
+    // ------------------------------------------------------------------
+    // Messages de l'Écran : clics du client, fin du décompte, réveil
+    // ------------------------------------------------------------------
+
+    private void SurMessageEcran(MessageCanal m)
+    {
+        switch (m.Type)
+        {
+            case "reveil":
+                Volatile.Write(ref _reveil, 1);
+                break;
+
+            case "extinction":
+                // On n'éteint que si le serveur l'a demandé dans la dernière minute
+                var age = TimeSpan.FromTicks(DateTime.UtcNow.Ticks - Interlocked.Read(ref _arretDemandeTicks));
+                if (age < TimeSpan.FromMinutes(1)) Eteindre();
+                else Journal.Ecrire("Demande d'extinction de l'Écran ignorée (aucun ordre du serveur).");
+                break;
+
+            case "req":
+                _ = Task.Run(async () => _canal.Envoyer(await TraiterRequeteAsync(m)));
+                break;
+        }
+    }
+
+    private async Task<MessageCanal> TraiterRequeteAsync(MessageCanal m)
+    {
+        var rep = new MessageCanal { Type = "rep", Id = m.Id };
+        try
+        {
+            switch (m.Action)
+            {
+                case "activer":
+                {
+                    Journal.Ecrire("Activation demandée par le client…");
+                    var r = await _api.ActiverAsync();
+                    Journal.Ecrire(r.Succes
+                        ? $"Activation OK{(r.Avertissement != null ? " (avertissement : " + r.Avertissement + ")" : "")}"
+                        : $"Activation refusée : {r.Message}");
+                    rep.Succes = r.Succes; rep.Message = r.Message; rep.Avertissement = r.Avertissement;
+                    break;
+                }
+                case "suspendre":
+                {
+                    Journal.Ecrire("Suspension demandée…");
+                    Remplir(rep, await _api.SuspendreSessionAsync());
+                    break;
+                }
+                case "reprendre":
+                {
+                    Journal.Ecrire("Reprise demandée…");
+                    Remplir(rep, await _api.ReprendreSessionAsync());
+                    break;
+                }
+                case "fermer":
+                {
+                    Journal.Ecrire("Fermeture de session demandée…");
+                    Remplir(rep, await _api.FermerSessionAsync());
+                    break;
+                }
+                case "message":
+                {
+                    var texte = (m.Texte ?? "").Trim();
+                    var r = texte.Length == 0 ? new ResultatAction(false, "Message vide.") : await _api.EnvoyerMessageAsync(texte);
+                    Journal.Ecrire(r.Succes ? $"Message envoyé à l'accueil ({texte.Length} caractères)." : $"Message non envoyé : {r.Message}");
+                    Remplir(rep, r);
+                    break;
+                }
+                default:
+                    rep.Succes = false; rep.Message = "Action inconnue.";
+                    break;
+            }
+        }
+        catch (Exception ex)
+        {
+            Journal.Ecrire($"Requête '{m.Action}' échouée : {ex.Message}");
+            rep.Succes = false; rep.Message = "Erreur inattendue.";
+        }
+        return rep;
+    }
+
+    private static void Remplir(MessageCanal rep, ResultatAction r)
+    {
+        rep.Succes = r.Succes; rep.Message = r.Message; rep.Montant = r.Montant;
+    }
+
+    // ------------------------------------------------------------------
+    // Informations poussées vers l'Écran
+    // ------------------------------------------------------------------
+
+    private void PousserEtat()
+    {
+        _canal.Envoyer(new MessageCanal
+        {
+            Type = "etat",
+            Poste = _config.NomPoste,
+            Ip = _api.Reseau.Ip,
+            Etat = _serveurOk ? _etat : "serveur_injoignable",
+            // Verrou absent = pas de donnée fraîche du serveur : l'Écran garde son état (mode dégradé)
+            Verrou = _serveurOk && _donneesFraiches ? _verrou : null,
+            Session = _session
+        });
+    }
+
+    private void PousserBranding()
+    {
+        string? logo = null;
+        try
+        {
+            if (!string.IsNullOrEmpty(_config.LogoVersion) && File.Exists(Chemins.Logo))
+                logo = Convert.ToBase64String(File.ReadAllBytes(Chemins.Logo));
+        }
+        catch { }
+
+        var jamaisSynchronise = string.IsNullOrWhiteSpace(_config.NomCyber);
+        _canal.Envoyer(new MessageCanal
+        {
+            Type = "branding",
+            Nom = jamaisSynchronise ? "Cyber Manager" : _config.NomCyber,
+            Slogan = jamaisSynchronise ? "Gestion de cybercafé" : _config.Slogan,
+            Couleur = string.IsNullOrWhiteSpace(_config.Couleur) ? "#7c3aed" : _config.Couleur,
+            Logo = logo
+        });
+    }
+
+    private async Task AppliquerBrandingAsync(BrandingInfo? b)
+    {
+        if (b == null || _brandingOccupe) return;
+        _brandingOccupe = true;
+        try
+        {
+            var nom = string.IsNullOrWhiteSpace(b.NomCyber) ? "Cyber Manager" : b.NomCyber.Trim();
+            var slogan = b.Slogan ?? "";
+            var couleur = string.IsNullOrWhiteSpace(b.Couleur) ? "#7c3aed" : b.Couleur;
+            var version = b.AvecLogo ? (b.LogoVersion ?? "") : "";
+
+            var texteChange = nom != _config.NomCyber || slogan != _config.Slogan || couleur != _config.Couleur;
+            var logoChange = version != _config.LogoVersion;
+            if (!texteChange && !logoChange) return;
+
+            if (logoChange)
+            {
+                if (version == "")
+                {
+                    try { File.Delete(Chemins.Logo); } catch { }
+                    _config.LogoVersion = "";
+                }
+                else
+                {
+                    var octets = await _api.TelechargerLogoAsync();
+                    if (octets == null) return;   // on réessaiera au prochain heartbeat
+                    await File.WriteAllBytesAsync(Chemins.Logo, octets);
+                    _config.LogoVersion = version;
+                }
+            }
+
+            _config.NomCyber = nom;
+            _config.Slogan = slogan;
+            _config.Couleur = couleur;
+            _config.Save();
+
+            PousserBranding();
+            Journal.Ecrire($"Identité du cyber mise à jour : '{nom}'{(version != "" ? " (avec logo)" : " (sans logo)")}.");
+        }
+        catch (Exception ex) { Journal.Ecrire($"Identité du cyber : erreur ({ex.Message})."); }
+        finally { _brandingOccupe = false; }
+    }
+
+    // ------------------------------------------------------------------
+    // Mises à jour : seulement poste libre ET verrouillé, téléchargements étalés
+    // ------------------------------------------------------------------
+
+    private bool PosteLibreEtVerrouille() =>
+        _serveurOk && _donneesFraiches && _session == null && _verrou
+        && TimeSpan.FromTicks(DateTime.UtcNow.Ticks - Interlocked.Read(ref _arretDemandeTicks)) > TimeSpan.FromMinutes(2);
+
+    private async Task BoucleMiseAJourAsync(CancellationToken ct)
+    {
+        await Task.Delay(TimeSpan.FromSeconds(_console ? 10 : 30), ct);
+
+        while (!ct.IsCancellationRequested)
+        {
+            try
+            {
+                if (!string.IsNullOrEmpty(_config.AgentToken) && _serveurOk && !_maj.EnCours)
+                {
+                    var courante = _maj.VersionCourante() ?? "";
+                    var p = await _api.VerifierMiseAJourAsync(courante);
+
+                    if (p != null && p.Version != courante && !_config.VersionsEchouees.Contains(p.Version) && PosteLibreEtVerrouille())
+                    {
+                        // Délai aléatoire : 20 postes ne téléchargent pas en même temps (CYBER_MAJ_DELAI=0 pour les tests)
+                        var max = int.TryParse(Environment.GetEnvironmentVariable("CYBER_MAJ_DELAI"), out var d) ? d : 120;
+                        Journal.Ecrire($"Mise à jour disponible : {courante} → {p.Version}.");
+                        if (max > 0) await Task.Delay(TimeSpan.FromSeconds(Random.Shared.Next(0, max + 1)), ct);
+
+                        if (PosteLibreEtVerrouille())
+                        {
+                            var (ok, detail) = await _maj.AppliquerAsync(p, ct);
+                            await _api.SignalerResultatAsync(p.Version, ok, detail);
+                        }
+                    }
+                }
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException) { Journal.Ecrire($"Mise à jour : erreur inattendue : {ex.Message}"); }
+
+            await Task.Delay(60_000, ct);
+        }
+    }
+}
+
+================================================================================
+📄 FICHIER : cyber-manager-gardien/cyber-manager-gardien.csproj
+================================================================================
+
+<Project Sdk="Microsoft.NET.Sdk.Worker">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <RootNamespace>cyber_manager_gardien</RootNamespace>
+    <AssemblyName>cyber-manager-gardien</AssemblyName>
+    <NoWarn>$(NoWarn);CA1416</NoWarn>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Include="..\cyber-manager-commun\*.cs" LinkBase="Commun" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Extensions.Hosting.WindowsServices" Version="10.0.0" />
+  </ItemGroup>
+
+</Project>
+

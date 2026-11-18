@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html lang="fr">
+<html lang="fr" x-data="{ sombre: localStorage.getItem('cm_theme') === 'dark' }" x-bind:class="sombre ? 'dark' : ''">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -8,6 +8,13 @@
     <title>{{ $title ?? 'Cyber Manager' }}</title>
 
     <style>[x-cloak]{display:none !important}</style>
+    
+    <script>
+        // Empêcher le flash blanc au chargement si le mode sombre est activé
+        if (localStorage.getItem('cm_theme') === 'dark') {
+            document.documentElement.classList.add('dark');
+        }
+    </script>
 
     @vite(['resources/css/app.css', 'resources/js/app.js'])
 
@@ -30,7 +37,7 @@
                 try { document.execCommand('copy'); } catch (_) {}
                 t.remove();
             }
-            window.dispatchEvent(new CustomEvent('toast', { detail: 'Copié dans le presse-papiers' }));
+            window.dispatchEvent(new CustomEvent('cm-toast', { detail: { ok: true, message: 'Copié dans le presse-papiers' } }));
         };
 
         window.mikrotikStatut = function (url) {
@@ -53,10 +60,16 @@
             return {
                 open: localStorage.getItem('cm_sidebar_open') !== '0',
                 mobileOpen: false,
+                sombre: localStorage.getItem('cm_theme') === 'dark',
                 toggle() {
                     this.open = !this.open;
                     localStorage.setItem('cm_sidebar_open', this.open ? '1' : '0');
                 },
+                toggleTheme() {
+                    this.sombre = !this.sombre;
+                    localStorage.setItem('cm_theme', this.sombre ? 'dark' : 'light');
+                    document.documentElement.classList.toggle('dark', this.sombre);
+                }
             };
         };
     </script>
@@ -77,10 +90,7 @@
         ['route' => 'statistiques.index', 'motif' => 'statistiques.*',   'label' => 'Statistiques', 'icone' => 'chart'],
         ['route' => 'parametres.index',   'motif' => ['parametres.*', 'enregistrement.*', 'portail.*'], 'label' => 'Paramètres', 'icone' => 'tag'],
     ];
-    // Le personnel n'a pas accès aux Paramètres
     $liens = array_values(array_filter($liens, fn ($l) => $estAdmin || $l['route'] !== 'parametres.index'));
-    $bientot = [];
-
     $enParametres = request()->routeIs('parametres.*', 'enregistrement.*', 'portail.*');
 
     try {
@@ -90,18 +100,24 @@
     }
 @endphp
 
-<body x-data="cmSidebar()" class="min-h-screen bg-slate-50 text-slate-900 antialiased">
+<body x-data="cmSidebar()" class="min-h-screen bg-slate-50 text-slate-900 antialiased dark:bg-slate-950 dark:text-slate-100">
 
+    {{-- Toasts Unifiés --}}
     <div x-data="{ items: [] }"
-         @toast.window="const id = Date.now(); items.push({ id, msg: $event.detail }); setTimeout(() => items = items.filter(i => i.id !== id), 2500)"
-         class="pointer-events-none fixed right-4 top-4 z-[60] space-y-2">
+         @cm-toast.window="const id = Date.now(); items.push({ id, ok: $event.detail.ok ?? true, msg: $event.detail.message || $event.detail }); setTimeout(() => items = items.filter(i => i.id !== id), 4000)"
+         class="pointer-events-none fixed right-4 top-4 z-[999] space-y-2">
         <template x-for="i in items" :key="i.id">
-            <div x-transition class="pointer-events-auto rounded-lg bg-slate-900 px-4 py-2.5 text-sm text-white shadow-lg" x-text="i.msg"></div>
+            <div x-transition class="pointer-events-auto rounded-lg px-4 py-2.5 text-sm font-medium text-white shadow-lg" :class="i.ok ? 'bg-emerald-600' : 'bg-rose-600'" x-text="i.msg"></div>
         </template>
     </div>
 
+    {{-- Barre de progression (chargement long) --}}
+    <div x-data="{ chargement: false }" @cm-loading.window="chargement = $event.detail" x-show="chargement" x-cloak
+         class="fixed left-0 top-0 z-[1000] h-1 w-full bg-violet-600 animate-pulse"></div>
+
     <div class="flex h-screen overflow-hidden">
 
+        {{-- Sidebar desktop --}}
         <aside :class="open ? 'w-64' : 'w-[72px]'"
                class="hidden shrink-0 flex-col bg-gradient-to-b from-indigo-950 to-indigo-900 transition-all duration-200 sm:flex">
             <div class="flex h-14 items-center gap-2 border-b border-white/10 px-4">
@@ -115,30 +131,34 @@
                 </button>
             </div>
 
-            <nav class="flex-1 space-y-1 overflow-y-auto p-2">
+            {{-- NAV DESKTOP CORRIGÉE --}}
+            <nav class="sidebar-scroll flex-1 space-y-1 overflow-y-auto overflow-x-hidden p-2">
                 @foreach($liens as $lien)
                     @php $actif = request()->routeIs(...(array) $lien['motif']); @endphp
                     <a href="{{ route($lien['route']) }}" title="{{ $lien['label'] }}"
                        @class([
                            'flex items-center gap-3 rounded-lg px-3 py-2.5 text-[15px] font-medium transition',
-                           'bg-white text-indigo-900 shadow-sm' => $actif,
+                           'bg-white text-indigo-900 shadow-sm dark:bg-slate-800 dark:text-white' => $actif,
                            'text-indigo-200 hover:bg-white/10 hover:text-white' => !$actif,
                        ])>
                         <x-icone :nom="$lien['icone']" class="h-5 w-5 shrink-0" />
                         <span x-show="open" x-cloak class="truncate">{{ $lien['label'] }}</span>
                     </a>
                 @endforeach
-
-                @foreach($bientot as [$label, $icone])
-                    <span title="Bientôt disponible"
-                          class="flex cursor-not-allowed items-center gap-3 rounded-lg px-3 py-2.5 text-[15px] font-medium text-indigo-400/50">
-                        <x-icone :nom="$icone" class="h-5 w-5 shrink-0" />
-                        <span x-show="open" x-cloak class="truncate">{{ $label }}</span>
-                    </span>
-                @endforeach
             </nav>
+
+            {{-- Bouton Mode Sombre + Carte de profil --}}
+            <div class="border-t border-white/10 p-2">
+                <button type="button" @click="toggleTheme()" class="mb-2 flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-[15px] font-medium text-indigo-200 transition hover:bg-white/10 hover:text-white">
+                    <x-icone nom="eye" classe="h-5 w-5 shrink-0" x-show="!sombre" />
+                    <x-icone nom="eye-off" classe="h-5 w-5 shrink-0" x-show="sombre" x-cloak />
+                    <span x-show="open" x-cloak>Mode sombre</span>
+                </button>
+                <x-profil-carte />
+            </div>
         </aside>
 
+        {{-- Sidebar mobile --}}
         <div x-show="mobileOpen" x-cloak class="fixed inset-0 z-50 sm:hidden">
             <div class="absolute inset-0 bg-slate-900/50" @click="mobileOpen = false" x-transition.opacity></div>
             <aside x-show="mobileOpen" x-transition:enter="transition ease-out duration-200"
@@ -150,7 +170,8 @@
                     </span>
                     <span class="text-base font-semibold text-white">{{ $cyber['nom_cyber'] ?? 'Cyber Manager' }}</span>
                 </div>
-                <nav class="flex-1 space-y-1 overflow-y-auto p-2">
+                {{-- NAV MOBILE CORRIGÉE --}}
+                <nav class="sidebar-scroll flex-1 space-y-1 overflow-y-auto overflow-x-hidden p-2">
                     @foreach($liens as $lien)
                         @php $actif = request()->routeIs(...(array) $lien['motif']); @endphp
                         <a href="{{ route($lien['route']) }}"
@@ -159,11 +180,14 @@
                         </a>
                     @endforeach
                 </nav>
+                <div class="border-t border-white/10 p-2">
+                    <x-profil-carte />
+                </div>
             </aside>
         </div>
 
         <div class="flex flex-1 flex-col overflow-hidden">
-            <header class="flex h-14 shrink-0 items-center justify-between border-b border-slate-200 bg-white px-4 sm:px-6">
+            <header class="flex h-14 shrink-0 items-center justify-between border-b border-slate-200 bg-white px-4 sm:px-6 dark:border-slate-800 dark:bg-slate-900">
                 <button type="button" @click="mobileOpen = true" class="rounded-lg p-2 text-slate-500 hover:bg-slate-100 sm:hidden">
                     <x-icone nom="menu" class="h-5 w-5" />
                 </button>
@@ -183,28 +207,11 @@
                         <span x-text="etat === 'ok' ? 'MikroTik connecté' : (etat === 'ko' ? 'MikroTik déconnecté' : 'MikroTik…')"></span>
                         <span x-show="env" x-cloak x-text="env.toUpperCase()" class="rounded bg-white/70 px-1 text-[10px] tracking-wide"></span>
                     </div>
-                    <span class="text-sm text-slate-600">{{ ($estAdmin && filled($cyber['nom_admin'] ?? null)) ? $cyber['nom_admin'] : Auth::user()->name }}</span>
-                    @unless($estAdmin)
-                        <span class="rounded-full bg-sky-50 px-2 py-0.5 text-[11px] font-semibold text-sky-700 ring-1 ring-sky-200">Personnel</span>
-                    @endunless
-                    <form method="POST" action="{{ route('logout') }}">
-                        @csrf
-                        <button type="submit" class="text-sm text-rose-600 hover:text-rose-800">Déconnexion</button>
-                    </form>
                 </div>
             </header>
 
-            <main class="flex-1 overflow-y-auto p-4 sm:p-6">
-                @if(session('acces_refuse'))
-                    <div x-data="{ show: true }" x-show="show" x-transition
-                         class="mb-4 flex items-start gap-3 rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-900" role="alert">
-                        <x-icone nom="lock" class="mt-0.5 h-5 w-5 shrink-0" />
-                        <p class="flex-1">{{ session('acces_refuse') }}</p>
-                        <button type="button" @click="show = false" aria-label="Fermer" class="text-amber-700 hover:text-amber-900"><x-icone nom="x" class="h-4 w-4" /></button>
-                    </div>
-                @endif
-
-                @if($estAdmin && (config('app.debug') || config('app.env') !== 'production') && !request()->routeIs('parametres.production.*'))
+            <main class="flex-1 overflow-y-auto p-4 sm:p-6 dark:bg-slate-950">
+                @if((config('app.debug') || config('app.env') !== 'production') && !request()->routeIs('parametres.production.*'))
                     <a href="{{ route('parametres.production.index') }}"
                        class="mb-4 flex items-center gap-2 rounded-xl border border-amber-200 bg-amber-50 px-4 py-2.5 text-sm text-amber-900 hover:bg-amber-100">
                         <span>⚠</span>
@@ -212,7 +219,13 @@
                     </a>
                 @endif
 
+                {{-- Fil d'Ariane --}}
                 @if($enParametres)
+                    <nav class="mb-4 flex items-center gap-2 text-sm text-slate-500">
+                        <a href="{{ route('dashboard') }}" class="hover:text-slate-900 dark:hover:text-white">Dashboard</a>
+                        <span>/</span>
+                        <span class="font-semibold text-slate-900 dark:text-white">Paramètres</span>
+                    </nav>
                     <x-parametres.coque>
                         @yield('content')
                     </x-parametres.coque>
@@ -223,6 +236,5 @@
         </div>
 
     </div>
-
 </body>
 </html>

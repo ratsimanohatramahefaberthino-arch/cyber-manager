@@ -18,6 +18,11 @@ use App\Http\Controllers\HistoriqueController;
 use App\Http\Controllers\StatistiqueController;
 use App\Http\Controllers\EnregistrementController;
 use App\Http\Controllers\ProductionController;
+use App\Http\Controllers\AvatarController;
+use App\Http\Controllers\PersonnelController;
+use App\Http\Controllers\InstallationController;
+use App\Http\Controllers\VersionsController;
+use App\Http\Controllers\ParcController;
 
 /*
 |--------------------------------------------------------------------------
@@ -38,7 +43,7 @@ Route::get('/', function () {
 
 $admin = RoleMiddleware::class . ':admin';
 
-Route::middleware('auth')->group(function () use ($admin) {
+Route::middleware(['auth', 'verified.email'])->group(function () use ($admin) {
 
     // Dashboard
     Route::get('/dashboard', [DashboardController::class, 'index'])->name('dashboard');
@@ -81,21 +86,59 @@ Route::middleware('auth')->group(function () use ($admin) {
     Route::post('/postes/{poste}/arreter',     [PosteController::class, 'arreter'])->name('postes.arreter');
     Route::post('/postes/{poste}/recharger',   [PosteController::class, 'recharger'])->name('postes.recharger');
 
-    // ADMIN : enregistrement des postes (code d'installation, renommer, conflits d'identité)
+    // ADMIN : enregistrement, paramètres, personnel, versions, installation
     Route::middleware($admin)->group(function () {
+        // Enregistrement
         Route::get('/enregistrement',                          [EnregistrementController::class, 'index'])->name('enregistrement.index');
         Route::post('/enregistrement/code',                    [EnregistrementController::class, 'regenererCode'])->name('enregistrement.code');
         Route::post('/enregistrement/postes/{poste}/renommer', [EnregistrementController::class, 'renommer'])->name('enregistrement.renommer');
         Route::post('/enregistrement/postes/{poste}/separer',  [EnregistrementController::class, 'separer'])->name('enregistrement.separer');
         Route::post('/enregistrement/postes/{poste}/ignorer',  [EnregistrementController::class, 'ignorerConflit'])->name('enregistrement.ignorer');
 
-        // ADMIN : paramètres (identité du cyber) et mode production
+        // Paramètres généraux
         Route::get('/parametres',         [ParametresController::class, 'index'])->name('parametres.index');
         Route::post('/parametres',        [ParametresController::class, 'update'])->name('parametres.update');
         Route::delete('/parametres/logo', [ParametresController::class, 'supprimerLogo'])->name('parametres.logo.supprimer');
 
+        // Mode Production
         Route::get('/parametres/production',  [ProductionController::class, 'index'])->name('parametres.production.index');
         Route::post('/parametres/production', [ProductionController::class, 'appliquer'])->name('parametres.production.appliquer');
+
+        // Gestion du Personnel
+        Route::get('/parametres/personnel',                                     [PersonnelController::class, 'index'])->name('parametres.personnel.index');
+        Route::post('/parametres/personnel',                                    [PersonnelController::class, 'store'])->name('parametres.personnel.store');
+        Route::patch('/parametres/personnel/{utilisateur}',                     [PersonnelController::class, 'update'])->name('parametres.personnel.update');
+        Route::delete('/parametres/personnel/{utilisateur}',                    [PersonnelController::class, 'destroy'])->name('parametres.personnel.destroy');
+        Route::post('/parametres/personnel/{utilisateur}/reinitialiser',        [PersonnelController::class, 'reinitialiserMotDePasse'])->name('parametres.personnel.reinitialiser');
+        Route::post('/parametres/personnel/{utilisateur}/deconnecter-partout',  [PersonnelController::class, 'deconnecterPartout'])->name('parametres.personnel.deconnecter');
+        Route::delete('/parametres/personnel/{utilisateur}/avatar',             [PersonnelController::class, 'supprimerAvatar'])->name('parametres.personnel.avatar.supprimer');
+        Route::post('/parametres/personnel/{utilisateur}/debloquer',            [PersonnelController::class, 'debloquer'])->name('parametres.personnel.debloquer');
+
+        // Installation (Étape 9)
+        Route::get('/parametres/installation',             [InstallationController::class, 'index'])->name('parametres.installation.index');
+        Route::get('/parametres/installation/telecharger', [InstallationController::class, 'telecharger'])->name('parametres.installation.telecharger');
+        Route::get('/parametres/installation/fichier/{cle}', [InstallationController::class, 'fichier'])->name('parametres.installation.fichier');
+        Route::get('/parametres/installation/postes',      [InstallationController::class, 'postes'])->name('parametres.installation.postes');
+        Route::post('/parametres/installation/postes/{poste}/renommer', [InstallationController::class, 'renommer'])->name('parametres.installation.renommer');
+
+        // Versions (Étape 10)
+        Route::get('/parametres/versions',                     [VersionsController::class, 'index'])->name('parametres.versions.index');
+        Route::post('/parametres/versions/televerser',         [VersionsController::class, 'televerser'])->name('parametres.versions.televerser');
+        Route::post('/parametres/versions/{version}/pilote',   [VersionsController::class, 'pilote'])->name('parametres.versions.pilote');
+        Route::post('/parametres/versions/{version}/general',  [VersionsController::class, 'general'])->name('parametres.versions.general');
+        Route::post('/parametres/versions/{version}/depublier',[VersionsController::class, 'depublier'])->name('parametres.versions.depublier');
+        Route::delete('/parametres/versions/{version}',        [VersionsController::class, 'supprimer'])->name('parametres.versions.supprimer');
+        // Routes ajoutées Étape 10
+        Route::get('/parametres/versions/{version}/telecharger', [VersionsController::class, 'telecharger'])->name('parametres.versions.telecharger');
+        Route::post('/parametres/versions/forcer-maj',           [VersionsController::class, 'forcerMiseAJour'])->name('parametres.versions.forcer');
+
+        // Routes pour le Parc (Étape 11)
+        Route::get('/parametres/parc',                          [ParcController::class, 'index'])->name('parametres.parc.index');
+        Route::post('/parametres/parc/{poste}/renommer',        [ParcController::class, 'renommer'])->name('parametres.parc.renommer');
+        Route::post('/parametres/parc/{poste}/maintenance',     [ParcController::class, 'maintenance'])->name('parametres.parc.maintenance');
+        Route::get('/parametres/parc/{poste}/logs',             [ParcController::class, 'logs'])->name('parametres.parc.logs');
+        Route::post('/parametres/parc/{poste}/redemarrer',      [ParcController::class, 'redemarrer'])->name('parametres.parc.redemarrer');
+        Route::post('/parametres/parc/restrictions',            [ParcController::class, 'restrictions'])->name('parametres.parc.restrictions');
     });
 
     // Historique et statistiques
@@ -103,15 +146,29 @@ Route::middleware('auth')->group(function () use ($admin) {
     Route::get('/historique/export', [HistoriqueController::class, 'export'])->name('historique.export');
     Route::get('/statistiques',      [StatistiqueController::class, 'index'])->name('statistiques.index');
 
-    // Profil utilisateur (la suppression de compte est réservée à l'admin)
-    Route::get('/profile', [ProfileController::class, 'edit'])->name('profile.edit');
-    Route::patch('/profile', [ProfileController::class, 'update'])->name('profile.update');
-    Route::delete('/profile', [ProfileController::class, 'destroy'])->middleware($admin)->name('profile.destroy');
+    // Profil utilisateur
+    Route::get('/profile',            [ProfileController::class, 'edit'])->name('profile.edit');
+    Route::patch('/profile',          [ProfileController::class, 'update'])->name('profile.update');
+    Route::patch('/profile/password', [ProfileController::class, 'updatePassword'])->name('profile.password');
+    Route::delete('/profile/avatar',  [ProfileController::class, 'supprimerAvatar'])->name('profile.avatar.supprimer');
+
+    // Route pour "Changer de compte"
+    Route::post('/changer-compte', function () {
+        auth()->logout();
+        request()->session()->invalidate();
+        request()->session()->regenerateToken();
+        return redirect()->route('login')->with('info', 'Vous avez été déconnecté pour changer de compte.');
+    })->name('changer-compte');
+
+    // Mon profil
+    Route::get('/mon-profil', function () {
+        return view('profile.edit', ['user' => auth()->user()]);
+    })->name('parametres.profil');
 
     // MikroTik — statut
     Route::get('/mikrotik/statut', [MikroTikStatusController::class, 'show'])->name('mikrotik.statut');
 
-    // HotSpot (vouchers = création de tickets)
+    // HotSpot
     Route::get('/hotspot', [HotspotController::class, 'index'])->name('hotspot.index');
     Route::get('/hotspot/etat', [HotspotController::class, 'etat'])->name('hotspot.etat');
     Route::get('/hotspot/options-mikrotik', [HotspotController::class, 'optionsMikrotik'])->name('hotspot.options-mikrotik');
@@ -147,7 +204,7 @@ Route::middleware('auth')->group(function () use ($admin) {
     Route::post('/wifi/session/{session}/alarme/acquitter',  [WifiController::class, 'acquitterAlarme'])->name('wifi.session.alarme.acquitter');
     Route::post('/wifi/session/{session}/alarme/declencher', [WifiController::class, 'marquerAlarmeDeclenchee'])->name('wifi.session.alarme.declencher');
 
-    // Réglages de l'alarme Wi-Fi : consultation pour tous, modification admin
+    // Réglages de l'alarme Wi-Fi
     Route::get('/wifi/alarme', [WifiAlarmController::class, 'index'])->name('wifi.alarme.index');
     Route::middleware($admin)->group(function () {
         Route::post('/wifi/alarme/reglages',      [WifiAlarmController::class, 'reglages'])->name('wifi.alarme.reglages');
@@ -193,6 +250,9 @@ Route::prefix('api/agent')->group(function () {
     Route::post('/commandes/{commande}/confirmer', [AgentController::class, 'confirmerCommande']);
     Route::get('/logo',       [AgentController::class, 'logo'])->name('agent.logo');
 });
+
+// Route pour servir les avatars sans dépendre du dossier public
+Route::get('/avatar/{user}', [AvatarController::class, 'show'])->name('avatar.show');
 
 /*
 |--------------------------------------------------------------------------
