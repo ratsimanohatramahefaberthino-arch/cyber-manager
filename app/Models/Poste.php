@@ -16,7 +16,7 @@ class Poste extends Model
     public const ETAT_HORS_LIGNE  = 'hors_ligne';
 
     /** Délai (secondes) sans heartbeat avant de considérer le poste hors ligne. */
-    public const DELAI_HORS_LIGNE = 30;
+    public const DELAI_HORS_LIGNE = 180;
 
     /**
      * Deux signes de vie venant de deux adresses réseau différentes à moins de ce délai (secondes)
@@ -27,8 +27,8 @@ class Poste extends Model
     /** Un conflit signalé s'efface tout seul après ce nombre de minutes sans nouveau signalement. */
     public const DUREE_CONFLIT_MINUTES = 10;
 
-    /** Délai (s) sans réponse du serveur avant que l'AGENT verrouille le poste. DOIT rester < DELAI_HORS_LIGNE. */
-    public const DELAI_GRACE_AGENT = 15;
+    /** Délai (secondes) sans réponse du serveur avant que l'AGENT verrouille le poste (3 minutes). */
+    public const DELAI_GRACE_AGENT = 180;
 
     protected $fillable = [
         'nom_poste', 'nom_windows', 'adresse_mac', 'adresse_ip',

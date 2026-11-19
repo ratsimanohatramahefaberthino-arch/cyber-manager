@@ -1,14 +1,16 @@
 # Préparation du PC serveur (à lancer UNE fois, en administrateur) :
 #   - ouvre UN seul port dans le pare-feu, pour tous les types de réseau (le pare-feu reste actif)
-#   - installe Apache et MySQL comme services Windows, démarrage automatique
+#   - installe Apache et MySQL comme services Windows, démarrage automatique (sauf avec -SansServices)
 #   - planifie la sauvegarde quotidienne de la base
-#   - installe l'écoute de découverte : les postes retrouvent seuls le serveur si son adresse change
-# Usage : powershell -ExecutionPolicy Bypass -File scripts\preparer-serveur.ps1 -Port 8000 [-XamppDir C:\xampp] [-Destination D:\Sauvegardes] [-Heure 03:00]
+#   - installe l'écoute de découverte : les postes retrouvent seuls le serveur, même si son adresse ou son port change
+# -SansServices : n'installe pas Apache/MySQL (PC où XAMPP est piloté depuis son panneau de contrôle, ou « artisan serve »).
+# Usage : powershell -ExecutionPolicy Bypass -File scripts\preparer-serveur.ps1 -Port 8000 [-XamppDir C:\xampp] [-Destination D:\Sauvegardes] [-Heure 03:00] [-SansServices]
 param(
     [Parameter(Mandatory = $true)][int]$Port,
     [string]$XamppDir = "C:\xampp",
     [string]$Destination = "",
-    [string]$Heure = "03:00"
+    [string]$Heure = "03:00",
+    [switch]$SansServices
 )
 $ErrorActionPreference = "Stop"
 
@@ -31,8 +33,12 @@ function Preparer-Service($nom, $exe, $argsInstall) {
         Write-Host "Service $nom : démarrage automatique." -ForegroundColor Green
     }
 }
-Preparer-Service "Apache2.4" (Join-Path $XamppDir "apache\bin\httpd.exe") @("-k", "install")
-Preparer-Service "MySQL"     (Join-Path $XamppDir "mysql\bin\mysqld.exe") @("--install", "MySQL")
+if ($SansServices) {
+    Write-Host "Services Apache/MySQL : ignorés (-SansServices)." -ForegroundColor Yellow
+} else {
+    Preparer-Service "Apache2.4" (Join-Path $XamppDir "apache\bin\httpd.exe") @("-k", "install")
+    Preparer-Service "MySQL"     (Join-Path $XamppDir "mysql\bin\mysqld.exe") @("--install", "MySQL")
+}
 
 # 3. Sauvegarde quotidienne
 $script = Join-Path $PSScriptRoot "sauvegarde-base.ps1"
@@ -44,7 +50,7 @@ $parametres = New-ScheduledTaskSettingsSet -StartWhenAvailable -AllowStartIfOnBa
 Register-ScheduledTask -TaskName "CyberManager Sauvegarde" -Action $action -Trigger $declencheur -Settings $parametres -User "SYSTEM" -RunLevel Highest -Force | Out-Null
 Write-Host "Sauvegarde : chaque jour à $Heure." -ForegroundColor Green
 
-# 4. Découverte automatique : les postes retrouvent seuls le serveur (UDP 47474)
-& (Join-Path $PSScriptRoot "installer-decouverte.ps1") -Port $Port -XamppDir $XamppDir
+# 4. Découverte automatique : les postes retrouvent seuls le serveur (UDP 47474). Le port HTTP est détecté tout seul.
+& (Join-Path $PSScriptRoot "installer-decouverte.ps1") -XamppDir $XamppDir
 
 Write-Host "Terminé. Conseil : mettez -Destination sur un AUTRE disque ou une clé, pas sur le même disque que la base." -ForegroundColor Cyan

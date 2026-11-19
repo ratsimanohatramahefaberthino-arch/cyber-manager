@@ -66,7 +66,7 @@ class ParcController extends Controller
             ->map(function($c) {
                 return [
                     'date' => $c->created_at->timezone('Indian/Antananarivo')->format('d/m/Y H:i:s'),
-                    'commande' => $c->type_commande ?? 'Inconnu',
+                    'commande' => $c->type ?? 'Inconnu',
                     'statut' => $c->statut,
                     'resultat' => $c->resultat ?? 'Aucun retour',
                 ];
@@ -84,9 +84,9 @@ class ParcController extends Controller
 
         PosteCommande::create([
             'poste_id' => $poste->id,
-            'type_commande' => 'redemarrer',
-            'statut' => 'en_attente',
-            'donnees' => json_encode([]),
+            'type'     => 'redemarrer',
+            'statut'   => 'en_attente',
+            'payload'  => null,
         ]);
 
         return response()->json(['ok' => true, 'message' => "Ordre de redémarrage envoyé à « {$poste->nom_poste} »."]);

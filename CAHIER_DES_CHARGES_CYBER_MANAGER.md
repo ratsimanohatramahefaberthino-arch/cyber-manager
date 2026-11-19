@@ -1035,3 +1035,49 @@ cd E:\xampp\htdocs\cyber-manager
 git add .
 git commit -m "Sauvegarde avant [nom de l'étape]"
 git push
+
+Commande pour généré le la structure.txt : 
+Get-ChildItem -Path . -Recurse -File |
+  Where-Object { $_.FullName -notmatch '\\(node_modules|vendor|\.git|bin|obj|storage\\logs|storage\\framework|bootstrap\\cache|public\\build)\\' } |
+  ForEach-Object { $_.FullName.Replace((Get-Location).Path + '\', '') } |
+  Sort-Object |
+  Out-File -FilePath structure.txt -Encoding utf8
+
+
+================================================================================
+PROCÉDURE DE COMPILATION ET PUBLICATION CYBER MANAGER (.NET / LARAVEL)
+================================================================================
+
+RÈGLES D'ORGANISATION DES DOSSIERS :
+- Racine d'exécution des commandes : E:\xampp\htdocs\cyber-manager
+- Dossier central de distribution (fichiers prêts) : E:\xampp\htdocs\cyber-manager-commun\dist
+- Dossiers internes Laravel :
+    * Écran (versions) : storage/app/private/agent-packages/
+    * Gardien & Installateur : storage/app/private/installateur/
+
+1. COMPILATION DE L'ÉCRAN (cyber-manager-agent) :
+   - On publie la nouvelle version (ex: X.Y.Z) et on génère directement le fichier ZIP 
+     dans « ..\cyber-manager-commun\dist\ecran-X.Y.Z.zip ».
+   - Ensuite, depuis l'interface web (Paramètres > Versions) :
+     on renseigne le numéro X.Y.Z, on sélectionne ce fichier ZIP depuis le dossier « dist »,
+     on clique sur « Téléverser », puis sur « Définir comme version générale ».
+   Commande type :
+   dotnet publish ..\cyber-manager-agent -c Release -o temp_ecran ; Compress-Archive -Path "temp_ecran\*" -DestinationPath "..\cyber-manager-commun\dist\ecran-X.Y.Z.zip" -Force ; Remove-Item -Recurse -Force temp_ecran
+
+2. COMPILATION DU GARDIEN (cyber-manager-gardien) :
+   - On publie le Gardien, on crée le ZIP dans « ..\cyber-manager-commun\dist\gardien.zip »,
+     ET on le copie automatiquement dans « storage\app\private\installateur\gardien.zip ».
+   Commande type :
+   dotnet publish ..\cyber-manager-gardien -c Release -o temp_gardien ; Compress-Archive -Path "temp_gardien\*" -DestinationPath "..\cyber-manager-commun\dist\gardien.zip" -Force ; Copy-Item -Path "..\cyber-manager-commun\dist\gardien.zip" -Destination "storage\app\private\installateur\gardien.zip" -Force ; Remove-Item -Recurse -Force temp_gardien
+
+3. COMPILATION DE L'INSTALLATEUR (cyber-manager-installateur) :
+   - On publie l'exécutable dans « ..\cyber-manager-commun\dist\CyberManagerInstall.exe »
+     ET on le copie automatiquement dans « storage\app\private\installateur\CyberManagerInstall.exe ».
+   - Ainsi, le gérant télécharge l'installateur à jour directement depuis l'interface web
+     (Paramètres > Installation > bouton « Télécharger l'installateur »).
+   Commande type :
+   dotnet publish ..\cyber-manager-installateur -c Release -o temp_installateur ; Copy-Item -Path "temp_installateur\CyberManagerInstall.exe" -Destination "..\cyber-manager-commun\dist\CyberManagerInstall.exe" -Force ; Copy-Item -Path "temp_installateur\CyberManagerInstall.exe" -Destination "storage\app\private\installateur\CyberManagerInstall.exe" -Force ; Remove-Item -Recurse -Force temp_installateur
+
+RÈGLE D'OR : Toujours fournir les commandes en une seule ligne prête à coller dans 
+PowerShell depuis « E:\xampp\htdocs\cyber-manager », sans intervention manuelle dans les dossiers.
+================================================================================

@@ -1,0 +1,1023 @@
+================================================================================
+CONTEXTE CIBLÉ — DASHBOARD ET NAVIGATION
+Racine : E:\xampp\htdocs\cyber-manager
+================================================================================
+
+Objectifs :
+  1. Retirer l'onglet redondant 'Sessions' de la navigation latérale.
+  2. Concevoir un Dashboard simple, moderne, captivant et utile pour le gérant.
+
+Nombre de fichiers ciblés : 6
+
+
+################################################################################
+# LAYOUT — cyber-manager.blade.php (Sidebar / Barre de navigation principale)
+# resources/views/layouts/cyber-manager.blade.php
+################################################################################
+<!DOCTYPE html>
+<html lang="fr" x-data="{ sombre: localStorage.getItem('cm_theme') === 'dark' }" x-bind:class="sombre ? 'dark' : ''">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="csrf-token" content="{{ csrf_token() }}">
+
+    <title>{{ $title ?? 'Cyber Manager' }}</title>
+
+    <style>[x-cloak]{display:none !important}</style>
+    
+    <script>
+        // Empêcher le flash blanc au chargement si le mode sombre est activé
+        if (localStorage.getItem('cm_theme') === 'dark') {
+            document.documentElement.classList.add('dark');
+        }
+    </script>
+
+    @vite(['resources/css/app.css', 'resources/js/app.js'])
+
+    <script>
+        window.cmFetch = function (url, opts = {}) {
+            const token = document.querySelector('meta[name="csrf-token"]').content;
+            return fetch(url, {
+                ...opts,
+                headers: { 'X-CSRF-TOKEN': token, 'Accept': 'application/json', ...(opts.headers || {}) },
+            });
+        };
+
+        window.cmCopy = async function (texte) {
+            try {
+                await navigator.clipboard.writeText(texte);
+            } catch (e) {
+                const t = document.createElement('textarea');
+                t.value = texte; t.style.position = 'fixed'; t.style.opacity = '0';
+                document.body.appendChild(t); t.select();
+                try { document.execCommand('copy'); } catch (_) {}
+                t.remove();
+            }
+            window.dispatchEvent(new CustomEvent('cm-toast', { detail: { ok: true, message: 'Copié dans le presse-papiers' } }));
+        };
+
+        window.mikrotikStatut = function (url) {
+            return {
+                etat: 'chargement', env: '', titre: 'Vérification…',
+                async charger() {
+                    try {
+                        const r = await fetch(url, { headers: { 'Accept': 'application/json' } });
+                        const d = await r.json();
+                        this.etat = d.connecte ? 'ok' : 'ko';
+                        this.env = d.environnement || '';
+                        this.titre = d.connecte ? (d.identity || '') + ' · RouterOS ' + (d.version || '') : (d.erreur || 'Injoignable');
+                    } catch (e) { this.etat = 'ko'; this.titre = 'Statut indisponible'; }
+                },
+                init() { this.charger(); setInterval(() => this.charger(), 30000); },
+            };
+        };
+
+        window.cmSidebar = function () {
+            return {
+                open: localStorage.getItem('cm_sidebar_open') !== '0',
+                mobileOpen: false,
+                sombre: localStorage.getItem('cm_theme') === 'dark',
+                toggle() {
+                    this.open = !this.open;
+                    localStorage.setItem('cm_sidebar_open', this.open ? '1' : '0');
+                },
+                toggleTheme() {
+                    this.sombre = !this.sombre;
+                    localStorage.setItem('cm_theme', this.sombre ? 'dark' : 'light');
+                    document.documentElement.classList.toggle('dark', this.sombre);
+                }
+            };
+        };
+    </script>
+</head>
+
+@php
+    $cyber = \App\Models\CyberSetting::tous();
+    $estAdmin = Auth::user()?->estAdmin() ?? false;
+
+    $liens = [
+        ['route' => 'dashboard',          'motif' => 'dashboard',        'label' => 'Dashboard',    'icone' => 'home'],
+        ['route' => 'postes.index',       'motif' => 'postes.*',         'label' => 'Postes',       'icone' => 'desktop'],
+        ['route' => 'sessions.index',     'motif' => 'sessions.*',       'label' => 'Sessions',     'icone' => 'clock'],
+        ['route' => 'wifi.index',         'motif' => 'wifi.*',           'label' => 'Wi-Fi',        'icone' => 'wifi'],
+        ['route' => 'hotspot.index',      'motif' => 'hotspot.*',        'label' => 'HotSpot',      'icone' => 'key'],
+        ['route' => 'tarifs.index',       'motif' => 'tarifs.*',         'label' => 'Tarifs',       'icone' => 'tag'],
+        ['route' => 'historique.index',   'motif' => 'historique.*',     'label' => 'Historique',   'icone' => 'archive'],
+        ['route' => 'statistiques.index', 'motif' => 'statistiques.*',   'label' => 'Statistiques', 'icone' => 'chart'],
+        ['route' => 'parametres.index',   'motif' => ['parametres.*', 'enregistrement.*', 'portail.*'], 'label' => 'Paramètres', 'icone' => 'tag'],
+    ];
+    $liens = array_values(array_filter($liens, fn ($l) => $estAdmin || $l['route'] !== 'parametres.index'));
+    $enParametres = request()->routeIs('parametres.*', 'enregistrement.*', 'portail.*');
+
+    try {
+        $nbConflits = $estAdmin ? \App\Models\Poste::whereNotNull('conflit_identite_at')->count() : 0;
+    } catch (\Throwable) {
+        $nbConflits = 0;
+    }
+@endphp
+
+<body x-data="cmSidebar()" class="min-h-screen bg-slate-50 text-slate-900 antialiased dark:bg-slate-950 dark:text-slate-100">
+
+    {{-- Toasts Unifiés --}}
+    <div x-data="{ items: [] }"
+         @cm-toast.window="const id = Date.now(); items.push({ id, ok: $event.detail.ok ?? true, msg: $event.detail.message || $event.detail }); setTimeout(() => items = items.filter(i => i.id !== id), 4000)"
+         class="pointer-events-none fixed right-4 top-4 z-[999] space-y-2">
+        <template x-for="i in items" :key="i.id">
+            <div x-transition class="pointer-events-auto rounded-lg px-4 py-2.5 text-sm font-medium text-white shadow-lg" :class="i.ok ? 'bg-emerald-600' : 'bg-rose-600'" x-text="i.msg"></div>
+        </template>
+    </div>
+
+    {{-- Barre de progression (chargement long) --}}
+    <div x-data="{ chargement: false }" @cm-loading.window="chargement = $event.detail" x-show="chargement" x-cloak
+         class="fixed left-0 top-0 z-[1000] h-1 w-full bg-violet-600 animate-pulse"></div>
+
+    <div class="flex h-screen overflow-hidden">
+
+        {{-- Sidebar desktop --}}
+        <aside :class="open ? 'w-64' : 'w-[72px]'"
+               class="hidden shrink-0 flex-col bg-gradient-to-b from-indigo-950 to-indigo-900 transition-all duration-200 sm:flex">
+            <div class="flex h-14 items-center gap-2 border-b border-white/10 px-4">
+                <span class="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-white/10">
+                    <x-icone nom="wifi" class="h-5 w-5 text-white" />
+                </span>
+                <span x-show="open" x-cloak class="truncate text-base font-semibold tracking-wide text-white">{{ $cyber['nom_cyber'] ?? 'Cyber Manager' }}</span>
+                <button type="button" @click="toggle()" title="Réduire / agrandir le menu"
+                        class="ml-auto flex h-8 w-8 shrink-0 cursor-pointer items-center justify-center rounded-lg text-indigo-300 transition hover:bg-white/10 hover:text-white">
+                    <x-icone nom="chevron-left" class="h-5 w-5 transition-transform duration-200" x-bind:class="!open ? 'rotate-180' : ''" />
+                </button>
+            </div>
+
+            {{-- NAV DESKTOP CORRIGÉE --}}
+            <nav class="sidebar-scroll flex-1 space-y-1 overflow-y-auto overflow-x-hidden p-2">
+                @foreach($liens as $lien)
+                    @php $actif = request()->routeIs(...(array) $lien['motif']); @endphp
+                    <a href="{{ route($lien['route']) }}" title="{{ $lien['label'] }}"
+                       @class([
+                           'flex items-center gap-3 rounded-lg px-3 py-2.5 text-[15px] font-medium transition',
+                           'bg-white text-indigo-900 shadow-sm dark:bg-slate-800 dark:text-white' => $actif,
+                           'text-indigo-200 hover:bg-white/10 hover:text-white' => !$actif,
+                       ])>
+                        <x-icone :nom="$lien['icone']" class="h-5 w-5 shrink-0" />
+                        <span x-show="open" x-cloak class="truncate">{{ $lien['label'] }}</span>
+                    </a>
+                @endforeach
+            </nav>
+
+            {{-- Bouton Mode Sombre + Carte de profil --}}
+            <div class="border-t border-white/10 p-2">
+                <button type="button" @click="toggleTheme()" class="mb-2 flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-[15px] font-medium text-indigo-200 transition hover:bg-white/10 hover:text-white">
+                    <x-icone nom="eye" classe="h-5 w-5 shrink-0" x-show="!sombre" />
+                    <x-icone nom="eye-off" classe="h-5 w-5 shrink-0" x-show="sombre" x-cloak />
+                    <span x-show="open" x-cloak>Mode sombre</span>
+                </button>
+                <x-profil-carte />
+            </div>
+        </aside>
+
+        {{-- Sidebar mobile --}}
+        <div x-show="mobileOpen" x-cloak class="fixed inset-0 z-50 sm:hidden">
+            <div class="absolute inset-0 bg-slate-900/50" @click="mobileOpen = false" x-transition.opacity></div>
+            <aside x-show="mobileOpen" x-transition:enter="transition ease-out duration-200"
+                   x-transition:enter-start="-translate-x-full" x-transition:enter-end="translate-x-0"
+                   class="relative flex h-full w-64 flex-col bg-gradient-to-b from-indigo-950 to-indigo-900 shadow-xl">
+                <div class="flex h-14 items-center gap-2 border-b border-white/10 px-4">
+                    <span class="flex h-8 w-8 items-center justify-center rounded-lg bg-white/10">
+                        <x-icone nom="wifi" class="h-5 w-5 text-white" />
+                    </span>
+                    <span class="text-base font-semibold text-white">{{ $cyber['nom_cyber'] ?? 'Cyber Manager' }}</span>
+                </div>
+                {{-- NAV MOBILE CORRIGÉE --}}
+                <nav class="sidebar-scroll flex-1 space-y-1 overflow-y-auto overflow-x-hidden p-2">
+                    @foreach($liens as $lien)
+                        @php $actif = request()->routeIs(...(array) $lien['motif']); @endphp
+                        <a href="{{ route($lien['route']) }}"
+                           @class(['flex items-center gap-3 rounded-lg px-3 py-2.5 text-[15px] font-medium', 'bg-white text-indigo-900' => $actif, 'text-indigo-200 hover:bg-white/10' => !$actif])>
+                            <x-icone :nom="$lien['icone']" class="h-5 w-5 shrink-0" /> {{ $lien['label'] }}
+                        </a>
+                    @endforeach
+                </nav>
+                <div class="border-t border-white/10 p-2">
+                    <x-profil-carte />
+                </div>
+            </aside>
+        </div>
+
+        <div class="flex flex-1 flex-col overflow-hidden">
+            <header class="flex h-14 shrink-0 items-center justify-between border-b border-slate-200 bg-white px-4 sm:px-6 dark:border-slate-800 dark:bg-slate-900">
+                <button type="button" @click="mobileOpen = true" class="rounded-lg p-2 text-slate-500 hover:bg-slate-100 sm:hidden">
+                    <x-icone nom="menu" class="h-5 w-5" />
+                </button>
+                <div class="hidden sm:block"></div>
+                <div class="flex items-center gap-3">
+                    @if($nbConflits > 0)
+                        <a href="{{ route('enregistrement.index') }}" title="Deux ordinateurs semblent utiliser la même identité de poste"
+                           class="flex items-center gap-1.5 rounded-full border border-rose-200 bg-rose-50 px-3 py-1 text-xs font-medium text-rose-700">
+                            <span>⚠</span>
+                            <span>{{ $nbConflits }} conflit(s) d'identité de poste</span>
+                        </a>
+                    @endif
+                    <div x-data="mikrotikStatut('{{ route('mikrotik.statut') }}')" :title="titre"
+                         class="hidden items-center gap-1.5 rounded-full border px-3 py-1 text-xs font-medium sm:flex"
+                         :class="{ 'border-emerald-200 bg-emerald-50 text-emerald-700': etat === 'ok', 'border-rose-200 bg-rose-50 text-rose-700': etat === 'ko', 'border-slate-200 bg-slate-50 text-slate-500': etat === 'chargement' }">
+                        <span x-text="etat === 'ko' ? '○' : '●'"></span>
+                        <span x-text="etat === 'ok' ? 'MikroTik connecté' : (etat === 'ko' ? 'MikroTik déconnecté' : 'MikroTik…')"></span>
+                        <span x-show="env" x-cloak x-text="env.toUpperCase()" class="rounded bg-white/70 px-1 text-[10px] tracking-wide"></span>
+                    </div>
+                </div>
+            </header>
+
+            <main class="flex-1 overflow-y-auto p-4 sm:p-6 dark:bg-slate-950">
+                @if((config('app.debug') || config('app.env') !== 'production') && !request()->routeIs('parametres.production.*'))
+                    <a href="{{ route('parametres.production.index') }}"
+                       class="mb-4 flex items-center gap-2 rounded-xl border border-amber-200 bg-amber-50 px-4 py-2.5 text-sm text-amber-900 hover:bg-amber-100">
+                        <span>⚠</span>
+                        <span><strong>Mode test actif.</strong> Passez en mode production avant d'utiliser le logiciel avec de vrais clients.</span>
+                    </a>
+                @endif
+
+                {{-- Fil d'Ariane --}}
+                @if($enParametres)
+                    <nav class="mb-4 flex items-center gap-2 text-sm text-slate-500">
+                        <a href="{{ route('dashboard') }}" class="hover:text-slate-900 dark:hover:text-white">Dashboard</a>
+                        <span>/</span>
+                        <span class="font-semibold text-slate-900 dark:text-white">Paramètres</span>
+                    </nav>
+                    <x-parametres.coque>
+                        @yield('content')
+                    </x-parametres.coque>
+                @else
+                    @yield('content')
+                @endif
+            </main>
+        </div>
+
+    </div>
+</body>
+</html>
+
+################################################################################
+# LAYOUT — navigation.blade.php (Navigation secondaire / mobile si existante)
+# resources/views/layouts/navigation.blade.php
+################################################################################
+<nav x-data="{ open: false }" class="bg-white border-b border-gray-100">
+    <!-- Primary Navigation Menu -->
+    <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+        <div class="flex justify-between h-16">
+            <div class="flex">
+                <!-- Logo -->
+                <div class="shrink-0 flex items-center">
+                    <a href="{{ route('dashboard') }}">
+                        <x-application-logo class="block h-9 w-auto fill-current text-gray-800" />
+                    </a>
+                </div>
+
+                <!-- Navigation Links -->
+                <div class="hidden space-x-8 sm:-my-px sm:ms-10 sm:flex">
+                    <x-nav-link :href="route('dashboard')" :active="request()->routeIs('dashboard')">
+                        {{ __('Dashboard') }}
+                    </x-nav-link>
+                </div>
+            </div>
+
+            <!-- Settings Dropdown -->
+            <div class="hidden sm:flex sm:items-center sm:ms-6">
+                <x-dropdown align="right" width="48">
+                    <x-slot name="trigger">
+                        <button class="inline-flex items-center px-3 py-2 border border-transparent text-sm leading-4 font-medium rounded-md text-gray-500 bg-white hover:text-gray-700 focus:outline-none transition ease-in-out duration-150">
+                            <div>{{ Auth::user()->name }}</div>
+
+                            <div class="ms-1">
+                                <svg class="fill-current h-4 w-4" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20">
+                                    <path fill-rule="evenodd" d="M5.293 7.293a1 1 0 011.414 0L10 10.586l3.293-3.293a1 1 0 111.414 1.414l-4 4a1 1 0 01-1.414 0l-4-4a1 1 0 010-1.414z" clip-rule="evenodd" />
+                                </svg>
+                            </div>
+                        </button>
+                    </x-slot>
+
+                    <x-slot name="content">
+                        <x-dropdown-link :href="route('profile.edit')">
+                            {{ __('Profile') }}
+                        </x-dropdown-link>
+
+                        <!-- Authentication -->
+                        <form method="POST" action="{{ route('logout') }}">
+                            @csrf
+
+                            <x-dropdown-link :href="route('logout')"
+                                    onclick="event.preventDefault();
+                                                this.closest('form').submit();">
+                                {{ __('Log Out') }}
+                            </x-dropdown-link>
+                        </form>
+                    </x-slot>
+                </x-dropdown>
+            </div>
+
+            <!-- Hamburger -->
+            <div class="-me-2 flex items-center sm:hidden">
+                <button @click="open = ! open" class="inline-flex items-center justify-center p-2 rounded-md text-gray-400 hover:text-gray-500 hover:bg-gray-100 focus:outline-none focus:bg-gray-100 focus:text-gray-500 transition duration-150 ease-in-out">
+                    <svg class="h-6 w-6" stroke="currentColor" fill="none" viewBox="0 0 24 24">
+                        <path :class="{'hidden': open, 'inline-flex': ! open }" class="inline-flex" stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16" />
+                        <path :class="{'hidden': ! open, 'inline-flex': open }" class="hidden" stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12" />
+                    </svg>
+                </button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Responsive Navigation Menu -->
+    <div :class="{'block': open, 'hidden': ! open}" class="hidden sm:hidden">
+        <div class="pt-2 pb-3 space-y-1">
+            <x-responsive-nav-link :href="route('dashboard')" :active="request()->routeIs('dashboard')">
+                {{ __('Dashboard') }}
+            </x-responsive-nav-link>
+        </div>
+
+        <!-- Responsive Settings Options -->
+        <div class="pt-4 pb-1 border-t border-gray-200">
+            <div class="px-4">
+                <div class="font-medium text-base text-gray-800">{{ Auth::user()->name }}</div>
+                <div class="font-medium text-sm text-gray-500">{{ Auth::user()->email }}</div>
+            </div>
+
+            <div class="mt-3 space-y-1">
+                <x-responsive-nav-link :href="route('profile.edit')">
+                    {{ __('Profile') }}
+                </x-responsive-nav-link>
+
+                <!-- Authentication -->
+                <form method="POST" action="{{ route('logout') }}">
+                    @csrf
+
+                    <x-responsive-nav-link :href="route('logout')"
+                            onclick="event.preventDefault();
+                                        this.closest('form').submit();">
+                        {{ __('Log Out') }}
+                    </x-responsive-nav-link>
+                </form>
+            </div>
+        </div>
+    </div>
+</nav>
+
+
+################################################################################
+# CONTRÔLEUR — DashboardController.php
+# app/Http/Controllers/DashboardController.php
+################################################################################
+<?php
+
+namespace App\Http\Controllers;
+
+use App\Services\DashboardService;
+
+class DashboardController extends Controller
+{
+    public function __construct(
+        private DashboardService $dashboard,
+    ) {
+    }
+
+    public function index()
+    {
+        return view('dashboard', [
+            'stats' => $this->dashboard->getStats(),
+        ]);
+    }
+}
+
+################################################################################
+# SERVICE — DashboardService.php
+# app/Services/DashboardService.php
+################################################################################
+<?php
+
+namespace App\Services;
+
+use App\Models\Poste;
+use App\Models\Session;
+use App\Models\Voucher;
+use Illuminate\Support\Facades\DB;
+
+/**
+ * Agrège les statistiques affichées sur le dashboard.
+ *
+ * Ne contient AUCUN SQL complexe en dehors de simples count().
+ * Ne touche PAS aux Controllers.
+ */
+class DashboardService
+{
+    public function __construct(
+        private MikroTikService $mikroTik,
+    ) {
+    }
+
+    public function getStats(): array
+    {
+        return [
+            'mikrotik' => $this->getMikroTikStatus(),
+            'postes'   => $this->getPosteStats(),
+            'hotspot'  => $this->getHotspotStats(),
+            'vouchers' => $this->getVoucherStats(),
+            'sessions' => $this->getSessionStats(),
+        ];
+    }
+
+    /**
+     * Ping MikroTik en direct. Ne lance JAMAIS d'exception :
+     * en cas d'échec, retourne connecte=false + message.
+     */
+    private function getMikroTikStatus(): array
+    {
+        try {
+            $info    = $this->mikroTik->testConnection();
+            $users   = $this->mikroTik->listHotspotUsers();
+            $active  = $this->mikroTik->listHotspotActive();
+            $profil  = $this->mikroTik->listHotspotProfiles();
+
+            return [
+                'connecte' => true,
+                'identity' => $info['identity']   ?? '?',
+                'version'  => $info['version']    ?? '?',
+                'board'    => $info['board_name'] ?? '?',
+                'uptime'   => $info['uptime']     ?? '?',
+                'users'    => count($users),
+                'active'   => count($active),
+                'profiles' => count($profil),
+                'erreur'   => null,
+            ];
+        } catch (\Throwable $e) {
+            return [
+                'connecte' => false,
+                'identity' => null,
+                'version'  => null,
+                'board'    => null,
+                'uptime'   => null,
+                'users'    => 0,
+                'active'   => 0,
+                'profiles' => 0,
+                'erreur'   => $e->getMessage(),
+            ];
+        }
+    }
+
+    private function getPosteStats(): array
+    {
+        return [
+            'total'           => Poste::count(),
+            'disponible'      => Poste::where('actif', true)
+                                       ->where('etat', 'disponible')
+                                       ->count(),
+            'en_utilisation'  => Poste::where('etat', 'en_utilisation')->count(),
+            'suspendu'        => Poste::where('etat', 'suspendu')->count(),
+            'inactif'         => Poste::where('actif', false)->count(),
+        ];
+    }
+
+    /**
+     * Stats purement HotSpot (comptées depuis MikroTik).
+     * Séparé de MikroTikStatus pour lisibilité du blade.
+     */
+    private function getHotspotStats(): array
+    {
+        try {
+            $users = $this->mikroTik->listHotspotUsers();
+            $cmUsers = $this->mikroTik->listCyberManagerHotspotUsers();
+
+            return [
+                'users_total'  => count($users),
+                'users_cm'     => count($cmUsers),
+                'users_autres' => count($users) - count($cmUsers),
+            ];
+        } catch (\Throwable) {
+            return [
+                'users_total'  => 0,
+                'users_cm'     => 0,
+                'users_autres' => 0,
+            ];
+        }
+    }
+
+    private function getVoucherStats(): array
+    {
+        return [
+            'total'      => Voucher::count(),
+            'disponible' => Voucher::where('etat', 'disponible')->count(),
+            'utilise'    => Voucher::where('etat', 'utilise')->count(),
+            'annule'     => Voucher::where('etat', 'annule')->count(),
+            'non_sync'   => Voucher::whereNull('mikrotik_synced_at')
+                                   ->where('etat', '!=', 'annule')
+                                   ->count(),
+        ];
+    }
+
+    private function getSessionStats(): array
+    {
+        return [
+            'en_cours'   => Session::where('etat', 'en_cours')->count(),
+            'suspendue'  => Session::where('etat', 'suspendue')->count(),
+            'aujourdhui' => Session::whereDate('date_heure_debut', today())->count(),
+        ];
+    }
+}
+
+################################################################################
+# VUE — dashboard.blade.php (Contenu du Tableau de bord)
+# resources/views/dashboard.blade.php
+################################################################################
+@extends('layouts.cyber-manager', ['title' => 'Dashboard — Cyber Manager'])
+
+@section('content')
+
+{{-- ============================================================= --}}
+{{-- Bandeau état MikroTik --}}
+{{-- ============================================================= --}}
+@if($stats['mikrotik']['connecte'])
+
+    <div class="bg-green-50 border border-green-200 rounded-lg p-4 mb-6">
+        <div class="flex items-center gap-2 text-green-800 font-semibold">
+            <span class="w-2 h-2 rounded-full bg-green-500"></span>
+            MikroTik connecté —
+            {{ $stats['mikrotik']['identity'] }}
+            (v{{ $stats['mikrotik']['version'] }})
+        </div>
+        <div class="text-sm text-green-700 mt-1">
+            Board : {{ $stats['mikrotik']['board'] }}
+            &middot; Uptime : {{ $stats['mikrotik']['uptime'] }}
+        </div>
+    </div>
+
+@else
+
+    <div class="bg-red-50 border border-red-200 rounded-lg p-4 mb-6">
+        <div class="flex items-center gap-2 text-red-800 font-semibold">
+            <span class="w-2 h-2 rounded-full bg-red-500"></span>
+            MikroTik injoignable
+        </div>
+        <div class="text-sm text-red-700 mt-1 break-all">
+            {{ $stats['mikrotik']['erreur'] }}
+        </div>
+        <div class="text-xs text-red-600 mt-2">
+            Les statistiques HotSpot ci-dessous sont indisponibles.
+            Les statistiques locales (postes, vouchers, sessions) restent valides.
+        </div>
+    </div>
+
+@endif
+
+
+{{-- ============================================================= --}}
+{{-- Cartes synthèse --}}
+{{-- ============================================================= --}}
+<div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
+
+    {{-- Postes --}}
+    <div class="bg-white border border-gray-200 rounded-lg p-5">
+        <div class="text-sm text-gray-500 mb-1">Postes</div>
+        <div class="text-3xl font-bold text-gray-800">
+            {{ $stats['postes']['en_utilisation'] }}
+            <span class="text-base font-normal text-gray-400">
+                / {{ $stats['postes']['total'] }}
+            </span>
+        </div>
+        <div class="text-xs text-gray-500 mt-2">
+            {{ $stats['postes']['disponible'] }} disponibles
+            &middot; {{ $stats['postes']['suspendu'] }} suspendus
+        </div>
+    </div>
+
+    {{-- Sessions en cours --}}
+    <div class="bg-white border border-gray-200 rounded-lg p-5">
+        <div class="text-sm text-gray-500 mb-1">Sessions en cours</div>
+        <div class="text-3xl font-bold text-blue-600">
+            {{ $stats['sessions']['en_cours'] }}
+        </div>
+        <div class="text-xs text-gray-500 mt-2">
+            {{ $stats['sessions']['suspendue'] }} suspendues
+            &middot; {{ $stats['sessions']['aujourdhui'] }} aujourd'hui
+        </div>
+    </div>
+
+    {{-- HotSpot actifs --}}
+    <div class="bg-white border border-gray-200 rounded-lg p-5">
+        <div class="text-sm text-gray-500 mb-1">Clients Wi-Fi actifs</div>
+        <div class="text-3xl font-bold text-purple-600">
+            @if($stats['mikrotik']['connecte'])
+                {{ $stats['mikrotik']['active'] }}
+            @else
+                <span class="text-gray-300">—</span>
+            @endif
+        </div>
+        <div class="text-xs text-gray-500 mt-2">
+            @if($stats['mikrotik']['connecte'])
+                {{ $stats['hotspot']['users_total'] }} comptes configurés
+            @else
+                indisponible
+            @endif
+        </div>
+    </div>
+
+    {{-- Vouchers --}}
+    <div class="bg-white border border-gray-200 rounded-lg p-5">
+        <div class="text-sm text-gray-500 mb-1">Vouchers disponibles</div>
+        <div class="text-3xl font-bold text-amber-600">
+            {{ $stats['vouchers']['disponible'] }}
+        </div>
+        <div class="text-xs text-gray-500 mt-2">
+            {{ $stats['vouchers']['total'] }} au total
+            @if($stats['vouchers']['non_sync'] > 0)
+                &middot;
+                <span class="text-red-600 font-semibold">
+                    {{ $stats['vouchers']['non_sync'] }} non synchronisés
+                </span>
+            @endif
+        </div>
+    </div>
+
+</div>
+
+
+{{-- ============================================================= --}}
+{{-- Deux colonnes : détail postes / détail vouchers+hotspot --}}
+{{-- ============================================================= --}}
+<div class="grid grid-cols-1 lg:grid-cols-2 gap-4">
+
+    {{-- Postes --}}
+    <div class="bg-white border border-gray-200 rounded-lg p-5">
+        <h2 class="font-semibold text-gray-800 mb-3">État des postes</h2>
+
+        <dl class="space-y-2 text-sm">
+            <div class="flex justify-between">
+                <dt class="text-gray-600">Disponibles</dt>
+                <dd class="font-semibold text-green-600">
+                    {{ $stats['postes']['disponible'] }}
+                </dd>
+            </div>
+            <div class="flex justify-between">
+                <dt class="text-gray-600">En utilisation</dt>
+                <dd class="font-semibold text-blue-600">
+                    {{ $stats['postes']['en_utilisation'] }}
+                </dd>
+            </div>
+            <div class="flex justify-between">
+                <dt class="text-gray-600">Suspendus</dt>
+                <dd class="font-semibold text-amber-600">
+                    {{ $stats['postes']['suspendu'] }}
+                </dd>
+            </div>
+            <div class="flex justify-between">
+                <dt class="text-gray-600">Désactivés</dt>
+                <dd class="font-semibold text-gray-400">
+                    {{ $stats['postes']['inactif'] }}
+                </dd>
+            </div>
+        </dl>
+
+        <div class="mt-4 pt-4 border-t border-gray-100 text-right">
+            <a href="{{ route('postes.index') }}"
+               class="text-sm text-blue-600 hover:text-blue-800">
+                Voir les postes →
+            </a>
+        </div>
+    </div>
+
+    {{-- HotSpot + Vouchers --}}
+    <div class="bg-white border border-gray-200 rounded-lg p-5">
+        <h2 class="font-semibold text-gray-800 mb-3">HotSpot &amp; Vouchers</h2>
+
+        @if($stats['mikrotik']['connecte'])
+            <dl class="space-y-2 text-sm">
+                <div class="flex justify-between">
+                    <dt class="text-gray-600">Comptes HotSpot (MikroTik)</dt>
+                    <dd class="font-semibold">{{ $stats['hotspot']['users_total'] }}</dd>
+                </div>
+                <div class="flex justify-between">
+                    <dt class="text-gray-600">&nbsp;&nbsp;dont créés par Cyber Manager</dt>
+                    <dd class="font-semibold text-blue-600">
+                        {{ $stats['hotspot']['users_cm'] }}
+                    </dd>
+                </div>
+                <div class="flex justify-between">
+                    <dt class="text-gray-600">&nbsp;&nbsp;dont hérités (Mikhmon / manuels)</dt>
+                    <dd class="font-semibold text-gray-500">
+                        {{ $stats['hotspot']['users_autres'] }}
+                    </dd>
+                </div>
+                <div class="flex justify-between">
+                    <dt class="text-gray-600">Profils HotSpot</dt>
+                    <dd class="font-semibold">{{ $stats['mikrotik']['profiles'] }}</dd>
+                </div>
+            </dl>
+        @else
+            <p class="text-sm text-gray-400 italic">
+                Informations MikroTik indisponibles.
+            </p>
+        @endif
+
+        <div class="mt-4 pt-4 border-t border-gray-100">
+            <dl class="space-y-2 text-sm">
+                <div class="flex justify-between">
+                    <dt class="text-gray-600">Vouchers disponibles</dt>
+                    <dd class="font-semibold text-green-600">
+                        {{ $stats['vouchers']['disponible'] }}
+                    </dd>
+                </div>
+                <div class="flex justify-between">
+                    <dt class="text-gray-600">Vouchers utilisés</dt>
+                    <dd class="font-semibold">{{ $stats['vouchers']['utilise'] }}</dd>
+                </div>
+                <div class="flex justify-between">
+                    <dt class="text-gray-600">Vouchers annulés</dt>
+                    <dd class="font-semibold text-gray-400">
+                        {{ $stats['vouchers']['annule'] }}
+                    </dd>
+                </div>
+                @if($stats['vouchers']['non_sync'] > 0)
+                    <div class="flex justify-between">
+                        <dt class="text-red-600">Non synchronisés vers MikroTik</dt>
+                        <dd class="font-semibold text-red-600">
+                            {{ $stats['vouchers']['non_sync'] }}
+                        </dd>
+                    </div>
+                @endif
+            </dl>
+        </div>
+    </div>
+
+</div>
+
+@endsection
+
+################################################################################
+# ROUTES — web.php (Routes dashboard et sessions)
+# routes/web.php
+################################################################################
+<?php
+
+use App\Http\Controllers\HotspotController;
+use App\Http\Controllers\ProfileController;
+use App\Http\Middleware\RoleMiddleware;
+use Illuminate\Support\Facades\Route;
+use App\Http\Controllers\DashboardController;
+use App\Http\Controllers\PosteController;
+use App\Http\Controllers\SessionController;
+use App\Http\Controllers\TarifController;
+use App\Http\Controllers\WifiController;
+use App\Http\Controllers\MikroTikStatusController;
+use App\Http\Controllers\WifiAlarmController;
+use App\Http\Controllers\PortailController;
+use App\Http\Controllers\Api\AgentController;
+use App\Http\Controllers\ParametresController;
+use App\Http\Controllers\HistoriqueController;
+use App\Http\Controllers\StatistiqueController;
+use App\Http\Controllers\EnregistrementController;
+use App\Http\Controllers\ProductionController;
+use App\Http\Controllers\AvatarController;
+use App\Http\Controllers\PersonnelController;
+use App\Http\Controllers\InstallationController;
+use App\Http\Controllers\VersionsController;
+use App\Http\Controllers\ParcController;
+
+/*
+|--------------------------------------------------------------------------
+| Routes publiques
+|--------------------------------------------------------------------------
+*/
+
+Route::get('/', function () {
+    return view('welcome');
+});
+
+/*
+|--------------------------------------------------------------------------
+| Routes protégées (auth) — admin ET personnel
+| Les blocs « $admin » sont réservés à l'administrateur.
+|--------------------------------------------------------------------------
+*/
+
+$admin = RoleMiddleware::class . ':admin';
+
+Route::middleware(['auth', 'verified.email'])->group(function () use ($admin) {
+
+    // Dashboard
+    Route::get('/dashboard', [DashboardController::class, 'index'])->name('dashboard');
+
+    // Tarifs : consultation pour tous, modification réservée à l'admin
+    Route::get('/tarifs', [TarifController::class, 'index'])->name('tarifs.index');
+    Route::post('/tarifs/simuler', [TarifController::class, 'simuler'])->name('tarifs.simuler');
+
+    Route::middleware($admin)->group(function () {
+        Route::post('/tarifs/passer-separe', [TarifController::class, 'passerSepare'])->name('tarifs.passer-separe');
+        Route::post('/tarifs/passer-unifie', [TarifController::class, 'passerUnifie'])->name('tarifs.passer-unifie');
+        Route::post('/tarifs/reinitialiser', [TarifController::class, 'reinitialiser'])->name('tarifs.reinitialiser');
+        Route::patch('/tarifs/{tarif}', [TarifController::class, 'update'])->name('tarifs.update');
+        Route::post('/tarifs/{tarif}/raccourcis', [TarifController::class, 'storeRaccourci'])->name('tarifs.raccourcis.store');
+        Route::delete('/tarifs/{tarif}/raccourcis/{raccourci}', [TarifController::class, 'destroyRaccourci'])->name('tarifs.raccourcis.destroy');
+    });
+
+    // Sessions
+    Route::get('/sessions', [SessionController::class, 'index'])->name('sessions.index');
+    Route::post('/sessions', [SessionController::class, 'store'])->name('sessions.store');
+
+    // Postes
+    Route::get('/postes',       [PosteController::class, 'index'])->name('postes.index');
+    Route::get('/postes/etat',  [PosteController::class, 'etat'])->name('postes.etat');
+
+    Route::post('/postes/raccourcis',                [PosteController::class, 'ajouterRaccourci'])->name('postes.raccourcis.store');
+    Route::post('/postes/raccourcis/{id}/supprimer', [PosteController::class, 'supprimerRaccourci'])->name('postes.raccourcis.destroy');
+
+    Route::get('/postes/{poste}/chat',         [PosteController::class, 'chat'])->name('postes.chat');
+    Route::post('/postes/{poste}/message',     [PosteController::class, 'envoyerMessage'])->name('postes.message');
+
+    Route::post('/postes/{poste}/demarrer',    [PosteController::class, 'demarrer'])->name('postes.demarrer');
+    Route::post('/postes/{poste}/fermer',      [PosteController::class, 'fermer'])->name('postes.fermer');
+    Route::post('/postes/{poste}/suspendre',   [PosteController::class, 'suspendre'])->name('postes.suspendre');
+    Route::post('/postes/{poste}/reprendre',   [PosteController::class, 'reprendre'])->name('postes.reprendre');
+    Route::post('/postes/{poste}/verrouiller', [PosteController::class, 'verrouiller'])->name('postes.verrouiller');
+    Route::post('/postes/{poste}/debloquer',   [PosteController::class, 'debloquer'])->name('postes.debloquer');
+    Route::post('/postes/{poste}/desactiver',  [PosteController::class, 'desactiver'])->name('postes.desactiver');
+    Route::post('/postes/{poste}/activer',     [PosteController::class, 'activer'])->name('postes.activer');
+    Route::post('/postes/{poste}/arreter',     [PosteController::class, 'arreter'])->name('postes.arreter');
+    Route::post('/postes/{poste}/recharger',   [PosteController::class, 'recharger'])->name('postes.recharger');
+
+    // ADMIN : enregistrement, paramètres, personnel, versions, installation
+    Route::middleware($admin)->group(function () {
+        // Enregistrement
+        Route::get('/enregistrement',                          [EnregistrementController::class, 'index'])->name('enregistrement.index');
+        Route::post('/enregistrement/code',                    [EnregistrementController::class, 'regenererCode'])->name('enregistrement.code');
+        Route::post('/enregistrement/postes/{poste}/renommer', [EnregistrementController::class, 'renommer'])->name('enregistrement.renommer');
+        Route::post('/enregistrement/postes/{poste}/separer',  [EnregistrementController::class, 'separer'])->name('enregistrement.separer');
+        Route::post('/enregistrement/postes/{poste}/ignorer',  [EnregistrementController::class, 'ignorerConflit'])->name('enregistrement.ignorer');
+
+        // Paramètres généraux
+        Route::get('/parametres',         [ParametresController::class, 'index'])->name('parametres.index');
+        Route::post('/parametres',        [ParametresController::class, 'update'])->name('parametres.update');
+        Route::delete('/parametres/logo', [ParametresController::class, 'supprimerLogo'])->name('parametres.logo.supprimer');
+
+        // Mode Production
+        Route::get('/parametres/production',  [ProductionController::class, 'index'])->name('parametres.production.index');
+        Route::post('/parametres/production', [ProductionController::class, 'appliquer'])->name('parametres.production.appliquer');
+
+        // Gestion du Personnel
+        Route::get('/parametres/personnel',                                     [PersonnelController::class, 'index'])->name('parametres.personnel.index');
+        Route::post('/parametres/personnel',                                    [PersonnelController::class, 'store'])->name('parametres.personnel.store');
+        Route::patch('/parametres/personnel/{utilisateur}',                     [PersonnelController::class, 'update'])->name('parametres.personnel.update');
+        Route::delete('/parametres/personnel/{utilisateur}',                    [PersonnelController::class, 'destroy'])->name('parametres.personnel.destroy');
+        Route::post('/parametres/personnel/{utilisateur}/reinitialiser',        [PersonnelController::class, 'reinitialiserMotDePasse'])->name('parametres.personnel.reinitialiser');
+        Route::post('/parametres/personnel/{utilisateur}/deconnecter-partout',  [PersonnelController::class, 'deconnecterPartout'])->name('parametres.personnel.deconnecter');
+        Route::delete('/parametres/personnel/{utilisateur}/avatar',             [PersonnelController::class, 'supprimerAvatar'])->name('parametres.personnel.avatar.supprimer');
+        Route::post('/parametres/personnel/{utilisateur}/debloquer',            [PersonnelController::class, 'debloquer'])->name('parametres.personnel.debloquer');
+
+        // Installation (Étape 9)
+        Route::get('/parametres/installation',             [InstallationController::class, 'index'])->name('parametres.installation.index');
+        Route::get('/parametres/installation/telecharger', [InstallationController::class, 'telecharger'])->name('parametres.installation.telecharger');
+        Route::get('/parametres/installation/fichier/{cle}', [InstallationController::class, 'fichier'])->name('parametres.installation.fichier');
+        Route::get('/parametres/installation/postes',      [InstallationController::class, 'postes'])->name('parametres.installation.postes');
+        Route::post('/parametres/installation/postes/{poste}/renommer', [InstallationController::class, 'renommer'])->name('parametres.installation.renommer');
+
+        // Versions (Étape 10)
+        Route::get('/parametres/versions',                     [VersionsController::class, 'index'])->name('parametres.versions.index');
+        Route::post('/parametres/versions/televerser',         [VersionsController::class, 'televerser'])->name('parametres.versions.televerser');
+        Route::post('/parametres/versions/{version}/pilote',   [VersionsController::class, 'pilote'])->name('parametres.versions.pilote');
+        Route::post('/parametres/versions/{version}/general',  [VersionsController::class, 'general'])->name('parametres.versions.general');
+        Route::post('/parametres/versions/{version}/depublier',[VersionsController::class, 'depublier'])->name('parametres.versions.depublier');
+        Route::delete('/parametres/versions/{version}',        [VersionsController::class, 'supprimer'])->name('parametres.versions.supprimer');
+        // Routes ajoutées Étape 10
+        Route::get('/parametres/versions/{version}/telecharger', [VersionsController::class, 'telecharger'])->name('parametres.versions.telecharger');
+        Route::post('/parametres/versions/forcer-maj',           [VersionsController::class, 'forcerMiseAJour'])->name('parametres.versions.forcer');
+
+        // Routes pour le Parc (Étape 11)
+        Route::get('/parametres/parc',                          [ParcController::class, 'index'])->name('parametres.parc.index');
+        Route::post('/parametres/parc/{poste}/renommer',        [ParcController::class, 'renommer'])->name('parametres.parc.renommer');
+        Route::post('/parametres/parc/{poste}/maintenance',     [ParcController::class, 'maintenance'])->name('parametres.parc.maintenance');
+        Route::get('/parametres/parc/{poste}/logs',             [ParcController::class, 'logs'])->name('parametres.parc.logs');
+        Route::post('/parametres/parc/{poste}/redemarrer',      [ParcController::class, 'redemarrer'])->name('parametres.parc.redemarrer');
+        Route::post('/parametres/parc/restrictions',            [ParcController::class, 'restrictions'])->name('parametres.parc.restrictions');
+    });
+
+    // Historique et statistiques
+    Route::get('/historique',        [HistoriqueController::class, 'index'])->name('historique.index');
+    Route::get('/historique/export', [HistoriqueController::class, 'export'])->name('historique.export');
+    Route::get('/statistiques',      [StatistiqueController::class, 'index'])->name('statistiques.index');
+
+    // Profil utilisateur
+    Route::get('/profile',            [ProfileController::class, 'edit'])->name('profile.edit');
+    Route::patch('/profile',          [ProfileController::class, 'update'])->name('profile.update');
+    Route::patch('/profile/password', [ProfileController::class, 'updatePassword'])->name('profile.password');
+    Route::delete('/profile/avatar',  [ProfileController::class, 'supprimerAvatar'])->name('profile.avatar.supprimer');
+
+    // Route pour "Changer de compte"
+    Route::post('/changer-compte', function () {
+        auth()->logout();
+        request()->session()->invalidate();
+        request()->session()->regenerateToken();
+        return redirect()->route('login')->with('info', 'Vous avez été déconnecté pour changer de compte.');
+    })->name('changer-compte');
+
+    // Mon profil
+    Route::get('/mon-profil', function () {
+        return view('profile.edit', ['user' => auth()->user()]);
+    })->name('parametres.profil');
+
+    // MikroTik — statut
+    Route::get('/mikrotik/statut', [MikroTikStatusController::class, 'show'])->name('mikrotik.statut');
+
+    // HotSpot
+    Route::get('/hotspot', [HotspotController::class, 'index'])->name('hotspot.index');
+    Route::get('/hotspot/etat', [HotspotController::class, 'etat'])->name('hotspot.etat');
+    Route::get('/hotspot/options-mikrotik', [HotspotController::class, 'optionsMikrotik'])->name('hotspot.options-mikrotik');
+    Route::post('/hotspot/generer', [HotspotController::class, 'generer'])->name('hotspot.generer');
+    Route::post('/hotspot/ajouter', [HotspotController::class, 'ajouter'])->name('hotspot.ajouter');
+    Route::get('/hotspot/imprimer/{lot}', [HotspotController::class, 'imprimerLot'])->name('hotspot.imprimer.lot');
+    Route::get('/hotspot/imprimer-disponibles', [HotspotController::class, 'imprimerDisponibles'])->name('hotspot.imprimer.disponibles');
+    Route::post('/hotspot/{voucher}/proteger', [HotspotController::class, 'proteger'])->name('hotspot.proteger');
+    Route::post('/hotspot/appareils/{appareil}/renommer', [HotspotController::class, 'renommerAppareil'])->name('hotspot.appareils.renommer');
+    Route::post('/hotspot/synchroniser-tout', [HotspotController::class, 'synchroniserTout'])->name('hotspot.synchroniser-tout');
+    Route::post('/hotspot/supprimer-masse', [HotspotController::class, 'supprimerMasse'])->name('hotspot.supprimer-masse');
+    Route::post('/hotspot/pool-mode', [HotspotController::class, 'poolMode'])->name('hotspot.pool-mode');
+
+    // Wi-Fi
+    Route::get('/wifi', [WifiController::class, 'index'])->name('wifi.index');
+    Route::get('/wifi/etat', [WifiController::class, 'etat'])->name('wifi.etat');
+
+    Route::get('/wifi/comptes', [WifiController::class, 'comptes'])->name('wifi.comptes');
+    Route::post('/wifi/sync', [WifiController::class, 'syncNow'])->name('wifi.sync');
+    Route::post('/wifi/deconnecter', [WifiController::class, 'deconnecter'])->name('wifi.deconnecter');
+    Route::post('/wifi/comptes/{username}/toggle', [WifiController::class, 'toggleCompte'])->name('wifi.comptes.toggle');
+    Route::delete('/wifi/comptes/{username}', [WifiController::class, 'supprimerCompte'])->name('wifi.comptes.supprimer');
+
+    Route::post('/wifi/session/{session}/arreter',  [WifiController::class, 'arreter'])->name('wifi.session.arreter');
+    Route::post('/wifi/session/{session}/continuer', [WifiController::class, 'continuer'])->name('wifi.session.continuer');
+    Route::delete('/wifi/session/{session}',         [WifiController::class, 'supprimer'])->name('wifi.session.supprimer');
+    Route::post('/wifi/session/supprimer-masse',     [WifiController::class, 'supprimerMasse'])->name('wifi.session.supprimer-masse');
+    Route::post('/wifi/session/{session}/remarque', [WifiController::class, 'enregistrerRemarque'])->name('wifi.session.remarque');
+
+    Route::post('/wifi/session/{session}/alarme',            [WifiController::class, 'definirAlarme'])->name('wifi.session.alarme');
+    Route::post('/wifi/session/{session}/alarme/prolonger',  [WifiController::class, 'prolongerAlarme'])->name('wifi.session.alarme.prolonger');
+    Route::post('/wifi/session/{session}/alarme/annuler',    [WifiController::class, 'annulerAlarme'])->name('wifi.session.alarme.annuler');
+    Route::post('/wifi/session/{session}/alarme/acquitter',  [WifiController::class, 'acquitterAlarme'])->name('wifi.session.alarme.acquitter');
+    Route::post('/wifi/session/{session}/alarme/declencher', [WifiController::class, 'marquerAlarmeDeclenchee'])->name('wifi.session.alarme.declencher');
+
+    // Réglages de l'alarme Wi-Fi
+    Route::get('/wifi/alarme', [WifiAlarmController::class, 'index'])->name('wifi.alarme.index');
+    Route::middleware($admin)->group(function () {
+        Route::post('/wifi/alarme/reglages',      [WifiAlarmController::class, 'reglages'])->name('wifi.alarme.reglages');
+        Route::post('/wifi/alarme/son',           [WifiAlarmController::class, 'uploader'])->name('wifi.alarme.son');
+        Route::post('/wifi/alarme/son/choisir',   [WifiAlarmController::class, 'choisirSon'])->name('wifi.alarme.son.choisir');
+        Route::delete('/wifi/alarme/son',         [WifiAlarmController::class, 'supprimerSon'])->name('wifi.alarme.son.supprimer');
+        Route::post('/wifi/alarme/reinitialiser', [WifiAlarmController::class, 'reinitialiser'])->name('wifi.alarme.reinitialiser');
+
+        // Portail Captif (Admin)
+        Route::get('/admin/portail', [PortailController::class, 'adminIndex'])->name('portail.admin');
+        Route::post('/admin/portail', [PortailController::class, 'adminSave'])->name('portail.admin.save');
+        Route::post('/admin/portail/reset', [PortailController::class, 'adminResetDefaults'])->name('portail.admin.reset');
+        Route::post('/admin/portail/configurer', [PortailController::class, 'configurerRouteur'])->name('portail.admin.configurer');
+    });
+
+});
+
+/*
+|--------------------------------------------------------------------------
+| Portail Captif (Client - Pas de Auth)
+|--------------------------------------------------------------------------
+*/
+
+Route::get('/portail', [PortailController::class, 'login'])->name('portail.login');
+Route::get('/portail/dashboard', [PortailController::class, 'dashboard'])->name('portail.dashboard');
+Route::get('/api/portail/stats', [PortailController::class, 'apiStats'])->name('portail.api');
+
+/*
+|--------------------------------------------------------------------------
+| API pour les Agents Windows
+|--------------------------------------------------------------------------
+*/
+
+Route::prefix('api/agent')->group(function () {
+    Route::post('/handshake', [AgentController::class, 'handshake'])->middleware('throttle:30,1');
+    Route::post('/heartbeat', [AgentController::class, 'heartbeat']);
+    Route::post('/activer',   [AgentController::class, 'activer']);
+    Route::post('/message',   [AgentController::class, 'message']);
+    Route::post('/session/suspendre', [AgentController::class, 'suspendreSession']);
+    Route::post('/session/reprendre', [AgentController::class, 'reprendreSession']);
+    Route::post('/session/fermer',    [AgentController::class, 'fermerSession']);
+    Route::get('/commandes',  [AgentController::class, 'commandes']);
+    Route::post('/commandes/{commande}/confirmer', [AgentController::class, 'confirmerCommande']);
+    Route::get('/logo',       [AgentController::class, 'logo'])->name('agent.logo');
+});
+
+// Route pour servir les avatars sans dépendre du dossier public
+Route::get('/avatar/{user}', [AvatarController::class, 'show'])->name('avatar.show');
+
+/*
+|--------------------------------------------------------------------------
+| Authentification (Breeze)
+|--------------------------------------------------------------------------
+*/
+
+require __DIR__.'/auth.php';
+require __DIR__.'/agent_maj.php';
+
+================================================================================
+FIN DU CONTEXTE DASHBOARD
+TOUS LES FICHIERS ONT ÉTÉ TROUVÉS.
+================================================================================
