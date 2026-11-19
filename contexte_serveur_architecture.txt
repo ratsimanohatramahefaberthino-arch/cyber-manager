@@ -1,0 +1,2005 @@
+================================================================================
+CONTEXTE ARCHITECTURE — SERVEUR, LANCEUR & RÉSILIENCE
+Racine du projet : E:\xampp\htdocs\cyber-manager
+================================================================================
+
+Fichiers ciblés pour l'analyse de conception par l'IA.
+Nombre de fichiers : 13
+
+
+################################################################################
+# SERVICE — PosteSessionService.php (clôture, reprise, déduction temps hors ligne)
+# app/Services/PosteSessionService.php
+################################################################################
+<?php
+
+namespace App\Services;
+
+use App\Models\Poste;
+use App\Models\Session;
+use Carbon\CarbonInterface;
+use Illuminate\Support\Facades\Cache;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Log;
+
+/**
+ * Logique partagée entre l'interface admin, l'API agent et la maintenance planifiée :
+ * création / suspension / reprise / clôture de session et connexion du poste au réseau (MikroTik).
+ *
+ * POLITIQUE « poste injoignable pendant une session » :
+ *  - le temps d'injoignabilité n'est jamais facturé (facturation jusqu'au dernier heartbeat) ;
+ *  - la session reste ouverte pendant la tolérance (config postes.hors_ligne_tolerance_minutes) ;
+ *    si le poste revient, la panne est déduite (duree_hors_ligne_secondes) et la session reprend ;
+ *  - au-delà de la tolérance, clôture automatique (motif « hors_ligne ») + coupure MikroTik.
+ *
+ * MODE DÉGRADÉ : aucune méthode réseau ne lève d'exception ; une panne MikroTik est loggée
+ * (jamais de mot de passe ni de token dans les logs) et la session s'ouvre / se ferme quand même.
+ */
+class PosteSessionService
+{
+    public function __construct(
+        private MikroTikService $mikroTik,
+        private TarifService $tarifs
+    ) {}
+
+    // ------------------------------------------------------------------
+    // Cycle de vie de la session (base de données)
+    // ------------------------------------------------------------------
+
+    public function creerSession(Poste $poste, string $mode, ?int $duree): Session
+    {
+        try {
+            $tarifId = $this->tarifs->tarifStandard()->id;
+        } catch (\Throwable) {
+            $tarifId = null;
+        }
+
+        $session = Session::create([
+            'poste_id'              => $poste->id,
+            'type_session'          => 'ethernet',
+            'date_heure_debut'      => now(),
+            'date_heure_fin_prevue' => $duree ? now()->addMinutes($duree) : null,
+            'duree_prevue'          => $duree ?? 0,
+            'etat'                  => 'en_cours',
+            'tarif_id'              => $tarifId,
+            'montant_initial'       => 0,
+            'montant_total'         => 0,
+            'description'           => "Session {$mode}" . ($duree ? " de {$duree} minutes." : '.'),
+        ]);
+
+        $session->mode_facturation = $mode;
+        $session->save();
+
+        return $session;
+    }
+
+    /**
+     * Montant (Ar) de la session. Le mode « libre » n'est jamais facturé.
+     *
+     * @param int|null $secondes Durée facturable à utiliser ; null = durée consommée à l'instant T
+     */
+    public function montant(Session $session, ?int $secondes = null): int
+    {
+        if (($session->mode_facturation ?? 'forfait') === 'libre') {
+            return 0;
+        }
+
+        try {
+            $tarif   = $session->tarif ?: $this->tarifs->tarifStandard();
+            $minutes = intdiv($secondes ?? $session->secondesConsommees(), 60);
+
+            return $this->tarifs->montantTempsReel($minutes, $tarif);
+        } catch (\Throwable) {
+            return 0;
+        }
+    }
+
+    /**
+     * Suspend la session active : chrono figé, poste « suspendu ».
+     * Base de données uniquement (à appeler dans une transaction) ; la coupure réseau
+     * se fait ensuite via deconnecterReseau().
+     *
+     * @return bool false si le poste n'a aucune session active
+     */
+    public function suspendre(Poste $poste): bool
+    {
+        $session = $poste->sessionActive();
+        if ($session === null) {
+            return false;
+        }
+
+        if ($session->etat === 'en_cours') {
+            $session->update(['etat' => 'en_pause', 'date_heure_suspension' => now()]);
+        }
+        $poste->update(['etat' => Poste::ETAT_SUSPENDU]);
+
+        return true;
+    }
+
+    /**
+     * Reprend la session active (si elle était en pause) et passe le poste « utilisé ».
+     * Base de données uniquement ; la reconnexion réseau se fait ensuite via connecterReseau().
+     *
+     * @return bool false si le poste n'a aucune session active
+     */
+    public function reprendre(Poste $poste): bool
+    {
+        $session = $poste->sessionActive();
+        if ($session === null) {
+            return false;
+        }
+
+        if ($session->etat === 'en_pause') {
+            $pause = $session->date_heure_suspension
+                ? max(0, now()->getTimestamp() - $session->date_heure_suspension->getTimestamp())
+                : 0;
+
+            $session->update([
+                'etat'                  => 'en_cours',
+                'date_heure_reprise'    => now(),
+                'duree_suspension'      => (int) $session->duree_suspension + $pause,
+                'date_heure_suspension' => null,
+            ]);
+        }
+
+        $poste->update(['etat' => Poste::ETAT_OCCUPE]);
+
+        return true;
+    }
+
+    /**
+     * Clôture la session active : calcule et fige le montant, poste « disponible ».
+     * Base de données uniquement (à appeler dans une transaction) ; la coupure réseau
+     * se fait ensuite via deconnecterReseau().
+     *
+     * @param CarbonInterface|null $arretA Instant (passé) où la consommation s'est réellement arrêtée
+     *                                     (expiration d'un forfait, poste injoignable). Ignoré si la session est en pause.
+     */
+    public function cloturer(Poste $poste, string $motif = 'client', ?CarbonInterface $arretA = null): ?Session
+    {
+        $session = $poste->sessionActive();
+        if ($session === null) {
+            return null;
+        }
+
+        $brut     = $session->secondesConsommees();   // avant le changement d'état
+        $secondes = $brut;
+        $fin      = now();
+
+        if ($arretA !== null && $session->etat === 'en_cours' && $session->date_heure_debut !== null) {
+            $arret = $arretA->copy();
+            if ($arret->lt($session->date_heure_debut)) {
+                $arret = $session->date_heure_debut->copy();
+            }
+            if ($arret->lt($fin)) {
+                // Le chrono comptait en continu : on retire le temps écoulé depuis l'arrêt réel
+                $secondes = max(0, $brut - ($fin->getTimestamp() - $arret->getTimestamp()));
+                $fin      = $arret;
+            }
+        }
+
+        $montant = $this->montant($session, $secondes);
+
+        $session->update([
+            'etat'                  => 'terminee',
+            'date_heure_fin_reelle' => $fin,
+            'motif_fin'             => $motif,
+            'duree_consommee'       => intdiv($secondes, 60),
+            'montant_consomme'      => $montant,
+            'montant_total'         => $montant,
+        ]);
+
+        // Fin de session (fermeture, expiration, poste injoignable) : le poste passe en « Désactivé ».
+        // Il ne redevient disponible que lorsque le gérant clique sur « Activer ».
+        $poste->update(['etat' => Poste::ETAT_DESACTIVE]);
+
+        return $session;
+    }
+
+    // ------------------------------------------------------------------
+    // Expiration des forfaits
+    // ------------------------------------------------------------------
+
+    /** Vrai si la session est un forfait en cours dont le temps est épuisé. */
+    public function sessionExpiree(Session $session): bool
+    {
+        return $session->etat === 'en_cours'
+            && ($session->mode_facturation ?? 'forfait') === 'forfait'
+            && (int) $session->duree_prevue > 0
+            && $session->secondesConsommees() >= (int) $session->duree_prevue * 60;
+    }
+
+    /**
+     * Clôture la session du poste si son forfait est épuisé, puis coupe Internet.
+     * Idempotent et sûr en concurrence (verrou de ligne) : appelable depuis le heartbeat
+     * ET depuis la maintenance planifiée.
+     */
+    public function expirerSiNecessaire(Poste $poste): ?Session
+    {
+        $apercu = $poste->sessionActive();
+        if ($apercu === null || !$this->sessionExpiree($apercu)) {
+            return null;
+        }
+
+        $session = DB::transaction(function () use ($poste) {
+            $p = Poste::whereKey($poste->id)->lockForUpdate()->first();
+            $s = $p?->sessionActive();
+            if ($s === null || !$this->sessionExpiree($s)) {
+                return null;
+            }
+
+            // Instant exact où le forfait a été épuisé (en tenant compte des temps non facturés)
+            $deductions = (int) $s->duree_suspension + (int) $s->duree_hors_ligne_secondes + (int) $s->duree_pause_secondes;
+            $arret      = $s->date_heure_debut->copy()->addSeconds((int) $s->duree_prevue * 60 + $deductions);
+
+            return $this->cloturer($p, 'expiration', $arret->isFuture() ? null : $arret);
+        });
+
+        if ($session === null) {
+            return null;
+        }
+
+        Log::info("Forfait expiré : session #{$session->id} du poste {$poste->nom_poste} clôturée ({$session->montant_total} Ar).");
+        $this->deconnecterReseau($poste);
+
+        return $session;
+    }
+
+    // ------------------------------------------------------------------
+    // Poste injoignable / retour en ligne
+    // ------------------------------------------------------------------
+
+    /**
+     * Le poste redonne signe de vie après une panne : le temps d'injoignabilité n'est pas facturé.
+     *
+     * @return int Secondes déduites
+     */
+    public function deduireTempsHorsLigne(Poste $poste, ?CarbonInterface $dernierSigne): int
+    {
+        if ($dernierSigne === null) {
+            return 0;
+        }
+
+        return DB::transaction(function () use ($poste, $dernierSigne) {
+            $p = Poste::whereKey($poste->id)->lockForUpdate()->first();
+            $s = $p?->sessionActive();
+            if ($s === null || $s->etat !== 'en_cours') {
+                return 0;
+            }
+
+            // La panne ne peut pas avoir commencé avant le début ou la dernière reprise de la session
+            $debutPanne = max(
+                $dernierSigne->getTimestamp(),
+                $s->date_heure_debut?->getTimestamp() ?? 0,
+                $s->date_heure_reprise?->getTimestamp() ?? 0
+            );
+            $panne = now()->getTimestamp() - $debutPanne;
+            if ($panne <= Poste::DELAI_HORS_LIGNE) {
+                return 0;
+            }
+
+            $s->update(['duree_hors_ligne_secondes' => (int) $s->duree_hors_ligne_secondes + $panne]);
+            Log::info("Poste {$poste->nom_poste} de retour après {$panne} s : temps de panne déduit de la session #{$s->id}.");
+
+            return $panne;
+        });
+    }
+
+    /**
+     * Retour en ligne d'un poste (redémarrage, coupure) : déduit la panne, applique une éventuelle
+     * expiration, puis rétablit Internet si la session est toujours en cours.
+     */
+    public function traiterRetourEnLigne(Poste $poste, ?CarbonInterface $dernierSigne): void
+    {
+        $this->deduireTempsHorsLigne($poste, $dernierSigne);
+
+        if ($this->expirerSiNecessaire($poste) !== null) {
+            return;
+        }
+
+        $session = $poste->sessionActive();
+        if ($session !== null && $session->etat === 'en_cours') {
+            $this->connecterReseau($poste);
+        }
+    }
+
+    /**
+     * Clôture une session « en cours » dont le poste est injoignable depuis plus longtemps que la tolérance.
+     * Facturée jusqu'au dernier signe de vie ; Internet coupé.
+     */
+    public function cloturerSiInjoignable(Poste $poste, int $toleranceMinutes): ?Session
+    {
+        $session = DB::transaction(function () use ($poste, $toleranceMinutes) {
+            $p = Poste::whereKey($poste->id)->lockForUpdate()->first();
+            $s = $p?->sessionActive();
+            if ($s === null || $s->etat !== 'en_cours') {
+                return null;
+            }
+
+            $dernier = $p->dernier_heartbeat;
+            if ($dernier !== null && $dernier->gt(now()->subMinutes($toleranceMinutes))) {
+                return null;   // revenu entre-temps ou tolérance pas encore écoulée
+            }
+
+            $arret = ($dernier === null || $dernier->lt($s->date_heure_debut)) ? $s->date_heure_debut : $dernier;
+
+            return $this->cloturer($p, 'hors_ligne', $arret);
+        });
+
+        if ($session === null) {
+            return null;
+        }
+
+        Log::warning("Poste {$poste->nom_poste} injoignable depuis plus de {$toleranceMinutes} min : session #{$session->id} clôturée automatiquement ({$session->montant_total} Ar, facturée jusqu'au dernier signe de vie).");
+        $this->deconnecterReseau($poste);
+
+        return $session;
+    }
+
+
+
+    // ------------------------------------------------------------------
+    // Réseau (MikroTik) — mode dégradé : ne lève jamais d'exception
+    // ------------------------------------------------------------------
+
+    /**
+     * Le compte HotSpot existe-t-il sur MikroTik ?
+     *
+     * @return bool|null true/false = vérifié, null = impossible à vérifier (MikroTik désactivé ou injoignable)
+     */
+    public function compteHotspotExiste(string $username): ?bool
+    {
+        if (!$this->mikrotikActif()) {
+            return null;
+        }
+
+        try {
+            return $this->mikroTik->findHotspotUser($username) !== null;
+        } catch (\Throwable $e) {
+            Log::warning('MikroTik : vérification du compte HotSpot impossible (' . $e->getMessage() . ').');
+            return null;
+        }
+    }
+
+    public function mikrotikActif(): bool
+    {
+        return (bool) config('mikrotik.enabled', true);
+    }
+
+    /**
+     * Connecte le poste à Internet via MikroTik.
+     *
+     * @return bool|null true = connecté, false = échec (mode dégradé), null = non applicable
+     *                   (MikroTik désactivé, identifiants HotSpot ou MAC absents)
+     */
+    public function connecterReseau(Poste $poste): ?bool
+    {
+        if (!$this->mikrotikActif()) {
+            Log::info("MikroTik désactivé (MIKROTIK_ENABLED=false) : connexion Internet de {$poste->nom_poste} ignorée.");
+            return null;
+        }
+        if (!$poste->hotspot_username || !$poste->adresse_mac) {
+            Log::warning("Poste {$poste->nom_poste} : identifiants HotSpot ou adresse MAC absents, Internet non activé.");
+            return null;
+        }
+
+        try {
+            $this->mikroTik->connecterPosteHotspot(
+                $poste->hotspot_username,
+                $poste->hotspot_password ?? '',
+                $poste->adresse_mac,
+                $poste->adresse_ip
+            );
+            Log::info("MikroTik : poste {$poste->nom_poste} connecté à Internet.");
+            return true;
+        } catch (\Throwable $e) {
+            Log::warning("MikroTik : connexion de {$poste->nom_poste} échouée (mode dégradé, la session continue) : " . $e->getMessage());
+            return false;
+        }
+    }
+
+    /**
+     * Coupe l'accès Internet du poste.
+     *
+     * @return bool|null true = traité, false = échec (mode dégradé), null = non applicable
+     */
+    public function deconnecterReseau(Poste $poste): ?bool
+    {
+        if (!$this->mikrotikActif()) {
+            Log::info("MikroTik désactivé (MIKROTIK_ENABLED=false) : coupure Internet de {$poste->nom_poste} ignorée.");
+            return null;
+        }
+        if (!$poste->adresse_mac) {
+            Log::info("Poste {$poste->nom_poste} : MAC absente, coupure réseau ignorée.");
+            return null;
+        }
+
+        try {
+            $coupe = $this->mikroTik->deconnecterPosteHotspot($poste->adresse_mac, $poste->hotspot_username);
+            Log::info($coupe
+                ? "MikroTik : Internet coupé pour {$poste->nom_poste}."
+                : "MikroTik : aucune session HotSpot active pour {$poste->nom_poste} (déjà coupé).");
+            return true;
+        } catch (\Throwable $e) {
+            Log::warning("MikroTik : coupure Internet de {$poste->nom_poste} échouée (mode dégradé, la session est tout de même terminée) : " . $e->getMessage());
+            return false;
+        }
+    }
+
+    /**
+     * Aligne MikroTik sur l'état réel des sessions (auto-réparation) :
+     *  - poste avec session « en cours » mais sans session HotSpot → reconnecté ;
+     *  - poste sans session « en cours » mais encore connecté → coupé (YouTube résiduel).
+     * Rattrape un MikroTik tombé pendant une fermeture, ou redémarré en pleine session.
+     *
+     * @return array{connectes:int, coupes:int, erreurs:int}
+     */
+    public function reconcilierReseau(): array
+    {
+        $bilan = ['connectes' => 0, 'coupes' => 0, 'erreurs' => 0];
+
+        if (!$this->mikrotikActif()) {
+            return $bilan;
+        }
+
+        try {
+            $actives = $this->mikroTik->listHotspotActive();
+        } catch (\Throwable $e) {
+            Log::warning('MikroTik injoignable : réconciliation réseau ignorée (' . $e->getMessage() . ').');
+            $bilan['erreurs']++;
+            return $bilan;
+        }
+
+        $macsActives = [];
+        foreach ($actives as $ligne) {
+            $mac = strtoupper((string) ($ligne['mac-address'] ?? ''));
+            if ($mac !== '') {
+                $macsActives[$mac] = true;
+            }
+        }
+
+        $cache = Cache::store('file');
+
+        foreach (Poste::whereNotNull('adresse_mac')->get() as $poste) {
+            $session          = $poste->etat === Poste::ETAT_DESACTIVE ? null : $poste->sessionActive();
+            $doitEtreConnecte = $session !== null && $session->etat === 'en_cours';
+            $estConnecte      = isset($macsActives[strtoupper($poste->adresse_mac)]);
+
+            if ($doitEtreConnecte && !$estConnecte) {
+                if (!$poste->estEnLigne() || !$poste->hotspot_username) {
+                    continue;   // PC éteint ou poste non configuré : rien à reconnecter
+                }
+                $cle = "reseau:reessai:{$poste->id}";
+                if ($cache->has($cle)) {
+                    continue;   // évite de répéter un échec toutes les 30 s
+                }
+                $res = $this->connecterReseau($poste);
+                if ($res === true) {
+                    $bilan['connectes']++;
+                } elseif ($res === false) {
+                    $bilan['erreurs']++;
+                    $cache->put($cle, true, 120);
+                }
+            } elseif (!$doitEtreConnecte && $estConnecte) {
+                $res = $this->deconnecterReseau($poste);
+                if ($res === true) {
+                    $bilan['coupes']++;
+                } elseif ($res === false) {
+                    $bilan['erreurs']++;
+                }
+            }
+        }
+
+        return $bilan;
+    }
+}
+
+################################################################################
+# MODÈLE — Session.php (champs, statuts, calculs de durée)
+# app/Models/Session.php
+################################################################################
+<?php
+
+namespace App\Models;
+
+use Illuminate\Database\Eloquent\Relations\HasMany;
+use Illuminate\Database\Eloquent\Model;
+use Illuminate\Database\Eloquent\Relations\BelongsTo;
+
+class Session extends Model
+{
+    protected $table = 'cyber_sessions';
+
+    public const WIFI_CONNECTE   = 'connecte';
+    public const WIFI_DECONNECTE = 'deconnecte';
+    public const WIFI_TERMINE    = 'termine';
+    public const WIFI_EN_PAUSE   = 'en_pause';
+
+    protected $fillable = [
+        'poste_id', 'type_session',
+        'date_heure_debut', 'date_heure_fin_prevue', 'date_heure_fin_reelle',
+        'date_heure_suspension', 'date_heure_reprise', 'duree_suspension',
+        'duree_prevue', 'duree_consommee', 'temps_restant',
+        'montant_initial', 'montant_recharge', 'montant_total',
+        'montant_consomme', 'montant_restant', 'montant_a_reverser',
+        'description', 'etat', 'motif_fin', 'tarif_id', 'voucher_id',
+        'volume_entree', 'volume_sortie', 'volume_total',
+        'mikrotik_active_id', 'hotspot_username', 'client_mac', 'client_ip',
+        'ssid', 'appareil_wifi_id', 'derniere_sync_at',
+        'etat_wifi', 'deconnecte_at', 'reconnecte_at', 'duree_hors_ligne_secondes',
+        'pause_at', 'duree_pause_secondes',
+        'alarme_active', 'alarme_type', 'alarme_duree_minutes', 'alarme_montant',
+        'alarme_fin_prevue', 'alarme_derniere_fin_at', 'alarme_declenchee_at',
+        'alarme_message', 'alarme_historique', 'alarme_secondes_restantes',
+        'alarme_total_secondes',
+        'remarque',
+    ];
+
+    protected $casts = [
+        'date_heure_debut' => 'datetime',
+        'date_heure_fin_prevue' => 'datetime',
+        'date_heure_fin_reelle' => 'datetime',
+        'date_heure_suspension' => 'datetime',
+        'date_heure_reprise' => 'datetime',
+        'derniere_sync_at' => 'datetime',
+        'deconnecte_at' => 'datetime',
+        'reconnecte_at' => 'datetime',
+        'pause_at' => 'datetime',
+        'alarme_fin_prevue' => 'datetime',
+        'alarme_derniere_fin_at' => 'datetime',
+        'alarme_declenchee_at' => 'datetime',
+        'alarme_active' => 'boolean',
+        'duree_hors_ligne_secondes' => 'integer',
+        'duree_pause_secondes' => 'integer',
+        'alarme_duree_minutes' => 'integer',
+        'alarme_montant' => 'integer',
+        'alarme_historique' => 'array',
+        'alarme_secondes_restantes' => 'integer',
+        'alarme_total_secondes' => 'integer',
+    ];
+
+    public function poste(): BelongsTo { return $this->belongsTo(Poste::class); }
+    public function recharges(): HasMany { return $this->hasMany(Recharge::class); }
+    public function restitutions(): HasMany { return $this->hasMany(Restitution::class); }
+    public function tarif(): BelongsTo { return $this->belongsTo(Tarif::class); }
+    public function voucher(): BelongsTo { return $this->belongsTo(Voucher::class); }
+    public function appareilWifi(): BelongsTo { return $this->belongsTo(AppareilWifi::class, 'appareil_wifi_id'); }
+
+    public function estConnecte(): bool   { return $this->etat_wifi === self::WIFI_CONNECTE; }
+    public function estDeconnecte(): bool { return $this->etat_wifi === self::WIFI_DECONNECTE; }
+    public function estEnPause(): bool    { return $this->etat_wifi === self::WIFI_EN_PAUSE; }
+    public function estTermine(): bool    { return $this->etat_wifi === self::WIFI_TERMINE; }
+
+    public function compteurActif(): bool
+    {
+        return $this->etat_wifi === self::WIFI_CONNECTE;
+    }
+
+    /**
+     * Secondes facturables écoulées (hors périodes déconnecté / en pause).
+     *
+     * On travaille sur des timestamps entiers : avec Carbon 3, diffInSeconds()
+     * renvoie un float signé, ce qui provoquait des conversions implicites
+     * float → int (dépréciées en PHP 8.1+).
+     */
+    public function secondesConsommees(): int
+    {
+        if (!$this->date_heure_debut) return 0;
+
+        if ($this->estTermine()) {
+            return max(0, (int) $this->duree_consommee * 60);
+        }
+
+        if ($this->estEnPause() && $this->pause_at) {
+            $fin = $this->pause_at;
+        } elseif ($this->estDeconnecte() && $this->deconnecte_at) {
+            $fin = $this->deconnecte_at;
+        } elseif ($this->etat === 'en_pause' && $this->date_heure_suspension) {
+            $fin = $this->date_heure_suspension;      // postes Ethernet : chrono figé pendant la suspension
+        } elseif ($this->etat === 'terminee' && $this->date_heure_fin_reelle) {
+            $fin = $this->date_heure_fin_reelle;      // postes Ethernet : session clôturée
+        } else {
+            $fin = now();
+        }
+
+        $total = $fin->getTimestamp() - $this->date_heure_debut->getTimestamp();
+        $total -= (int) $this->duree_hors_ligne_secondes;
+        $total -= (int) $this->duree_pause_secondes;
+        $total -= (int) $this->duree_suspension;      // pauses Ethernet déjà terminées
+
+        return max(0, (int) $total);
+    }
+}
+
+################################################################################
+# MODÈLE — Poste.php (statuts présence, heartbeats, délais)
+# app/Models/Poste.php
+################################################################################
+<?php
+
+namespace App\Models;
+
+use Illuminate\Database\Eloquent\Model;
+use Illuminate\Database\Eloquent\Relations\HasMany;
+use Illuminate\Support\Str;
+
+class Poste extends Model
+{
+    public const ETAT_DISPONIBLE  = 'disponible';
+    public const ETAT_OCCUPE      = 'occupe';
+    public const ETAT_SUSPENDU    = 'suspendu';
+    public const ETAT_VERROUILLE  = 'verrouille';
+    public const ETAT_DESACTIVE   = 'desactive';
+    public const ETAT_HORS_LIGNE  = 'hors_ligne';
+
+    /** Délai (secondes) sans heartbeat avant de considérer le poste hors ligne. */
+    public const DELAI_HORS_LIGNE = 180;
+
+    /**
+     * Deux signes de vie venant de deux adresses réseau différentes à moins de ce délai (secondes)
+     * = deux ordinateurs utilisent la même identité (PC cloné).
+     */
+    public const DELAI_CONFLIT = 12;
+
+    /** Un conflit signalé s'efface tout seul après ce nombre de minutes sans nouveau signalement. */
+    public const DUREE_CONFLIT_MINUTES = 10;
+
+    /** Délai (secondes) sans réponse du serveur avant que l'AGENT verrouille le poste (3 minutes). */
+    public const DELAI_GRACE_AGENT = 180;
+
+    protected $fillable = [
+        'nom_poste', 'nom_windows', 'adresse_mac', 'adresse_ip',
+        'type_connexion', 'etat', 'actif', 'derniere_communication',
+        'agent_url', 'identifiant_unique', 'agent_token',
+        'dernier_heartbeat', 'agent_version',
+        'hotspot_username', 'hotspot_password',
+        'derniere_ip_vue', 'conflit_identite_at',
+        'internet_etat', 'internet_maj_at',
+    ];
+
+    protected $casts = [
+        'actif' => 'boolean',
+        'derniere_communication' => 'datetime',
+        'dernier_heartbeat' => 'datetime',
+        'conflit_identite_at' => 'datetime',
+        'internet_maj_at' => 'datetime',
+    ];
+
+    protected $hidden = ['agent_token', 'hotspot_password'];
+
+    public function sessions(): HasMany
+    {
+        return $this->hasMany(Session::class);
+    }
+
+    public function commandes(): HasMany
+    {
+        return $this->hasMany(PosteCommande::class);
+    }
+
+    public function messages(): HasMany
+    {
+        return $this->hasMany(PosteMessage::class);
+    }
+
+    public function sessionActive(): ?Session
+    {
+        return $this->sessions()
+            ->whereIn('etat', ['en_cours', 'en_pause'])
+            ->latest()
+            ->first();
+    }
+
+    public function estEnLigne(): bool
+    {
+        return $this->dernier_heartbeat
+            && $this->dernier_heartbeat->gt(now()->subSeconds(self::DELAI_HORS_LIGNE));
+    }
+
+    public function estConnecte(): bool
+    {
+        return $this->estEnLigne()
+            && $this->etat !== self::ETAT_HORS_LIGNE
+            && $this->etat !== self::ETAT_DESACTIVE;
+    }
+
+    public function etatAffiche(): string
+    {
+        if ($this->etat === self::ETAT_DESACTIVE) {
+            return self::ETAT_DESACTIVE;
+        }
+        if (!$this->estEnLigne()) {
+            return self::ETAT_HORS_LIGNE;
+        }
+        if ($this->etat === self::ETAT_HORS_LIGNE) {
+            return $this->sessionActive() ? self::ETAT_OCCUPE : self::ETAT_DISPONIBLE;
+        }
+        return $this->etat;
+    }
+
+    /** Un conflit d'identité (PC cloné) est-il signalé pour ce poste ? */
+    public function aConflitIdentite(): bool
+    {
+        return $this->conflit_identite_at !== null;
+    }
+
+    // ------------------------------------------------------------------
+    // Noms de postes
+    // ------------------------------------------------------------------
+
+    /** Nettoie un nom : pas de caractères de contrôle, espaces simplifiés, 100 caractères maximum. */
+    public static function nettoyerNom(string $nom): string
+    {
+        $nom = preg_replace('/[\x00-\x1F\x7F]+/u', ' ', $nom) ?? '';
+        $nom = preg_replace('/\s+/u', ' ', $nom) ?? '';
+
+        return mb_substr(trim($nom), 0, 100);
+    }
+
+    /** Ce nom (majuscules/minuscules ignorées) est-il déjà pris par un autre poste ? */
+    public static function nomExiste(string $nom, ?int $ignorerId = null): bool
+    {
+        return static::query()
+            ->whereRaw('LOWER(nom_poste) = ?', [mb_strtolower($nom)])
+            ->when($ignorerId !== null, fn ($q) => $q->where('id', '!=', $ignorerId))
+            ->exists();
+    }
+
+    /** Si le nom est pris, ajoute un suffixe : « Poste 3 » devient « Poste 3-2 », « Poste 3-3 »… */
+    public static function nomDisponible(string $nom, ?int $ignorerId = null): string
+    {
+        $candidat = $nom;
+        $i = 2;
+
+        while (static::nomExiste($candidat, $ignorerId)) {
+            $suffixe  = '-' . $i;
+            $candidat = mb_substr($nom, 0, 100 - mb_strlen($suffixe)) . $suffixe;
+            $i++;
+
+            if ($i > 500) {   // garde-fou : ne jamais boucler indéfiniment
+                $candidat = mb_substr($nom, 0, 90) . '-' . Str::lower(Str::random(6));
+                break;
+            }
+        }
+
+        return $candidat;
+    }
+
+    /**
+     * Nom attribué à un NOUVEAU poste :
+     *  - nom vide ou nom Windows par défaut (DESKTOP-XXXXXXX…) → « Poste 1 », « Poste 2 »…
+     *  - sinon le nom demandé, avec un suffixe s'il est déjà pris.
+     */
+    public static function nomPourNouveauPoste(string $demande): string
+    {
+        $nom = self::nettoyerNom($demande);
+
+        if ($nom === '' || preg_match('/^(DESKTOP|LAPTOP|WIN)-[A-Z0-9]{5,}$/i', $nom)) {
+            $n = 1;
+            while (static::nomExiste("Poste {$n}")) {
+                $n++;
+            }
+
+            return "Poste {$n}";
+        }
+
+        return self::nomDisponible($nom);
+    }
+}
+
+################################################################################
+# CONTRÔLEUR API — AgentController.php (handshake, heartbeat, activation)
+# app/Http/Controllers/Api/AgentController.php
+################################################################################
+<?php
+
+namespace App\Http\Controllers\Api;
+
+use App\Http\Controllers\Controller;
+use App\Models\Poste;
+use App\Models\PosteCommande;
+use App\Models\PosteMessage;
+use App\Models\Session;
+use App\Services\CodeInstallation;
+use App\Services\IdentiteMaterielle;
+use App\Services\PosteSessionService;
+use Illuminate\Database\UniqueConstraintViolationException;
+use Illuminate\Http\JsonResponse;
+use Illuminate\Http\Request;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Str;
+use App\Models\CyberSetting;
+
+class AgentController extends Controller
+{
+    private const REGEX_MAC = '/^([0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}$/';
+
+    private function reglesEmpreinte(): array
+    {
+        return [
+            'nom_windows'      => ['nullable', 'string', 'max:100'],
+            'empreinte'        => ['nullable', 'array'],
+            'empreinte.uuid'   => ['nullable', 'string', 'max:40'],
+            'empreinte.macs'   => ['nullable', 'array', 'max:16'],
+            'empreinte.macs.*' => ['string', 'max:17'],
+        ];
+    }
+
+    private function reponseDoublon(): JsonResponse
+    {
+        return response()->json([
+            'ok'                    => false,
+            'code'                  => 'identifiant_a_regenerer',
+            'regenerer_identifiant' => true,
+            'message'               => "Cet ordinateur est un doublon d'un autre poste : il va recevoir une nouvelle identité.",
+        ], 409);
+    }
+
+    public function handshake(Request $request, PosteSessionService $sessions): JsonResponse
+    {
+        $data = $request->validate([
+            'identifiant_unique' => ['required', 'string', 'max:64'],
+            'nom_poste'          => ['required', 'string', 'max:100'],
+            'adresse_ip'         => ['nullable', 'ip'],
+            'adresse_mac'        => ['nullable', 'string', 'regex:' . self::REGEX_MAC],
+            'agent_version'      => ['nullable', 'string', 'max:32'],
+            'code_installation'  => ['nullable', 'string', 'max:32'],
+        ] + $this->reglesEmpreinte());
+
+        $mac        = isset($data['adresse_mac']) ? strtoupper(str_replace('-', ':', $data['adresse_mac'])) : null;
+        $ipVue      = $this->ipVue($request);
+        $emp        = IdentiteMaterielle::normaliser($data['empreinte'] ?? null);
+        $nomWindows = isset($data['nom_windows']) ? Poste::nettoyerNom($data['nom_windows']) : null;
+
+        $poste      = Poste::where('identifiant_unique', $data['identifiant_unique'])->first();
+        $reinstalle = false;
+
+        if ($poste === null) {
+            if (!CodeInstallation::verifier($data['code_installation'] ?? null)) {
+                Log::warning("Enregistrement refusé depuis {$ipVue} : code d'installation absent ou invalide.");
+                return response()->json([
+                    'ok'      => false,
+                    'code'    => 'code_installation_invalide',
+                    'message' => "Code d'installation absent ou invalide. Demandez-le au gérant (page « Enregistrement » de l'interface web).",
+                ], 403);
+            }
+
+            // Système réinstallé sur le même ordinateur : on rattache au poste existant (aucune alerte)
+            $poste      = IdentiteMaterielle::retrouverPourReinstallation($emp, $mac, (string) $nomWindows, $data['nom_poste']);
+            $reinstalle = $poste !== null;
+        }
+
+        $retourApresPanne = false;
+        $ancienSigne      = null;
+
+        if ($poste === null) {
+            try {
+                $poste = Poste::create([
+                    'nom_poste'              => Poste::nomPourNouveauPoste($data['nom_poste']),
+                    'nom_windows'            => $nomWindows,
+                    'identifiant_unique'     => $data['identifiant_unique'],
+                    'adresse_ip'             => $data['adresse_ip'] ?? null,
+                    'derniere_ip_vue'        => $ipVue,
+                    'adresse_mac'            => $mac,
+                    'agent_version'          => $data['agent_version'] ?? null,
+                    'agent_token'            => Str::random(64),
+                    'etat'                   => Poste::ETAT_DESACTIVE,
+                    'actif'                  => true,
+                    'dernier_heartbeat'      => now(),
+                    'derniere_communication' => now(),
+                ]);
+            } catch (UniqueConstraintViolationException) {
+                return response()->json([
+                    'ok'      => false,
+                    'code'    => 'enregistrement_simultane',
+                    'message' => 'Enregistrement simultané détecté, nouvel essai en cours.',
+                ], 409);
+            }
+
+            IdentiteMaterielle::enregistrer($poste, $emp, $nomWindows);
+            Log::info("Nouveau poste enregistré : « {$poste->nom_poste} » (demandé : « {$data['nom_poste']} »).");
+            $nouveau = true;
+        } else {
+            if (!$reinstalle) {
+                $verdict = IdentiteMaterielle::memeMachine(IdentiteMaterielle::dePoste($poste), $emp);
+
+                if ($verdict === false && $poste->estEnLigne()) {
+                    // Autre ordinateur ET l'original répond : c'est un clone
+                    Log::warning("Poste « {$poste->nom_poste} » : un ordinateur cloné reçoit l'ordre de changer d'identité.");
+                    return $this->reponseDoublon();
+                }
+                if ($verdict === false) {
+                    Log::info("Poste « {$poste->nom_poste} » : remplacement matériel détecté (l'original est absent), nouvelle empreinte adoptée.");
+                }
+
+                // Séparation manuelle demandée sur un ancien poste (Gardien sans empreinte)
+                if ($emp === null && $poste->aConflitIdentite() && $mac !== null && $poste->adresse_mac !== null
+                    && $mac !== strtoupper($poste->adresse_mac)) {
+                    Log::warning("Poste « {$poste->nom_poste} » : un ordinateur dupliqué (MAC différente) reçoit l'ordre de changer d'identité.");
+                    return $this->reponseDoublon();
+                }
+            }
+
+            $retourApresPanne = !$poste->estEnLigne();
+            $ancienSigne      = $poste->dernier_heartbeat;
+
+            $maj = [
+                'adresse_ip'             => $data['adresse_ip'] ?? $poste->adresse_ip,
+                'derniere_ip_vue'        => $ipVue,
+                'adresse_mac'            => $mac ?? $poste->adresse_mac,
+                'agent_version'          => $data['agent_version'] ?? $poste->agent_version,
+                'agent_token'            => $poste->agent_token ?: Str::random(64),
+                'dernier_heartbeat'      => now(),
+                'derniere_communication' => now(),
+                'etat'                   => $poste->etat === Poste::ETAT_HORS_LIGNE
+                    ? ($poste->sessionActive() ? Poste::ETAT_OCCUPE : Poste::ETAT_DISPONIBLE)
+                    : $poste->etat,
+            ];
+
+            if ($reinstalle) {
+                $maj['identifiant_unique'] = $data['identifiant_unique'];
+                $maj['agent_token']        = Str::random(64);
+                $maj['conflit_identite_at'] = null;
+                Log::info("Poste « {$poste->nom_poste} » : réinstallation sur le même ordinateur reconnue (aucune alerte).");
+            }
+
+            $poste->update($maj);
+            IdentiteMaterielle::enregistrer($poste, $emp, $nomWindows);
+            $nouveau = false;
+        }
+
+        if ($retourApresPanne) {
+            $sessions->traiterRetourEnLigne($poste, $ancienSigne);
+            $poste->refresh();
+        }
+
+        $etat    = $poste->etatAffiche();
+        $session = $poste->sessionActive();
+
+        return response()->json([
+            'ok'                   => true,
+            'nouveau'              => $nouveau,
+            'poste_id'             => $poste->id,
+            'agent_token'          => $poste->agent_token,
+            'nom_poste'            => $poste->nom_poste,
+            'etat'                 => $etat,
+            'doit_etre_verrouille' => $this->doitEtreVerrouille($etat),
+            'session'              => $session ? $this->resumeSession($session) : null,
+            'branding'             => CyberSetting::brandingAgent(),
+            'message'              => $nouveau ? 'Poste enregistré.' : 'Poste reconnu.',
+            'delai_hors_ligne_s'   => Poste::DELAI_HORS_LIGNE,
+            'delai_grace_agent_s'  => Poste::DELAI_GRACE_AGENT,
+        ]);
+    }
+
+    public function heartbeat(Request $request, PosteSessionService $sessions): JsonResponse
+    {
+        $poste = $this->authentifier($request);
+        if ($poste === null) return response()->json(['ok' => false, 'message' => 'Token invalide.'], 401);
+
+        $data = $request->validate(['adresse_ip' => ['nullable', 'ip']] + $this->reglesEmpreinte());
+
+        $emp        = IdentiteMaterielle::normaliser($data['empreinte'] ?? null);
+        $nomWindows = isset($data['nom_windows']) ? Poste::nettoyerNom($data['nom_windows']) : null;
+
+        $etaitEnLigne = $poste->estEnLigne();
+        $ancienSigne  = $poste->dernier_heartbeat;
+
+        // Empreinte différente ET original encore présent = clone ; original absent = remplacement matériel
+        $verdict = IdentiteMaterielle::memeMachine(IdentiteMaterielle::dePoste($poste), $emp);
+        if ($verdict === false) {
+            if ($etaitEnLigne) {
+                Log::warning("Poste « {$poste->nom_poste} » : un ordinateur cloné reçoit l'ordre de changer d'identité.");
+                return $this->reponseDoublon();
+            }
+            Log::info("Poste « {$poste->nom_poste} » : remplacement matériel détecté (l'original est absent), nouvelle empreinte adoptée.");
+        }
+
+        $ipVue = $this->ipVue($request);
+
+        $maj = ['dernier_heartbeat' => now(), 'derniere_communication' => now(), 'derniere_ip_vue' => $ipVue];
+        if (!empty($data['adresse_ip'])) $maj['adresse_ip'] = $data['adresse_ip'];
+
+        // Anciennes alertes (détection par adresse IP, abandonnée) : elles s'effacent toutes seules
+        if ($poste->conflit_identite_at !== null
+            && $poste->conflit_identite_at->lt(now()->subMinutes(Poste::DUREE_CONFLIT_MINUTES))) {
+            $maj['conflit_identite_at'] = null;
+        }
+
+        if ($poste->etat === Poste::ETAT_HORS_LIGNE) {
+            $maj['etat'] = $poste->sessionActive() ? Poste::ETAT_OCCUPE : Poste::ETAT_DISPONIBLE;
+        }
+        $poste->update($maj);
+        IdentiteMaterielle::enregistrer($poste, $emp, $nomWindows);
+
+        if ($etaitEnLigne) {
+            $sessions->expirerSiNecessaire($poste);
+        } else {
+            $sessions->traiterRetourEnLigne($poste, $ancienSigne);
+        }
+        $poste->refresh();
+
+        app(\App\Services\AccesInternetService::class)->reconcilierTous();
+
+        $etat    = $poste->etatAffiche();
+        $session = $poste->sessionActive();
+
+        return response()->json([
+            'ok'                   => true,
+            'nom_poste'            => $poste->nom_poste,
+            'etat'                 => $etat,
+            'doit_etre_verrouille' => $this->doitEtreVerrouille($etat),
+            'session'              => $session ? $this->resumeSession($session) : null,
+            'branding'             => CyberSetting::brandingAgent(),
+            'delai_hors_ligne_s'   => Poste::DELAI_HORS_LIGNE,
+            'delai_grace_agent_s'  => Poste::DELAI_GRACE_AGENT,
+        ]);
+    }
+
+    public function activer(Request $request, PosteSessionService $sessions): JsonResponse
+    {
+        $poste = $this->authentifier($request);
+        if ($poste === null) return response()->json(['ok' => false, 'message' => 'Token invalide.'], 401);
+
+        [$code, $corps, $posteFinal] = DB::transaction(function () use ($poste, $sessions) {
+            $p = Poste::whereKey($poste->id)->lockForUpdate()->first();
+            $p->update(['dernier_heartbeat' => now(), 'derniere_communication' => now()]);
+
+            switch ($p->etatAffiche()) {
+                case Poste::ETAT_DESACTIVE: return [403, ['ok' => false, 'message' => 'Poste désactivé, contactez le gérant.'], null];
+                case Poste::ETAT_SUSPENDU: return [409, ['ok' => false, 'message' => "Votre session est en pause."], null];
+                case Poste::ETAT_VERROUILLE: return [409, ['ok' => false, 'message' => "Ce poste est verrouillé."], null];
+                case Poste::ETAT_OCCUPE:
+                    $s = $p->sessionActive();
+                    return [200, ['ok' => true, 'message' => 'Session déjà active.', 'session' => $s ? $this->resumeSession($s) : null], $s ? $p : null];
+            }
+
+            if ($p->etatAffiche() !== Poste::ETAT_DISPONIBLE) {
+                return [409, ['ok' => false, 'message' => "Ce poste n'est pas disponible."], null];
+            }
+
+            $session = $sessions->creerSession($p, 'postpaye', null);
+            PosteMessage::where('poste_id', $p->id)->delete();
+            $this->tracer($p, 'demarrer', 'Activation depuis le poste client', ['session_id' => $session->id, 'type' => 'postpaye']);
+            $p->update(['etat' => Poste::ETAT_OCCUPE]);
+
+            return [200, ['ok' => true, 'message' => 'Poste activé.', 'session' => $this->resumeSession($session)], $p];
+        });
+
+        if ($posteFinal !== null) {
+            $reseau = app(\App\Services\AccesInternetService::class)->autoriser($posteFinal);
+            if ($reseau === false) $corps['avertissement'] = "Connexion Internet momentanément indisponible.";
+        }
+
+        return response()->json($corps, $code);
+    }
+
+    public function suspendreSession(Request $request, PosteSessionService $sessions): JsonResponse
+    {
+        $poste = $this->authentifier($request);
+        if ($poste === null) return response()->json(['ok' => false, 'message' => 'Token invalide.'], 401);
+
+        $ok = DB::transaction(function () use ($poste, $sessions) {
+            $p = Poste::whereKey($poste->id)->lockForUpdate()->first();
+            $p->update(['dernier_heartbeat' => now(), 'derniere_communication' => now()]);
+            $session = $p->sessionActive();
+            if ($session === null || !$sessions->suspendre($p)) return false;
+            $this->tracer($p, 'suspendre', 'Suspension depuis le widget client', ['session_id' => $session->id]);
+            return true;
+        });
+
+        if (!$ok) return response()->json(['ok' => false, 'message' => 'Aucune session active à suspendre.'], 409);
+
+        $corps = ['ok' => true, 'message' => 'Session suspendue.'];
+        if (app(\App\Services\AccesInternetService::class)->couper($poste) === false) $corps['avertissement'] = "Coupure Internet non confirmée.";
+        return response()->json($corps);
+    }
+
+    public function reprendreSession(Request $request, PosteSessionService $sessions): JsonResponse
+    {
+        $poste = $this->authentifier($request);
+        if ($poste === null) return response()->json(['ok' => false, 'message' => 'Token invalide.'], 401);
+
+        $ok = DB::transaction(function () use ($poste, $sessions) {
+            $p = Poste::whereKey($poste->id)->lockForUpdate()->first();
+            if ($p === null || !$sessions->reprendre($p)) return false;
+            $this->tracer($p, 'reprendre', 'Reprise depuis l\'écran de verrouillage client');
+            return true;
+        });
+
+        if (!$ok) return response()->json(['ok' => false, 'message' => 'Aucune session à reprendre.'], 409);
+
+        $corps = ['ok' => true, 'message' => 'Session reprise.'];
+        if (app(\App\Services\AccesInternetService::class)->autoriser($poste) === false) $corps['avertissement'] = "Connexion Internet non confirmée.";
+        return response()->json($corps);
+    }
+
+    private function doitEtreVerrouille(string $etat): bool
+    {
+        return in_array($etat, [Poste::ETAT_DISPONIBLE, Poste::ETAT_VERROUILLE, Poste::ETAT_DESACTIVE, Poste::ETAT_SUSPENDU], true);
+    }
+
+    public function fermerSession(Request $request, PosteSessionService $sessions): JsonResponse
+    {
+        $poste = $this->authentifier($request);
+        if ($poste === null) return response()->json(['ok' => false, 'message' => 'Token invalide.'], 401);
+
+        $resultat = DB::transaction(function () use ($poste, $sessions) {
+            $p = Poste::whereKey($poste->id)->lockForUpdate()->first();
+            $p->update(['dernier_heartbeat' => now(), 'derniere_communication' => now()]);
+
+            $session = $sessions->cloturer($p, 'client');
+            if ($session === null) return null;
+
+            $p->update(['etat' => Poste::ETAT_DESACTIVE]);
+            PosteCommande::create(['poste_id' => $p->id, 'type' => 'verrouiller']);
+
+            $this->tracer($p, 'fermer', 'Fermeture depuis le widget client', ['session_id' => $session->id]);
+            return [$p, (int) $session->montant_total];
+        });
+
+        if ($resultat === null) return response()->json(['ok' => false, 'message' => 'Aucune session active à fermer.'], 409);
+
+        [$posteFinal, $montant] = $resultat;
+
+        $corps = ['ok' => true, 'message' => 'Session terminée.', 'montant' => $montant];
+        if (app(\App\Services\AccesInternetService::class)->couper($posteFinal) === false) $corps['avertissement'] = "Coupure Internet non confirmée.";
+        return response()->json($corps);
+    }
+
+    public function message(Request $request): JsonResponse
+    {
+        $poste = $this->authentifier($request);
+        if ($poste === null) return response()->json(['ok' => false, 'message' => 'Token invalide.'], 401);
+
+        $data  = $request->validate(['texte' => ['required', 'string', 'max:500']]);
+        $texte = trim($data['texte']);
+        if ($texte === '') return response()->json(['ok' => false, 'message' => 'Message vide.'], 422);
+
+        $m = PosteMessage::create(['poste_id' => $poste->id, 'sens' => PosteMessage::SENS_CLIENT, 'contenu' => $texte]);
+        return response()->json(['ok' => true, 'message' => 'Message envoyé.', 'id' => $m->id]);
+    }
+
+    public function commandes(Request $request): JsonResponse
+    {
+        $poste = $this->authentifier($request);
+        if ($poste === null) return response()->json(['ok' => false, 'message' => 'Token invalide.'], 401);
+
+        $commandes = PosteCommande::where('poste_id', $poste->id)->where('statut', 'en_attente')->orderBy('id')->limit(10)->get();
+        foreach ($commandes as $c) $c->update(['statut' => 'recue', 'recue_at' => now()]);
+
+        return response()->json([
+            'ok'        => true,
+            'commandes' => $commandes->map(fn ($c) => ['id' => $c->id, 'type' => $c->type, 'payload' => $c->payload])->values(),
+        ]);
+    }
+
+    public function confirmerCommande(Request $request, PosteCommande $commande): JsonResponse
+    {
+        $poste = $this->authentifier($request);
+        if ($poste === null || $commande->poste_id !== $poste->id) return response()->json(['ok' => false], 401);
+
+        $data = $request->validate(['succes' => ['required', 'boolean'], 'message' => ['nullable', 'string', 'max:500']]);
+        $commande->update(['statut' => $data['succes'] ? 'executee' : 'echouee', 'resultat' => $data['message'] ?? null, 'executee_at' => now()]);
+        return response()->json(['ok' => true]);
+    }
+
+    public function logo()
+    {
+        $chemin = CyberSetting::logoChemin();
+        if ($chemin === null) {
+            return response()->json(['ok' => false, 'message' => 'Aucun logo.'], 404);
+        }
+        return response()->file($chemin, ['Cache-Control' => 'no-cache']);
+    }
+
+    private function authentifier(Request $request): ?Poste
+    {
+        $token = $request->header('X-Agent-Token');
+        if (!$token) return null;
+        return Poste::where('agent_token', $token)->first();
+    }
+
+    private function ipVue(Request $request): ?string
+    {
+        $ip = $request->ip();
+        if ($ip === null) return null;
+
+        if (str_starts_with($ip, '::ffff:')) $ip = substr($ip, 7);
+        return $ip === '::1' ? '127.0.0.1' : $ip;
+    }
+
+    private function tracer(Poste $poste, string $type, string $resultat, array $payload = []): void
+    {
+        PosteCommande::create([
+            'poste_id' => $poste->id, 'type' => $type, 'payload' => $payload + ['origine' => 'client'],
+            'statut' => 'executee', 'resultat' => $resultat, 'recue_at' => now(), 'executee_at' => now(),
+        ]);
+    }
+
+    private function resumeSession(Session $session): array
+    {
+        $mode    = $session->mode_facturation ?: 'forfait';
+        $ecoule  = (int) $session->secondesConsommees();
+        $prevue  = (int) $session->duree_prevue;
+        $restant = ($mode === 'forfait' && $prevue > 0) ? max(0, $prevue * 60 - $ecoule) : null;
+
+        $forfaitTotal = 0;
+        if ($mode === 'forfait') {
+            $tarif = app(\App\Services\TarifService::class)->tarifStandard();
+            $forfaitTotal = app(\App\Services\TarifService::class)->montantPourMinutes($prevue, $tarif);
+        }
+
+        $tarifInfo = ['par_minute' => 20, 'minimum' => 300, 'arrondi_actif' => false, 'unite' => 0, 'seuil' => 0];
+        try {
+            $t = $session->tarif ?: app(\App\Services\TarifService::class)->tarifStandard();
+            $tarifInfo = [
+                'par_minute'    => (int) $t->montant_par_minute,
+                'minimum'       => (int) $t->montant_minimum,
+                'arrondi_actif' => (bool) $t->arrondi_actif,
+                'unite'         => (int) $t->unite_arrondi,
+                'seuil'         => (int) $t->seuil_arrondi,
+            ];
+        } catch (\Throwable) {}
+
+        return [
+            'id'               => $session->id,
+            'mode'             => $mode,
+            'date_heure_debut' => $session->date_heure_debut?->toIso8601String(),
+            'date_heure_fin'   => $session->date_heure_fin_prevue?->toIso8601String(),
+            'duree_prevue'     => $prevue,
+            'forfait_total'    => $forfaitTotal,
+            'montant_actuel'   => app(PosteSessionService::class)->montant($session),
+            'etat'             => $session->etat,
+            'ecoule_s'         => $ecoule,
+            'restant_s'        => $restant,
+            'tarif'            => $tarifInfo,
+        ];
+    }
+}
+
+################################################################################
+# CONSOLE — routes/console.php (planification des tâches Laravel Scheduler)
+# routes/console.php
+################################################################################
+<?php
+
+use Illuminate\Foundation\Inspiring;
+use Illuminate\Support\Facades\Artisan;
+use Illuminate\Support\Facades\Schedule;
+
+Artisan::command('inspire', function () {
+    $this->comment(Inspiring::quote());
+})->purpose('Display an inspiring quote');
+
+// Ferme les sessions Ethernet arrivées à expiration
+Schedule::command('sessions:expire')->everyMinute();
+
+// Synchronise les sessions Wi-Fi depuis le MikroTik, toutes les 5 secondes,
+// même si aucune page n'est ouverte. Le verrou est dans WifiSessionService.
+Schedule::command('wifi:sync-sessions')
+    ->everyFiveSeconds()
+    ->withoutOverlapping(2);
+
+// Expire les vouchers dépassés et réapprovisionne le pool de temporaires
+Schedule::command('vouchers:reapprovisionner')
+    ->everyFiveMinutes()
+    ->withoutOverlapping();
+
+
+// Étape 4 — maintenance des postes (expiration des forfaits, postes injoignables) et réconciliation MikroTik
+Schedule::command('postes:maintenance')->everyTenSeconds();
+Schedule::command('postes:maintenance --reseau')->everyThirtySeconds();
+
+################################################################################
+# COMMANDE — ExpireSessions.php (expiration automatique des forfaits)
+# app/Console/Commands/ExpireSessions.php
+################################################################################
+<?php
+
+namespace App\Console\Commands;
+
+use App\Services\SessionExpirationService;
+use Illuminate\Console\Command;
+
+class ExpireSessions extends Command
+{
+    protected $signature = 'sessions:expire';
+
+    protected $description = 'Vérifie et expire les sessions arrivées à leur terme';
+
+    public function handle(
+        SessionExpirationService $sessionExpirationService
+    ): int {
+        $expirees = $sessionExpirationService->verifierSessions();
+
+        $this->info("Sessions expirées : {$expirees}");
+
+        return self::SUCCESS;
+    }
+}
+
+################################################################################
+# COMMANDE — MaintenancePostes.php (détection postes injoignables)
+# app/Console/Commands/MaintenancePostes.php
+################################################################################
+<?php
+
+namespace App\Console\Commands;
+
+use App\Models\Session;
+use App\Services\PosteSessionService;
+use Illuminate\Console\Command;
+use Illuminate\Support\Facades\Cache;
+use Illuminate\Support\Facades\Log;
+
+/**
+ * Maintenance des postes clients.
+ *
+ *  postes:maintenance           → expire les forfaits terminés + clôture les sessions de postes
+ *                                  injoignables au-delà de la tolérance (voir config/postes.php)
+ *  postes:maintenance --reseau  → réconcilie MikroTik avec l'état réel des sessions
+ *
+ * Les verrous utilisent le cache « file » : aucune dépendance à la table cache de la base.
+ */
+class MaintenancePostes extends Command
+{
+    protected $signature = 'postes:maintenance {--reseau : Réconcilie l\'état réseau MikroTik (connecté / coupé)}';
+
+    protected $description = 'Expire les forfaits, clôture les sessions de postes injoignables, réconcilie MikroTik.';
+
+    public function handle(PosteSessionService $sessions): int
+    {
+        $reseau = (bool) $this->option('reseau');
+
+        // Un seul exemplaire à la fois (évite les doubles clôtures si un passage traîne)
+        $verrou = Cache::store('file')->lock($reseau ? 'postes:maintenance:reseau' : 'postes:maintenance', 120);
+        if (!$verrou->get()) {
+            return self::SUCCESS;
+        }
+
+        try {
+            if ($reseau) {
+                $this->reconcilierReseau($sessions);
+            } else {
+                $this->expirerLesForfaits($sessions);
+                $this->cloturerLesPostesInjoignables($sessions);
+            }
+        } catch (\Throwable $e) {
+            Log::error('Maintenance des postes : erreur inattendue : ' . $e->getMessage());
+            return self::FAILURE;
+        } finally {
+            $verrou->release();
+        }
+
+        return self::SUCCESS;
+    }
+
+    /** Forfaits dont le temps est écoulé (postes en ligne ou non). */
+    private function expirerLesForfaits(PosteSessionService $sessions): void
+    {
+        $candidates = Session::query()
+            ->where('etat', 'en_cours')
+            ->where('mode_facturation', 'forfait')
+            ->where('duree_prevue', '>', 0)
+            ->whereNotNull('poste_id')
+            ->with('poste')
+            ->get();
+
+        foreach ($candidates as $session) {
+            $poste = $session->poste;
+            if ($poste === null || !$sessions->sessionExpiree($session)) {
+                continue;
+            }
+            $sessions->expirerSiNecessaire($poste);
+        }
+    }
+
+    /** Sessions « en cours » dont le poste ne donne plus signe de vie depuis plus que la tolérance. */
+    private function cloturerLesPostesInjoignables(PosteSessionService $sessions): void
+    {
+        $magasin    = Cache::store('file');
+        $maintenant = now()->getTimestamp();
+
+        // Garde de redémarrage : si le planificateur était arrêté, on laisse les agents se reconnecter
+        $dernierPassage = $magasin->get('postes:maintenance:dernier_passage');
+        $magasin->put('postes:maintenance:dernier_passage', $maintenant, 86400);
+        if ($dernierPassage === null || $maintenant - (int) $dernierPassage > 60) {
+            $garde = (int) config('postes.garde_redemarrage_secondes', 90);
+            $magasin->put('postes:maintenance:garde_jusqua', $maintenant + $garde, 86400);
+            Log::info("Maintenance des postes (re)démarrée : pas de clôture pour injoignabilité pendant {$garde} s.");
+        }
+        if ((int) $magasin->get('postes:maintenance:garde_jusqua', 0) > $maintenant) {
+            return;
+        }
+
+        $tolerance = (int) config('postes.hors_ligne_tolerance_minutes', 10);
+        if ($tolerance <= 0) {
+            return;   // clôture automatique désactivée : le gérant ferme à la main
+        }
+
+        $sessionsEnCours = Session::query()
+            ->where('etat', 'en_cours')
+            ->whereNotNull('poste_id')
+            ->with('poste')
+            ->get();
+
+        foreach ($sessionsEnCours as $session) {
+            $poste = $session->poste;
+            if ($poste === null || $poste->estEnLigne()) {
+                continue;
+            }
+            if ($poste->dernier_heartbeat && $poste->dernier_heartbeat->gt(now()->subMinutes($tolerance))) {
+                continue;   // encore dans la tolérance
+            }
+            $sessions->cloturerSiInjoignable($poste, $tolerance);
+        }
+    }
+
+    private function reconcilierReseau(PosteSessionService $sessions): void
+    {
+        $bilan = $sessions->reconcilierReseau();
+
+        if ($bilan['connectes'] > 0 || $bilan['coupes'] > 0) {
+            Log::info("Réconciliation MikroTik : {$bilan['connectes']} poste(s) reconnecté(s), {$bilan['coupes']} coupé(s).");
+        }
+    }
+}
+
+################################################################################
+# COMMANDE — WifiSyncSessionsCommand.php (synchronisation Wi-Fi en continu)
+# app/Console/Commands/WifiSyncSessionsCommand.php
+################################################################################
+<?php
+
+namespace App\Console\Commands;
+
+use App\Services\WifiSessionService;
+use Illuminate\Console\Command;
+
+class WifiSyncSessionsCommand extends Command
+{
+    protected $signature   = 'wifi:sync-sessions';
+    protected $description = 'Synchronise les sessions Wi-Fi depuis le HotSpot MikroTik';
+
+    public function handle(WifiSessionService $service): int
+    {
+        $result = $service->synchroniser();
+
+        if ($result['erreur']) {
+            $this->error('MikroTik injoignable : ' . $result['erreur']);
+            return self::FAILURE;
+        }
+
+        if (!empty($result['ignoree'])) {
+            $this->line('Une synchronisation est déjà en cours, rien à faire.');
+            return self::SUCCESS;
+        }
+
+        $this->info(sprintf(
+            'Sessions ouvertes : %d · mises à jour : %d · fermées : %d',
+            $result['ouvertes'],
+            $result['maj'],
+            $result['fermees']
+        ));
+
+        return self::SUCCESS;
+    }
+}
+
+################################################################################
+# CONFIG — composer.json (PHP requis, extensions, dépendances)
+# composer.json
+################################################################################
+{
+    "$schema": "https://getcomposer.org/schema.json",
+    "name": "laravel/laravel",
+    "type": "project",
+    "description": "The skeleton application for the Laravel framework.",
+    "keywords": ["laravel", "framework"],
+    "license": "MIT",
+    "require": {
+        "php": "^8.2",
+        "laravel/framework": "^12.0",
+        "laravel/tinker": "^2.10.1"
+    },
+    "require-dev": {
+        "fakerphp/faker": "^1.23",
+        "laravel/breeze": "^2.4",
+        "laravel/pail": "^1.2.2",
+        "laravel/pint": "^1.24",
+        "laravel/sail": "^1.41",
+        "mockery/mockery": "^1.6",
+        "nunomaduro/collision": "^8.6",
+        "phpunit/phpunit": "^11.5.50"
+    },
+    "autoload": {
+        "psr-4": {
+            "App\\": "app/",
+            "Database\\Factories\\": "database/factories/",
+            "Database\\Seeders\\": "database/seeders/"
+        }
+    },
+    "autoload-dev": {
+        "psr-4": {
+            "Tests\\": "tests/"
+        }
+    },
+    "scripts": {
+        "setup": [
+            "composer install",
+            "@php -r \"file_exists('.env') || copy('.env.example', '.env');\"",
+            "@php artisan key:generate",
+            "@php artisan migrate --force",
+            "npm install",
+            "npm run build"
+        ],
+        "dev": [
+            "Composer\\Config::disableProcessTimeout",
+            "npx concurrently -c \"#93c5fd,#c4b5fd,#fb7185,#fdba74\" \"php artisan serve\" \"php artisan queue:listen --tries=1 --timeout=0\" \"php artisan pail --timeout=0\" \"npm run dev\" --names=server,queue,logs,vite --kill-others"
+        ],
+        "test": [
+            "@php artisan config:clear --ansi",
+            "@php artisan test"
+        ],
+        "post-autoload-dump": [
+            "Illuminate\\Foundation\\ComposerScripts::postAutoloadDump",
+            "@php artisan package:discover --ansi"
+        ],
+        "post-update-cmd": [
+            "@php artisan vendor:publish --tag=laravel-assets --ansi --force"
+        ],
+        "post-root-package-install": [
+            "@php -r \"file_exists('.env') || copy('.env.example', '.env');\""
+        ],
+        "post-create-project-cmd": [
+            "@php artisan key:generate --ansi",
+            "@php -r \"file_exists('database/database.sqlite') || touch('database/database.sqlite');\"",
+            "@php artisan migrate --graceful --ansi"
+        ],
+        "pre-package-uninstall": [
+            "Illuminate\\Foundation\\ComposerScripts::prePackageUninstall"
+        ]
+    },
+    "extra": {
+        "laravel": {
+            "dont-discover": []
+        }
+    },
+    "config": {
+        "optimize-autoloader": true,
+        "preferred-install": "dist",
+        "sort-packages": true,
+        "allow-plugins": {
+            "pestphp/pest-plugin": true,
+            "php-http/discovery": true
+        }
+    },
+    "minimum-stability": "stable",
+    "prefer-stable": true
+}
+
+
+################################################################################
+# CONFIG — database.php (drivers MySQL / SQLite existants)
+# config/database.php
+################################################################################
+<?php
+
+use Illuminate\Support\Str;
+use Pdo\Mysql;
+
+return [
+
+    /*
+    |--------------------------------------------------------------------------
+    | Default Database Connection Name
+    |--------------------------------------------------------------------------
+    |
+    | Here you may specify which of the database connections below you wish
+    | to use as your default connection for database operations. This is
+    | the connection which will be utilized unless another connection
+    | is explicitly specified when you execute a query / statement.
+    |
+    */
+
+    'default' => env('DB_CONNECTION', 'sqlite'),
+
+    /*
+    |--------------------------------------------------------------------------
+    | Database Connections
+    |--------------------------------------------------------------------------
+    |
+    | Below are all of the database connections defined for your application.
+    | An example configuration is provided for each database system which
+    | is supported by Laravel. You're free to add / remove connections.
+    |
+    */
+
+    'connections' => [
+
+        'sqlite' => [
+            'driver' => 'sqlite',
+            'url' => env('DB_URL'),
+            'database' => env('DB_DATABASE', database_path('database.sqlite')),
+            'prefix' => '',
+            'foreign_key_constraints' => env('DB_FOREIGN_KEYS', true),
+            'busy_timeout' => null,
+            'journal_mode' => null,
+            'synchronous' => null,
+            'transaction_mode' => 'DEFERRED',
+        ],
+
+        'mysql' => [
+            'driver' => 'mysql',
+            'url' => env('DB_URL'),
+            'host' => env('DB_HOST', '127.0.0.1'),
+            'port' => env('DB_PORT', '3306'),
+            'database' => env('DB_DATABASE', 'laravel'),
+            'username' => env('DB_USERNAME', 'root'),
+            'password' => env('DB_PASSWORD', ''),
+            'unix_socket' => env('DB_SOCKET', ''),
+            'charset' => env('DB_CHARSET', 'utf8mb4'),
+            'collation' => env('DB_COLLATION', 'utf8mb4_unicode_ci'),
+            'prefix' => '',
+            'prefix_indexes' => true,
+            'strict' => true,
+            'engine' => null,
+            'options' => extension_loaded('pdo_mysql') ? array_filter([
+                (PHP_VERSION_ID >= 80500 ? Mysql::ATTR_SSL_CA : PDO::MYSQL_ATTR_SSL_CA) => env('MYSQL_ATTR_SSL_CA'),
+            ]) : [],
+        ],
+
+        'mariadb' => [
+            'driver' => 'mariadb',
+            'url' => env('DB_URL'),
+            'host' => env('DB_HOST', '127.0.0.1'),
+            'port' => env('DB_PORT', '3306'),
+            'database' => env('DB_DATABASE', 'laravel'),
+            'username' => env('DB_USERNAME', 'root'),
+            'password' => env('DB_PASSWORD', ''),
+            'unix_socket' => env('DB_SOCKET', ''),
+            'charset' => env('DB_CHARSET', 'utf8mb4'),
+            'collation' => env('DB_COLLATION', 'utf8mb4_unicode_ci'),
+            'prefix' => '',
+            'prefix_indexes' => true,
+            'strict' => true,
+            'engine' => null,
+            'options' => extension_loaded('pdo_mysql') ? array_filter([
+                (PHP_VERSION_ID >= 80500 ? Mysql::ATTR_SSL_CA : PDO::MYSQL_ATTR_SSL_CA) => env('MYSQL_ATTR_SSL_CA'),
+            ]) : [],
+        ],
+
+        'pgsql' => [
+            'driver' => 'pgsql',
+            'url' => env('DB_URL'),
+            'host' => env('DB_HOST', '127.0.0.1'),
+            'port' => env('DB_PORT', '5432'),
+            'database' => env('DB_DATABASE', 'laravel'),
+            'username' => env('DB_USERNAME', 'root'),
+            'password' => env('DB_PASSWORD', ''),
+            'charset' => env('DB_CHARSET', 'utf8'),
+            'prefix' => '',
+            'prefix_indexes' => true,
+            'search_path' => 'public',
+            'sslmode' => env('DB_SSLMODE', 'prefer'),
+        ],
+
+        'sqlsrv' => [
+            'driver' => 'sqlsrv',
+            'url' => env('DB_URL'),
+            'host' => env('DB_HOST', 'localhost'),
+            'port' => env('DB_PORT', '1433'),
+            'database' => env('DB_DATABASE', 'laravel'),
+            'username' => env('DB_USERNAME', 'root'),
+            'password' => env('DB_PASSWORD', ''),
+            'charset' => env('DB_CHARSET', 'utf8'),
+            'prefix' => '',
+            'prefix_indexes' => true,
+            // 'encrypt' => env('DB_ENCRYPT', 'yes'),
+            // 'trust_server_certificate' => env('DB_TRUST_SERVER_CERTIFICATE', 'false'),
+        ],
+
+    ],
+
+    /*
+    |--------------------------------------------------------------------------
+    | Migration Repository Table
+    |--------------------------------------------------------------------------
+    |
+    | This table keeps track of all the migrations that have already run for
+    | your application. Using this information, we can determine which of
+    | the migrations on disk haven't actually been run on the database.
+    |
+    */
+
+    'migrations' => [
+        'table' => 'migrations',
+        'update_date_on_publish' => true,
+    ],
+
+    /*
+    |--------------------------------------------------------------------------
+    | Redis Databases
+    |--------------------------------------------------------------------------
+    |
+    | Redis is an open source, fast, and advanced key-value store that also
+    | provides a richer body of commands than a typical key-value system
+    | such as Memcached. You may define your connection settings here.
+    |
+    */
+
+    'redis' => [
+
+        'client' => env('REDIS_CLIENT', 'phpredis'),
+
+        'options' => [
+            'cluster' => env('REDIS_CLUSTER', 'redis'),
+            'prefix' => env('REDIS_PREFIX', Str::slug((string) env('APP_NAME', 'laravel')).'-database-'),
+            'persistent' => env('REDIS_PERSISTENT', false),
+        ],
+
+        'default' => [
+            'url' => env('REDIS_URL'),
+            'host' => env('REDIS_HOST', '127.0.0.1'),
+            'username' => env('REDIS_USERNAME'),
+            'password' => env('REDIS_PASSWORD'),
+            'port' => env('REDIS_PORT', '6379'),
+            'database' => env('REDIS_DB', '0'),
+            'max_retries' => env('REDIS_MAX_RETRIES', 3),
+            'backoff_algorithm' => env('REDIS_BACKOFF_ALGORITHM', 'decorrelated_jitter'),
+            'backoff_base' => env('REDIS_BACKOFF_BASE', 100),
+            'backoff_cap' => env('REDIS_BACKOFF_CAP', 1000),
+        ],
+
+        'cache' => [
+            'url' => env('REDIS_URL'),
+            'host' => env('REDIS_HOST', '127.0.0.1'),
+            'username' => env('REDIS_USERNAME'),
+            'password' => env('REDIS_PASSWORD'),
+            'port' => env('REDIS_PORT', '6379'),
+            'database' => env('REDIS_CACHE_DB', '1'),
+            'max_retries' => env('REDIS_MAX_RETRIES', 3),
+            'backoff_algorithm' => env('REDIS_BACKOFF_ALGORITHM', 'decorrelated_jitter'),
+            'backoff_base' => env('REDIS_BACKOFF_BASE', 100),
+            'backoff_cap' => env('REDIS_BACKOFF_CAP', 1000),
+        ],
+
+    ],
+
+];
+
+
+################################################################################
+# MODÈLE — CyberSetting.php (paramètres généraux et réseau persistés)
+# app/Models/CyberSetting.php
+################################################################################
+<?php
+
+namespace App\Models;
+
+use Illuminate\Database\Eloquent\Model;
+use Illuminate\Support\Facades\Storage;
+
+class CyberSetting extends Model
+{
+    protected $table = 'cyber_settings';
+    protected $fillable = ['cle', 'valeur'];
+
+    public const DEFAUTS = [
+        'nom_cyber'          => 'Cyber Manager',
+        'slogan'             => 'Gestion de cybercafé',
+        'nom_admin'          => '',
+        'couleur_principale' => '#7c3aed',
+        'logo_path'          => null,
+    ];
+
+    public static function tous(): array
+    {
+        try {
+            $lignes = static::query()->pluck('valeur', 'cle')->all();
+        } catch (\Throwable) {
+            $lignes = [];
+        }
+
+        $res = self::DEFAUTS;
+        foreach ($lignes as $cle => $val) {
+            if (array_key_exists($cle, $res)) {
+                $res[$cle] = $val ?? '';
+            }
+        }
+
+        if (trim((string) $res['nom_cyber']) === '') {
+            $res['nom_cyber'] = self::DEFAUTS['nom_cyber'];
+        }
+        if (!preg_match('/^#[0-9A-Fa-f]{6}$/', (string) $res['couleur_principale'])) {
+            $res['couleur_principale'] = self::DEFAUTS['couleur_principale'];
+        }
+        if ($res['logo_path'] === '') {
+            $res['logo_path'] = null;
+        }
+
+        return $res;
+    }
+
+    public static function definir(string $cle, ?string $valeur): void
+    {
+        static::updateOrCreate(['cle' => $cle], ['valeur' => $valeur]);
+    }
+
+    public static function logoChemin(): ?string
+    {
+        $p = self::tous()['logo_path'];
+        if (!$p || !Storage::disk('public')->exists($p)) {
+            return null;
+        }
+        return Storage::disk('public')->path($p);
+    }
+
+    public static function logoExiste(): bool
+    {
+        return self::logoChemin() !== null;
+    }
+
+    public static function logoVersion(): string
+    {
+        $chemin = self::logoChemin();
+        if ($chemin === null) {
+            return '';
+        }
+        return substr(md5($chemin . '|' . @filemtime($chemin) . '|' . @filesize($chemin)), 0, 12);
+    }
+
+    public static function brandingAgent(): array
+    {
+        $t = self::tous();
+        $version = self::logoVersion();
+
+        return [
+            'nom_cyber'    => $t['nom_cyber'],
+            'slogan'       => (string) $t['slogan'],
+            'couleur'      => $t['couleur_principale'],
+            'avec_logo'    => $version !== '',
+            'logo_version' => $version,
+        ];
+    }
+
+    // -----------------------------------------------------------------
+    // NOUVELLES MÉTHODES RÉSEAU
+    // -----------------------------------------------------------------
+
+    public static function reseau(string $cle, ?string $defaut = null): ?string
+    {
+        $valeur = static::query()->where('cle', $cle)->value('valeur');
+        if ($valeur !== null && $valeur !== '') {
+            return $valeur;
+        }
+        return $defaut;
+    }
+
+    public static function setReseau(string $cle, ?string $valeur): void
+    {
+        static::updateOrCreate(['cle' => $cle], ['valeur' => $valeur]);
+    }
+}
+
+################################################################################
+# SCRIPT — preparer-serveur.ps1 (tentatives ou scripts serveurs précédents)
+# scripts/preparer-serveur.ps1
+################################################################################
+# Préparation du PC serveur (à lancer UNE fois, en administrateur) :
+#   - ouvre UN seul port dans le pare-feu, pour tous les types de réseau (le pare-feu reste actif)
+#   - installe Apache et MySQL comme services Windows, démarrage automatique (sauf avec -SansServices)
+#   - planifie la sauvegarde quotidienne de la base
+#   - installe l'écoute de découverte : les postes retrouvent seuls le serveur, même si son adresse ou son port change
+# -SansServices : n'installe pas Apache/MySQL (PC où XAMPP est piloté depuis son panneau de contrôle, ou « artisan serve »).
+# Usage : powershell -ExecutionPolicy Bypass -File scripts\preparer-serveur.ps1 -Port 8000 [-XamppDir C:\xampp] [-Destination D:\Sauvegardes] [-Heure 03:00] [-SansServices]
+param(
+    [Parameter(Mandatory = $true)][int]$Port,
+    [string]$XamppDir = "C:\xampp",
+    [string]$Destination = "",
+    [string]$Heure = "03:00",
+    [switch]$SansServices
+)
+$ErrorActionPreference = "Stop"
+
+$admin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+if (-not $admin) { throw "Lancez PowerShell en tant qu'administrateur." }
+
+# 1. Pare-feu : un seul port, profils Domaine + Privé + Public (un réseau de cyber est souvent « Public »)
+$nomRegle = "Cyber Manager (port $Port)"
+Get-NetFirewallRule -DisplayName $nomRegle -ErrorAction SilentlyContinue | Remove-NetFirewallRule
+New-NetFirewallRule -DisplayName $nomRegle -Direction Inbound -Protocol TCP -LocalPort $Port -Action Allow -Profile Any | Out-Null
+Write-Host "Pare-feu : port $Port ouvert (TCP, tous réseaux)." -ForegroundColor Green
+
+# 2. Apache et MySQL en services Windows, démarrage automatique
+function Preparer-Service($nom, $exe, $argsInstall) {
+    if (-not (Test-Path $exe)) { Write-Host "Introuvable : $exe (vérifiez -XamppDir)" -ForegroundColor Yellow; return }
+    if (-not (Get-Service $nom -ErrorAction SilentlyContinue)) { & $exe @argsInstall | Out-Null }
+    if (Get-Service $nom -ErrorAction SilentlyContinue) {
+        Set-Service $nom -StartupType Automatic
+        if ((Get-Service $nom).Status -ne "Running") { Start-Service $nom -ErrorAction SilentlyContinue }
+        Write-Host "Service $nom : démarrage automatique." -ForegroundColor Green
+    }
+}
+if ($SansServices) {
+    Write-Host "Services Apache/MySQL : ignorés (-SansServices)." -ForegroundColor Yellow
+} else {
+    Preparer-Service "Apache2.4" (Join-Path $XamppDir "apache\bin\httpd.exe") @("-k", "install")
+    Preparer-Service "MySQL"     (Join-Path $XamppDir "mysql\bin\mysqld.exe") @("--install", "MySQL")
+}
+
+# 3. Sauvegarde quotidienne
+$script = Join-Path $PSScriptRoot "sauvegarde-base.ps1"
+$argsTache = "-NoProfile -ExecutionPolicy Bypass -File `"$script`" -XamppDir `"$XamppDir`""
+if ($Destination) { $argsTache += " -Destination `"$Destination`"" }
+$action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument $argsTache
+$declencheur = New-ScheduledTaskTrigger -Daily -At $Heure
+$parametres = New-ScheduledTaskSettingsSet -StartWhenAvailable -AllowStartIfOnBatteries
+Register-ScheduledTask -TaskName "CyberManager Sauvegarde" -Action $action -Trigger $declencheur -Settings $parametres -User "SYSTEM" -RunLevel Highest -Force | Out-Null
+Write-Host "Sauvegarde : chaque jour à $Heure." -ForegroundColor Green
+
+# 4. Découverte automatique : les postes retrouvent seuls le serveur (UDP 47474). Le port HTTP est détecté tout seul.
+& (Join-Path $PSScriptRoot "installer-decouverte.ps1") -XamppDir $XamppDir
+
+Write-Host "Terminé. Conseil : mettez -Destination sur un AUTRE disque ou une clé, pas sur le même disque que la base." -ForegroundColor Cyan
+
+################################################################################
+# SCRIPT — installer-decouverte.ps1 (découverte réseau UDP du serveur)
+# scripts/installer-decouverte.ps1
+################################################################################
+# Installe l'écoute de découverte (UDP) en tâche planifiée : démarre avec Windows, relancée si elle plante.
+# Le port HTTP du serveur est détecté automatiquement (ne rien saisir). -Port force un port (cas particulier).
+# Normalement appelé par preparer-serveur.ps1. Usage direct (administrateur) :
+#   powershell -ExecutionPolicy Bypass -File scripts\installer-decouverte.ps1 [-XamppDir E:\xampp] [-Port 8000] [-PortUdp 47474]
+param(
+    [int]$Port = 0,
+    [string]$XamppDir = "C:\xampp",
+    [int]$PortUdp = 47474
+)
+$ErrorActionPreference = "Stop"
+
+$admin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+if (-not $admin) { throw "Lancez PowerShell en tant qu'administrateur." }
+
+$app = Split-Path -Parent $PSScriptRoot
+$php = Join-Path $XamppDir "php\php.exe"
+if (-not (Test-Path $php)) {
+    $trouve = Get-Command php.exe -ErrorAction SilentlyContinue
+    if ($trouve) { $php = $trouve.Source }
+}
+$artisan = Join-Path $app "artisan"
+if (-not (Test-Path $php)) { throw "php.exe introuvable (utilisez -XamppDir)" }
+if (-not (Test-Path $artisan)) { throw "artisan introuvable : $artisan" }
+
+# 1. Pare-feu : un seul port UDP, tous les types de réseau
+$nomRegle = "Cyber Manager découverte (UDP $PortUdp)"
+Get-NetFirewallRule -DisplayName $nomRegle -ErrorAction SilentlyContinue | Remove-NetFirewallRule
+New-NetFirewallRule -DisplayName $nomRegle -Direction Inbound -Protocol UDP -LocalPort $PortUdp -Action Allow -Profile Any | Out-Null
+Write-Host "Pare-feu : port UDP $PortUdp ouvert (tous réseaux)." -ForegroundColor Green
+
+# 2. Tâche planifiée SYSTEM : au démarrage, sans limite de durée, relance automatique
+$arguments = "`"$artisan`" cyber:decouverte --udp-port=$PortUdp"
+if ($Port -gt 0) { $arguments += " --http-port=$Port" }
+
+$nomTache = "CyberManager Decouverte"
+$action = New-ScheduledTaskAction -Execute $php -Argument $arguments -WorkingDirectory $app
+$declencheur = New-ScheduledTaskTrigger -AtStartup
+$parametres = New-ScheduledTaskSettingsSet -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
+    -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew
+
+Stop-ScheduledTask -TaskName $nomTache -ErrorAction SilentlyContinue
+Register-ScheduledTask -TaskName $nomTache -Action $action -Trigger $declencheur -Settings $parametres -User "SYSTEM" -RunLevel Highest -Force | Out-Null
+Start-ScheduledTask -TaskName $nomTache
+Start-Sleep -Seconds 3
+
+$portTexte = if ($Port -gt 0) { "HTTP $Port" } else { "port HTTP détecté automatiquement" }
+if ((Get-ScheduledTask -TaskName $nomTache).State -eq "Running") {
+    Write-Host "Découverte : en écoute (UDP $PortUdp, $portTexte), démarrage automatique avec Windows." -ForegroundColor Green
+} else {
+    Write-Host "La tâche ne tourne pas. Testez à la main : $php `"$artisan`" cyber:decouverte" -ForegroundColor Yellow
+}
+
+================================================================================
+FIN DU CONTEXTE

@@ -1,0 +1,3212 @@
+================================================================================
+CONTEXTE POUR ÉTAPE 1.0 — AUDIT SQLITE & SERVICES RÉSEAU / SESSIONS
+Dossier source : E:\xampp\htdocs\cyber-manager
+================================================================================
+
+================================================================================
+SERVICES CLÉS & CONFIG
+================================================================================
+
+################################################################################
+# app/Services/WifiSessionService.php
+################################################################################
+<?php
+
+namespace App\Services;
+
+use App\Models\AppareilWifi;
+use App\Models\Session;
+use App\Models\Voucher;
+use Illuminate\Support\Carbon;
+use Illuminate\Support\Collection;
+use Illuminate\Support\Facades\Cache;
+use Illuminate\Support\Facades\Log;
+
+class WifiSessionService
+{
+    private const CLE_VERROU          = 'wifi_sync_verrou';
+    private const CLE_DERNIERE_SYNC   = 'wifi_sync_derniere_tentative';
+    private const CLE_ETAT_ROUTEUR    = 'wifi_sync_etat_routeur';
+    private const CLE_MACS_ACTIVES    = 'wifi_sync_macs_actives';
+    private const MACS_ACTIVES_AGE_MAX = 20;
+    private const PREFIXE_ABSENCE     = 'wifi_absence_session_';
+    private const PREFIXE_MAC_SANS_FIL = 'wifi_mac_sans_fil_';
+    private const PREFIXE_APPAREIL    = 'wifi_appareil_rafraichi_';
+    private const PREFIXE_VOLUME_BASE = 'wifi_volume_base_session_';
+
+    private const ABSENCE_SYNCS_MIN = 1;
+    private const ABSENCE_SECONDES_MIN = 0;
+    private const RELECTURE_PAUSE_US = 300000;
+
+    private const ETATS_OUVERTS = [
+        Session::WIFI_CONNECTE,
+        Session::WIFI_DECONNECTE,
+        Session::WIFI_EN_PAUSE,
+    ];
+
+    private ?array $baux = null;
+    private ?array $regTable = null;
+    private ?array $wireless = null;
+
+    public function __construct(private MikroTikService $mikroTik) {}
+
+    public function synchroniserSiNecessaire(int $ageMaxSecondes = 2): ?array
+    {
+        $etat = Cache::get(self::CLE_ETAT_ROUTEUR);
+        if (is_array($etat) && empty($etat['ok'])) {
+            $ageMaxSecondes = max($ageMaxSecondes, 10);
+        }
+
+        $derniere = Cache::get(self::CLE_DERNIERE_SYNC);
+        if ($derniere && (now()->getTimestamp() - (int) $derniere) < $ageMaxSecondes) {
+            return null;
+        }
+
+        return $this->synchroniser();
+    }
+
+    public function synchroniser(): array
+    {
+        $verrou = Cache::lock(self::CLE_VERROU, 30);
+
+        if (!$verrou->get()) {
+            return ['ouvertes' => 0, 'maj' => 0, 'fermees' => 0, 'erreur' => null, 'ignoree' => true];
+        }
+
+        try {
+            return $this->executerSynchro();
+        } finally {
+            $verrou->release();
+        }
+    }
+
+    public function etatSynchro(): array
+    {
+        $e = Cache::get(self::CLE_ETAT_ROUTEUR);
+
+        return [
+            'ok'     => (bool) ($e['ok'] ?? true),
+            'at'     => isset($e['at']) ? Carbon::createFromTimestamp((int) $e['at'])->toIso8601String() : null,
+            'erreur' => $e['erreur'] ?? null,
+        ];
+    }
+
+    public function macsEncoreActives(): ?array
+    {
+        $etat = Cache::get(self::CLE_ETAT_ROUTEUR);
+        if (is_array($etat) && empty($etat['ok'])) return null;
+
+        $d = Cache::get(self::CLE_MACS_ACTIVES);
+        if (!is_array($d) || !isset($d['at'], $d['macs'])) return null;
+
+        if ((now()->getTimestamp() - (int) $d['at']) > self::MACS_ACTIVES_AGE_MAX) return null;
+
+        return (array) $d['macs'];
+    }
+
+    private function executerSynchro(): array
+    {
+        $this->baux     = null;
+        $this->regTable = null;
+        $this->wireless = null;
+
+        Cache::put(self::CLE_DERNIERE_SYNC, now()->getTimestamp(), 3600);
+
+        try {
+            $actives = $this->mikroTik->listHotspotActive();
+        } catch (\Throwable $e) {
+            Log::warning('Sync Wi-Fi : MikroTik injoignable', ['error' => $e->getMessage()]);
+            Cache::put(self::CLE_ETAT_ROUTEUR, [
+                'ok' => false, 'at' => now()->getTimestamp(), 'erreur' => $e->getMessage(),
+            ], 3600);
+
+            return ['ouvertes' => 0, 'maj' => 0, 'fermees' => 0, 'erreur' => $e->getMessage()];
+        }
+
+        Cache::put(self::CLE_ETAT_ROUTEUR, [
+            'ok' => true, 'at' => now()->getTimestamp(), 'erreur' => null,
+        ], 3600);
+
+        $this->chargerPresenceSansFil();
+
+        $actives = $this->actifsCanoniques($actives);
+
+        $ouvertes      = 0;
+        $maj           = 0;
+        $idsPresents   = [];
+        $macsPresentes = [];
+
+        foreach ($actives as $active) {
+            $activeId = $active['.id'] ?? null;
+            if (!$activeId) continue;
+
+            $present = $this->estPresent($active);
+            if ($present) {
+                $idsPresents[] = $activeId;
+
+                $macPresente = AppareilWifi::normaliserMac($active['mac-address'] ?? null);
+                if ($macPresente) $macsPresentes[] = $macPresente;
+            }
+
+            try {
+                $r = $this->traiterActive($active, $present);
+                if ($r === 'ouverte') $ouvertes++;
+                elseif ($r === 'maj') $maj++;
+            } catch (\Throwable $e) {
+                Log::warning('Sync Wi-Fi : entrée ignorée', [
+                    'active_id' => $activeId,
+                    'error'     => $e->getMessage(),
+                ]);
+            }
+        }
+
+        $fermees = $this->marquerSessionsDisparues($idsPresents);
+
+        Cache::put(self::CLE_MACS_ACTIVES, [
+            'at'   => now()->getTimestamp(),
+            'macs' => array_values(array_unique($macsPresentes)),
+        ], 120);
+
+        return ['ouvertes' => $ouvertes, 'maj' => $maj, 'fermees' => $fermees, 'erreur' => null];
+    }
+
+    private function actifsCanoniques(array $actives): array
+    {
+        $resultat = [];
+        $groupes  = [];
+
+        foreach ($actives as $a) {
+            $mac = AppareilWifi::normaliserMac($a['mac-address'] ?? null);
+            if ($mac === null) {
+                $resultat[] = $a;
+                continue;
+            }
+            $groupes[$mac][] = $a;
+        }
+
+        foreach ($groupes as $mac => $liste) {
+            if (count($liste) > 1) {
+                usort($liste, fn ($x, $y) =>
+                    $this->parseUptime($x['uptime'] ?? '0s') <=> $this->parseUptime($y['uptime'] ?? '0s'));
+
+                Log::info('Sync Wi-Fi : plusieurs entrées MikroTik pour une même MAC, la plus récente est retenue', [
+                    'mac'     => $mac,
+                    'retenue' => $liste[0]['.id'] ?? null,
+                ]);
+            }
+            $resultat[] = $liste[0];
+        }
+
+        return $resultat;
+    }
+
+    private function chargerPresenceSansFil(): void
+    {
+        $this->regTable = null;
+
+        try {
+            $table = [];
+            foreach ($this->mikroTik->listWirelessRegistrationTable() as $r) {
+                $m = AppareilWifi::normaliserMac($r['mac-address'] ?? null);
+                if (!$m) continue;
+                $table[$m] = $r;
+                Cache::add(self::PREFIXE_MAC_SANS_FIL . str_replace(':', '', $m), 1, 604800);
+            }
+            $this->regTable = $table;
+        } catch (\Throwable $e) {
+            $this->regTable = null;
+        }
+    }
+
+    private function estPresent(array $active): bool
+    {
+        if ($this->regTable === null) return true;
+
+        $mac = AppareilWifi::normaliserMac($active['mac-address'] ?? null);
+        if (!$mac) return true;
+
+        if (isset($this->regTable[$mac])) return true;
+
+        return !Cache::has(self::PREFIXE_MAC_SANS_FIL . str_replace(':', '', $mac));
+    }
+
+    private function traiterActive(array $active, bool $present): ?string
+    {
+        $activeId = $active['.id'];
+        $mac      = AppareilWifi::normaliserMac($active['mac-address'] ?? null);
+        $username = (($active['user'] ?? '') !== '') ? $active['user'] : null;
+
+        // 1) Session OUVERTE correspondante
+        $candidats = $this->sessionsOuvertesCorrespondantes($active, $activeId, $mac, $username);
+
+        if ($candidats->isNotEmpty()) {
+            $session  = $candidats->first();
+            $doublons = $candidats->slice(1);
+
+            if ($doublons->isNotEmpty()) {
+                $this->fusionner($session, $doublons);
+            }
+
+            if (!$present) return null;
+
+            $this->mettreAJour($session, $active);
+            return 'maj';
+        }
+
+        if (!$present) return null;
+
+        // 2) Aucune session ouverte. Si une session TERMINÉE existe pour le
+        //    même appareil + voucher, on rattache le nouvel .id SANS créer
+        //    de nouvelle ligne. L'état reste "terminé" : le responsable
+        //    décidera de cliquer "Continuer" ou de supprimer.
+        $terminee = $this->sessionTermineeARattacher($active, $activeId, $mac, $username);
+        if ($terminee) {
+            $terminee->mikrotik_active_id = $activeId;
+            $terminee->client_ip = $active['address'] ?? $terminee->client_ip;
+            $terminee->client_mac = $active['mac-address'] ?? $terminee->client_mac;
+            $terminee->derniere_sync_at = now();
+            $terminee->save();
+            return null;
+        }
+
+        // 3) Vraie nouvelle connexion → nouvelle session.
+        $this->creer($active);
+        return 'ouverte';
+    }
+
+    private function sessionsOuvertesCorrespondantes(array $active, string $activeId, ?string $mac, ?string $username): Collection
+    {
+        $limite = now()->subMinutes($this->fenetreRepriseMinutes());
+
+        return $this->requeteParIdOuMac($activeId, $active, self::ETATS_OUVERTS)
+            ->orderBy('date_heure_debut')
+            ->orderBy('id')
+            ->get()
+            ->filter(function (Session $s) use ($activeId, $mac, $username, $limite) {
+                if (!$this->correspond($s, $activeId, $mac, $username)) return false;
+
+                $memeId = (string) $s->mikrotik_active_id === (string) $activeId;
+                if (!$memeId
+                    && $s->etat_wifi === Session::WIFI_DECONNECTE
+                    && $s->deconnecte_at
+                    && $s->deconnecte_at->lt($limite)) {
+                    return false;
+                }
+                return true;
+            })
+            ->values();
+    }
+
+    private function sessionTermineeARattacher(array $active, string $activeId, ?string $mac, ?string $username): ?Session
+    {
+        if ($mac === null) return null;
+
+        $terminees = $this->requeteParIdOuMac($activeId, $active, [Session::WIFI_TERMINE])
+            ->orderByDesc('date_heure_fin_reelle')
+            ->orderByDesc('id')
+            ->limit(5)
+            ->get();
+
+        foreach ($terminees as $t) {
+            if ($this->correspond($t, $activeId, $mac, $username)) {
+                return $t;
+            }
+        }
+        return null;
+    }
+
+    private function requeteParIdOuMac(string $activeId, array $active, array $etats)
+    {
+        $macBrute = $active['mac-address'] ?? null;
+        $macNorm  = AppareilWifi::normaliserMac($macBrute);
+        $macs     = array_values(array_unique(array_filter([$macBrute, $macNorm])));
+
+        return Session::where('type_session', 'wifi')
+            ->whereIn('etat_wifi', $etats)
+            ->where(function ($q) use ($activeId, $macs) {
+                $q->where('mikrotik_active_id', $activeId);
+                if (!empty($macs)) {
+                    $q->orWhereIn('client_mac', $macs);
+                }
+            });
+    }
+
+    private function correspond(Session $s, string $activeId, ?string $mac, ?string $username): bool
+    {
+        $macSession = AppareilWifi::normaliserMac($s->client_mac);
+
+        if ((string) $s->mikrotik_active_id === (string) $activeId) {
+            return $mac === null || $macSession === null || $macSession === $mac;
+        }
+
+        if ($mac === null || $macSession !== $mac) return false;
+
+        return (($s->hotspot_username ?: null) === $username);
+    }
+
+    private function fenetreRepriseMinutes(): int
+    {
+        return max(1, (int) config('mikrotik.wifi_reprise_minutes', 60));
+    }
+
+    private function fusionner(Session $garde, Collection $doublons): void
+    {
+        foreach ($doublons as $d) {
+            if (!$garde->alarme_active && $d->alarme_active) {
+                foreach ([
+                    'alarme_active', 'alarme_type', 'alarme_duree_minutes', 'alarme_montant',
+                    'alarme_fin_prevue', 'alarme_declenchee_at', 'alarme_message',
+                    'alarme_historique', 'alarme_secondes_restantes',
+                ] as $champ) {
+                    $garde->{$champ} = $d->{$champ};
+                }
+            }
+            if (empty($garde->remarque) && !empty($d->remarque)) {
+                $garde->remarque = $d->remarque;
+            }
+
+            Log::info('Sync Wi-Fi : doublon de session fusionné', [
+                'garde'    => $garde->id,
+                'supprime' => $d->id,
+            ]);
+
+            Cache::forget(self::PREFIXE_ABSENCE . $d->id);
+            Cache::forget(self::PREFIXE_VOLUME_BASE . $d->id);
+            $d->delete();
+        }
+
+        if ($garde->isDirty()) $garde->save();
+    }
+
+    private function creer(array $active): Session
+    {
+        $username = $active['user'] ?? null;
+        $voucher  = $username ? Voucher::where('username', $username)->first() : null;
+
+        $appareil = $this->resoudreAppareil($active);
+        $ssid     = $this->resoudreSsid($active);
+
+        $uptimeSecondes = $this->parseUptime($active['uptime'] ?? '0s');
+        $debut = now()->subSeconds($uptimeSecondes);
+
+        $montantTotal = $voucher?->montant ?? 0;
+
+        $session = Session::create(array_merge([
+            'poste_id'              => null,
+            'voucher_id'            => $voucher?->id,
+            'type_session'          => 'wifi',
+            'date_heure_debut'      => $debut,
+            'date_heure_fin_prevue' => null,
+            'duree_prevue'          => 0,
+            'duree_consommee'       => 0,
+            'temps_restant'         => 0,
+            'duree_suspension'      => 0,
+            'montant_initial'       => $montantTotal,
+            'montant_recharge'      => 0,
+            'montant_total'         => $montantTotal,
+            'montant_consomme'      => 0,
+            'montant_restant'       => $montantTotal,
+            'montant_a_reverser'    => 0,
+            'etat'                  => 'en_cours',
+            'etat_wifi'             => Session::WIFI_CONNECTE,
+            'mikrotik_active_id'    => $active['.id'] ?? null,
+            'hotspot_username'      => $username,
+            'client_mac'            => $active['mac-address'] ?? null,
+            'client_ip'             => $active['address']     ?? null,
+            'ssid'                  => $ssid,
+            'appareil_wifi_id'      => $appareil?->id,
+            'derniere_sync_at'      => now(),
+        ], $this->calculerVolumes($active)));
+
+        if ($voucher) {
+            try {
+                $voucher->marquerEnCours($appareil);
+            } catch (\Throwable $e) {
+                Log::warning('Impossible de marquer le voucher en cours', [
+                    'voucher_id' => $voucher->id,
+                    'error'      => $e->getMessage(),
+                ]);
+            }
+        }
+
+        return $session;
+    }
+
+    private function mettreAJour(Session $session, array $active): void
+    {
+        Cache::forget(self::PREFIXE_ABSENCE . $session->id);
+
+        $nouvelId = $active['.id'] ?? null;
+        if ($nouvelId && (string) $session->mikrotik_active_id !== (string) $nouvelId) {
+            Cache::put(self::PREFIXE_VOLUME_BASE . $session->id, [
+                'entree' => (int) $session->volume_entree,
+                'sortie' => (int) $session->volume_sortie,
+            ], 604800);
+
+            $session->mikrotik_active_id = $nouvelId;
+        }
+
+        if ($session->etat_wifi === Session::WIFI_DECONNECTE) {
+            $dureeHorsLigne = $session->deconnecte_at
+                ? max(0, now()->getTimestamp() - $session->deconnecte_at->getTimestamp())
+                : 0;
+
+            $session->duree_hors_ligne_secondes = (int) $session->duree_hors_ligne_secondes + $dureeHorsLigne;
+            $session->etat_wifi     = Session::WIFI_CONNECTE;
+            $session->reconnecte_at = now();
+            $session->deconnecte_at = null;
+
+            if ($session->alarme_active && $session->alarme_secondes_restantes > 0) {
+                $session->alarme_fin_prevue = now()->addSeconds($session->alarme_secondes_restantes);
+                $session->alarme_secondes_restantes = null;
+            }
+        }
+
+        $session->client_ip        = $active['address']     ?? $session->client_ip;
+        $session->client_mac       = $active['mac-address'] ?? $session->client_mac;
+        $session->derniere_sync_at = now();
+
+        $mac = AppareilWifi::normaliserMac($active['mac-address'] ?? null);
+        $rafraichir = !$session->appareil_wifi_id
+            || ($mac && Cache::add(self::PREFIXE_APPAREIL . str_replace(':', '', $mac), 1, 60));
+
+        if ($rafraichir && ($app = $this->resoudreAppareil($active))) {
+            $session->appareil_wifi_id = $app->id;
+        }
+
+        if (empty($session->ssid)) {
+            $session->ssid = $this->resoudreSsid($active);
+        }
+
+        if ($session->etat_wifi === Session::WIFI_CONNECTE) {
+            $vol  = $this->calculerVolumes($active);
+            $base = Cache::get(self::PREFIXE_VOLUME_BASE . $session->id);
+            $baseEntree = is_array($base) ? (int) ($base['entree'] ?? 0) : 0;
+            $baseSortie = is_array($base) ? (int) ($base['sortie'] ?? 0) : 0;
+
+            $session->volume_entree = $vol['volume_entree'] + $baseEntree;
+            $session->volume_sortie = $vol['volume_sortie'] + $baseSortie;
+            $session->volume_total  = $session->volume_entree + $session->volume_sortie;
+            $session->duree_consommee = (int) floor($session->secondesConsommees() / 60);
+        }
+
+        $session->save();
+    }
+
+    private function marquerSessionsDisparues(array $idsPresents): int
+    {
+        $query = Session::where('type_session', 'wifi')
+            ->where('etat_wifi', Session::WIFI_CONNECTE)
+            ->whereNotNull('mikrotik_active_id');
+
+        if (!empty($idsPresents)) {
+            $query->whereNotIn('mikrotik_active_id', $idsPresents);
+        }
+
+        $candidats = $query->get();
+        if ($candidats->isEmpty()) return 0;
+
+        $relecture = $this->relireEtatActuel();
+        if ($relecture === null) return 0;
+
+        $n = 0;
+        $maintenant = now()->getTimestamp();
+
+        foreach ($candidats as $s) {
+            $cle = self::PREFIXE_ABSENCE . $s->id;
+
+            if ($this->sessionEncorePresente($s, $relecture)) {
+                Cache::forget($cle);
+                continue;
+            }
+
+            $abs = Cache::get($cle);
+            if (!is_array($abs)) $abs = ['depuis' => $maintenant, 'n' => 0];
+
+            $abs['n'] = (int) $abs['n'] + 1;
+            Cache::put($cle, $abs, 120);
+
+            if ($abs['n'] < self::ABSENCE_SYNCS_MIN
+                || ($maintenant - (int) $abs['depuis']) < self::ABSENCE_SECONDES_MIN) {
+                continue;
+            }
+
+            $moment = Carbon::createFromTimestamp((int) $abs['depuis']);
+
+            $s->etat_wifi        = Session::WIFI_DECONNECTE;
+            $s->deconnecte_at    = $moment;
+            $s->derniere_sync_at = now();
+            $s->duree_consommee  = (int) floor($s->secondesConsommees() / 60);
+
+            if ($s->alarme_active && $s->alarme_fin_prevue) {
+                $restant = $s->alarme_fin_prevue->getTimestamp() - $moment->getTimestamp();
+                if ($restant > 0) {
+                    $s->alarme_secondes_restantes = $restant;
+                    $s->alarme_fin_prevue = null;
+                }
+            }
+
+            $s->save();
+            Cache::forget($cle);
+            $n++;
+        }
+
+        return $n;
+    }
+
+    private function relireEtatActuel(): ?array
+    {
+        usleep(self::RELECTURE_PAUSE_US);
+
+        try {
+            $actives = $this->mikroTik->listHotspotActive();
+        } catch (\Throwable $e) {
+            Log::warning('Sync Wi-Fi : relecture de confirmation impossible', ['error' => $e->getMessage()]);
+            return null;
+        }
+
+        try {
+            $reg = [];
+            foreach ($this->mikroTik->listWirelessRegistrationTable() as $r) {
+                $m = AppareilWifi::normaliserMac($r['mac-address'] ?? null);
+                if ($m) $reg[$m] = $r;
+            }
+        } catch (\Throwable $e) {
+            $reg = null;
+        }
+
+        return ['actives' => $actives, 'reg' => $reg];
+    }
+
+    private function sessionEncorePresente(Session $s, array $relecture): bool
+    {
+        $ancienneTable  = $this->regTable;
+        $this->regTable = $relecture['reg'];
+
+        try {
+            foreach ($relecture['actives'] as $a) {
+                $id = (string) ($a['.id'] ?? '');
+                if ($id === '') continue;
+
+                $mac      = AppareilWifi::normaliserMac($a['mac-address'] ?? null);
+                $username = (($a['user'] ?? '') !== '') ? $a['user'] : null;
+
+                if ($this->correspond($s, $id, $mac, $username) && $this->estPresent($a)) {
+                    return true;
+                }
+            }
+        } finally {
+            $this->regTable = $ancienneTable;
+        }
+
+        return false;
+    }
+
+    private function resoudreSsid(array $active): ?string
+    {
+        $mac = AppareilWifi::normaliserMac($active['mac-address'] ?? null);
+
+        if ($mac) {
+            $reg = ($this->regTable ?? [])[$mac] ?? [];
+            $iface = $reg['interface'] ?? null;
+
+            if ($iface) {
+                $wifi = $this->wirelessPourInterface($iface);
+                if (!empty($wifi['ssid'])) return mb_substr($wifi['ssid'], 0, 64);
+            }
+        }
+
+        $serveur = $active['server'] ?? null;
+        if ($serveur) {
+            $table = config('mikrotik.ssid_map', []);
+            if (isset($table[$serveur])) return mb_substr($table[$serveur], 0, 64);
+        }
+
+        $defaut = config('mikrotik.ssid_default');
+        return $defaut ? mb_substr($defaut, 0, 64) : null;
+    }
+
+    private function wirelessPourInterface(string $iface): array
+    {
+        if ($this->wireless === null) {
+            $this->wireless = [];
+            try {
+                foreach ($this->mikroTik->listWirelessInterfaces() as $w) {
+                    $name = $w['name'] ?? null;
+                    if ($name) $this->wireless[$name] = $w;
+                }
+            } catch (\Throwable $e) {}
+        }
+        return $this->wireless[$iface] ?? [];
+    }
+
+    private function resoudreAppareil(array $active): ?AppareilWifi
+    {
+        $mac = AppareilWifi::normaliserMac($active['mac-address'] ?? null);
+        if (!$mac) return null;
+
+        $bail = $this->bailPourMac($mac);
+
+        $appareil = AppareilWifi::trouverOuCreerParMac($mac, [
+            'adresse_ip' => $active['address'] ?? ($bail['address'] ?? null),
+            'host_name'  => $bail['host-name'] ?? null,
+        ]);
+
+        if (!$appareil->wasRecentlyCreated) {
+            $derniere = $appareil->derniere_connexion;
+            if (!$derniere || (now()->getTimestamp() - $derniere->getTimestamp()) > 60) {
+                $appareil->toucherDerniereConnexion();
+            }
+        }
+
+        return $appareil;
+    }
+
+    private function calculerVolumes(array $active): array
+    {
+        $bytesIn  = (int) ($active['bytes-in']  ?? 0);
+        $bytesOut = (int) ($active['bytes-out'] ?? 0);
+
+        return [
+            'volume_entree' => $bytesOut,
+            'volume_sortie' => $bytesIn,
+            'volume_total'  => $bytesIn + $bytesOut,
+        ];
+    }
+
+    private function bailPourMac(string $mac): array
+    {
+        if ($this->baux === null) {
+            $this->baux = [];
+            try {
+                foreach ($this->mikroTik->listDhcpLeases() as $bail) {
+                    $m = AppareilWifi::normaliserMac($bail['mac-address'] ?? null);
+                    if ($m) $this->baux[$m] = $bail;
+                }
+            } catch (\Throwable $e) {}
+        }
+        return $this->baux[$mac] ?? [];
+    }
+
+    private function parseUptime(string $uptime): int
+    {
+        $t = 0;
+        if (preg_match('/(\d+)w/', $uptime, $m)) $t += (int)$m[1] * 604800;
+        if (preg_match('/(\d+)d/', $uptime, $m)) $t += (int)$m[1] * 86400;
+        if (preg_match('/(\d+)h/', $uptime, $m)) $t += (int)$m[1] * 3600;
+        if (preg_match('/(\d+)m(?!s)/', $uptime, $m)) $t += (int)$m[1] * 60;
+        if (preg_match('/(\d+)s/', $uptime, $m)) $t += (int)$m[1];
+        return $t;
+    }
+}
+
+################################################################################
+# app/Services/AccesInternetService.php
+################################################################################
+<?php
+
+namespace App\Services;
+
+use App\Models\Poste;
+use Illuminate\Support\Facades\Cache;
+use Illuminate\Support\Facades\Log;
+
+/**
+ * Contrôle d'accès Internet d'un poste, SANS identifiant.
+ * Principe : le serveur autorise / retire l'adresse MAC du poste sur le routeur.
+ * Pilote disponible : MikroTik (HotSpot, ip-binding). Sans routeur configuré : « non contrôlé » (rien ne casse).
+ */
+final class AccesInternetService
+{
+    public const AUTORISE = 'autorise';
+    public const COUPE    = 'coupe';
+    public const ERREUR   = 'erreur';
+    public const NON_GERE = 'non_gere';
+
+    private const MARQUE = 'Cyber Manager - Poste';
+
+    public function disponible(): bool
+    {
+        return (new MikroTikService())->estConfigure();
+    }
+
+    /** @return bool|null true = fait, false = échec routeur, null = aucun routeur (non contrôlé) */
+    public function autoriser(Poste $poste): ?bool
+    {
+        return $this->appliquer($poste, true);
+    }
+
+    public function couper(Poste $poste): ?bool
+    {
+        return $this->appliquer($poste, false);
+    }
+
+    /** Règle unique : Internet seulement si la session tourne ET que le poste donne signe de vie. */
+    public function souhaite(Poste $poste): bool
+    {
+        $s = $poste->sessionActive();
+
+        return $s !== null && $s->etat === 'en_cours' && $poste->estEnLigne();
+    }
+
+    /**
+     * Remet les routeurs d'aplomb (au plus une fois / 10 s). Appelé par les heartbeats et la page Postes.
+     * Un poste qui disparaît (câble, panne, agent tué) perd Internet environ 30 s plus tard.
+     */
+    public function reconcilierTous(): void
+    {
+        if (Cache::has('acces.pause') || !Cache::add('acces.reconcilier', 1, 10)) {
+            return;
+        }
+
+        try {
+            if (!$this->disponible()) {
+                return;
+            }
+
+            $postes = Poste::whereNotNull('adresse_mac')->where('adresse_mac', '!=', '')->get();
+            foreach ($postes as $p) {
+                $voulu = $this->souhaite($p);
+                if ($p->internet_etat === ($voulu ? self::AUTORISE : self::COUPE)) {
+                    continue;
+                }
+                if ($this->appliquer($p, $voulu) === false) {
+                    Cache::put('acces.pause', 1, 30);   // routeur en panne : on ne bloque pas les requêtes
+                    break;
+                }
+            }
+        } catch (\Throwable $e) {
+            Log::warning('Accès Internet : réconciliation échouée (' . $e->getMessage() . ').');
+        }
+    }
+
+    private function appliquer(Poste $poste, bool $autoriser): ?bool
+    {
+        $mt = new MikroTikService(['timeout' => 3.0]);
+
+        if (!$mt->estConfigure()) {
+            $this->noter($poste, self::NON_GERE);
+            return null;
+        }
+
+        $mac = trim((string) $poste->adresse_mac);
+        if ($mac === '') {
+            $this->noter($poste, self::ERREUR);
+            return false;
+        }
+
+        try {
+            if ($autoriser) {
+                $mt->autoriserMac($mac, self::MARQUE . ' : ' . $poste->nom_poste);
+            } else {
+                $mt->revoquerMac($mac);
+            }
+        } catch (\Throwable $e) {
+            Log::warning("Internet du poste « {$poste->nom_poste} » : commande routeur échouée ({$e->getMessage()}).");
+            $this->noter($poste, self::ERREUR);
+            return false;
+        }
+
+        $this->noter($poste, $autoriser ? self::AUTORISE : self::COUPE);
+        return true;
+    }
+
+    private function noter(Poste $poste, string $etat): void
+    {
+        Poste::whereKey($poste->id)->update(['internet_etat' => $etat, 'internet_maj_at' => now()]);
+        $poste->internet_etat = $etat;
+    }
+}
+
+################################################################################
+# app/Services/SessionExpirationService.php
+################################################################################
+<?php
+
+namespace App\Services;
+
+use App\Models\Session;
+
+class SessionExpirationService
+{
+    public function __construct(
+        private SessionService $sessionService
+    ) {
+    }
+
+    public function verifierSessions(): int
+    {
+        $sessions = Session::where('etat', 'en_cours')->get();
+
+        $expirees = 0;
+
+        foreach ($sessions as $session) {
+            $etatAvant = $session->etat;
+
+            $sessionMiseAJour = $this->sessionService
+                ->mettreAJourConsommation($session);
+
+            if (
+                $etatAvant === 'en_cours'
+                && $sessionMiseAJour->etat === 'expiree'
+            ) {
+                $expirees++;
+            }
+        }
+
+        return $expirees;
+    }
+}
+
+################################################################################
+# config/database.php
+################################################################################
+<?php
+
+use Illuminate\Support\Str;
+use Pdo\Mysql;
+
+return [
+
+    /*
+    |--------------------------------------------------------------------------
+    | Default Database Connection Name
+    |--------------------------------------------------------------------------
+    |
+    | Here you may specify which of the database connections below you wish
+    | to use as your default connection for database operations. This is
+    | the connection which will be utilized unless another connection
+    | is explicitly specified when you execute a query / statement.
+    |
+    */
+
+    'default' => env('DB_CONNECTION', 'sqlite'),
+
+    /*
+    |--------------------------------------------------------------------------
+    | Database Connections
+    |--------------------------------------------------------------------------
+    |
+    | Below are all of the database connections defined for your application.
+    | An example configuration is provided for each database system which
+    | is supported by Laravel. You're free to add / remove connections.
+    |
+    */
+
+    'connections' => [
+
+        'sqlite' => [
+            'driver' => 'sqlite',
+            'url' => env('DB_URL'),
+            'database' => env('DB_DATABASE', database_path('database.sqlite')),
+            'prefix' => '',
+            'foreign_key_constraints' => env('DB_FOREIGN_KEYS', true),
+            'busy_timeout' => null,
+            'journal_mode' => null,
+            'synchronous' => null,
+            'transaction_mode' => 'DEFERRED',
+        ],
+
+        'mysql' => [
+            'driver' => 'mysql',
+            'url' => env('DB_URL'),
+            'host' => env('DB_HOST', '127.0.0.1'),
+            'port' => env('DB_PORT', '3306'),
+            'database' => env('DB_DATABASE', 'laravel'),
+            'username' => env('DB_USERNAME', 'root'),
+            'password' => env('DB_PASSWORD', ''),
+            'unix_socket' => env('DB_SOCKET', ''),
+            'charset' => env('DB_CHARSET', 'utf8mb4'),
+            'collation' => env('DB_COLLATION', 'utf8mb4_unicode_ci'),
+            'prefix' => '',
+            'prefix_indexes' => true,
+            'strict' => true,
+            'engine' => null,
+            'options' => extension_loaded('pdo_mysql') ? array_filter([
+                (PHP_VERSION_ID >= 80500 ? Mysql::ATTR_SSL_CA : PDO::MYSQL_ATTR_SSL_CA) => env('MYSQL_ATTR_SSL_CA'),
+            ]) : [],
+        ],
+
+        'mariadb' => [
+            'driver' => 'mariadb',
+            'url' => env('DB_URL'),
+            'host' => env('DB_HOST', '127.0.0.1'),
+            'port' => env('DB_PORT', '3306'),
+            'database' => env('DB_DATABASE', 'laravel'),
+            'username' => env('DB_USERNAME', 'root'),
+            'password' => env('DB_PASSWORD', ''),
+            'unix_socket' => env('DB_SOCKET', ''),
+            'charset' => env('DB_CHARSET', 'utf8mb4'),
+            'collation' => env('DB_COLLATION', 'utf8mb4_unicode_ci'),
+            'prefix' => '',
+            'prefix_indexes' => true,
+            'strict' => true,
+            'engine' => null,
+            'options' => extension_loaded('pdo_mysql') ? array_filter([
+                (PHP_VERSION_ID >= 80500 ? Mysql::ATTR_SSL_CA : PDO::MYSQL_ATTR_SSL_CA) => env('MYSQL_ATTR_SSL_CA'),
+            ]) : [],
+        ],
+
+        'pgsql' => [
+            'driver' => 'pgsql',
+            'url' => env('DB_URL'),
+            'host' => env('DB_HOST', '127.0.0.1'),
+            'port' => env('DB_PORT', '5432'),
+            'database' => env('DB_DATABASE', 'laravel'),
+            'username' => env('DB_USERNAME', 'root'),
+            'password' => env('DB_PASSWORD', ''),
+            'charset' => env('DB_CHARSET', 'utf8'),
+            'prefix' => '',
+            'prefix_indexes' => true,
+            'search_path' => 'public',
+            'sslmode' => env('DB_SSLMODE', 'prefer'),
+        ],
+
+        'sqlsrv' => [
+            'driver' => 'sqlsrv',
+            'url' => env('DB_URL'),
+            'host' => env('DB_HOST', 'localhost'),
+            'port' => env('DB_PORT', '1433'),
+            'database' => env('DB_DATABASE', 'laravel'),
+            'username' => env('DB_USERNAME', 'root'),
+            'password' => env('DB_PASSWORD', ''),
+            'charset' => env('DB_CHARSET', 'utf8'),
+            'prefix' => '',
+            'prefix_indexes' => true,
+            // 'encrypt' => env('DB_ENCRYPT', 'yes'),
+            // 'trust_server_certificate' => env('DB_TRUST_SERVER_CERTIFICATE', 'false'),
+        ],
+
+    ],
+
+    /*
+    |--------------------------------------------------------------------------
+    | Migration Repository Table
+    |--------------------------------------------------------------------------
+    |
+    | This table keeps track of all the migrations that have already run for
+    | your application. Using this information, we can determine which of
+    | the migrations on disk haven't actually been run on the database.
+    |
+    */
+
+    'migrations' => [
+        'table' => 'migrations',
+        'update_date_on_publish' => true,
+    ],
+
+    /*
+    |--------------------------------------------------------------------------
+    | Redis Databases
+    |--------------------------------------------------------------------------
+    |
+    | Redis is an open source, fast, and advanced key-value store that also
+    | provides a richer body of commands than a typical key-value system
+    | such as Memcached. You may define your connection settings here.
+    |
+    */
+
+    'redis' => [
+
+        'client' => env('REDIS_CLIENT', 'phpredis'),
+
+        'options' => [
+            'cluster' => env('REDIS_CLUSTER', 'redis'),
+            'prefix' => env('REDIS_PREFIX', Str::slug((string) env('APP_NAME', 'laravel')).'-database-'),
+            'persistent' => env('REDIS_PERSISTENT', false),
+        ],
+
+        'default' => [
+            'url' => env('REDIS_URL'),
+            'host' => env('REDIS_HOST', '127.0.0.1'),
+            'username' => env('REDIS_USERNAME'),
+            'password' => env('REDIS_PASSWORD'),
+            'port' => env('REDIS_PORT', '6379'),
+            'database' => env('REDIS_DB', '0'),
+            'max_retries' => env('REDIS_MAX_RETRIES', 3),
+            'backoff_algorithm' => env('REDIS_BACKOFF_ALGORITHM', 'decorrelated_jitter'),
+            'backoff_base' => env('REDIS_BACKOFF_BASE', 100),
+            'backoff_cap' => env('REDIS_BACKOFF_CAP', 1000),
+        ],
+
+        'cache' => [
+            'url' => env('REDIS_URL'),
+            'host' => env('REDIS_HOST', '127.0.0.1'),
+            'username' => env('REDIS_USERNAME'),
+            'password' => env('REDIS_PASSWORD'),
+            'port' => env('REDIS_PORT', '6379'),
+            'database' => env('REDIS_CACHE_DB', '1'),
+            'max_retries' => env('REDIS_MAX_RETRIES', 3),
+            'backoff_algorithm' => env('REDIS_BACKOFF_ALGORITHM', 'decorrelated_jitter'),
+            'backoff_base' => env('REDIS_BACKOFF_BASE', 100),
+            'backoff_cap' => env('REDIS_BACKOFF_CAP', 1000),
+        ],
+
+    ],
+
+];
+
+
+================================================================================
+MIGRATIONS DU PROJET (56 fichiers)
+================================================================================
+
+################################################################################
+# database\migrations\0001_01_01_000000_create_users_table.php
+################################################################################
+<?php
+
+use Illuminate\Database\Migrations\Migration;
+use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Support\Facades\Schema;
+
+return new class extends Migration
+{
+    /**
+     * Run the migrations.
+     */
+    public function up(): void
+    {
+        Schema::create('users', function (Blueprint $table) {
+            $table->id();
+            $table->string('name');
+            $table->string('email')->unique();
+            $table->timestamp('email_verified_at')->nullable();
+            $table->string('password');
+            $table->rememberToken();
+            $table->timestamps();
+        });
+
+        Schema::create('password_reset_tokens', function (Blueprint $table) {
+            $table->string('email')->primary();
+            $table->string('token');
+            $table->timestamp('created_at')->nullable();
+        });
+
+        Schema::create('sessions', function (Blueprint $table) {
+            $table->string('id')->primary();
+            $table->foreignId('user_id')->nullable()->index();
+            $table->string('ip_address', 45)->nullable();
+            $table->text('user_agent')->nullable();
+            $table->longText('payload');
+            $table->integer('last_activity')->index();
+        });
+    }
+
+    /**
+     * Reverse the migrations.
+     */
+    public function down(): void
+    {
+        Schema::dropIfExists('users');
+        Schema::dropIfExists('password_reset_tokens');
+        Schema::dropIfExists('sessions');
+    }
+};
+
+
+################################################################################
+# database\migrations\0001_01_01_000001_create_cache_table.php
+################################################################################
+<?php
+
+use Illuminate\Database\Migrations\Migration;
+use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Support\Facades\Schema;
+
+return new class extends Migration
+{
+    /**
+     * Run the migrations.
+     */
+    public function up(): void
+    {
+        Schema::create('cache', function (Blueprint $table) {
+            $table->string('key')->primary();
+            $table->mediumText('value');
+            $table->integer('expiration')->index();
+        });
+
+        Schema::create('cache_locks', function (Blueprint $table) {
+            $table->string('key')->primary();
+            $table->string('owner');
+            $table->integer('expiration')->index();
+        });
+    }
+
+    /**
+     * Reverse the migrations.
+     */
+    public function down(): void
+    {
+        Schema::dropIfExists('cache');
+        Schema::dropIfExists('cache_locks');
+    }
+};
+
+
+################################################################################
+# database\migrations\0001_01_01_000002_create_jobs_table.php
+################################################################################
+<?php
+
+use Illuminate\Database\Migrations\Migration;
+use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Support\Facades\Schema;
+
+return new class extends Migration
+{
+    /**
+     * Run the migrations.
+     */
+    public function up(): void
+    {
+        Schema::create('jobs', function (Blueprint $table) {
+            $table->id();
+            $table->string('queue')->index();
+            $table->longText('payload');
+            $table->unsignedTinyInteger('attempts');
+            $table->unsignedInteger('reserved_at')->nullable();
+            $table->unsignedInteger('available_at');
+            $table->unsignedInteger('created_at');
+        });
+
+        Schema::create('job_batches', function (Blueprint $table) {
+            $table->string('id')->primary();
+            $table->string('name');
+            $table->integer('total_jobs');
+            $table->integer('pending_jobs');
+            $table->integer('failed_jobs');
+            $table->longText('failed_job_ids');
+            $table->mediumText('options')->nullable();
+            $table->integer('cancelled_at')->nullable();
+            $table->integer('created_at');
+            $table->integer('finished_at')->nullable();
+        });
+
+        Schema::create('failed_jobs', function (Blueprint $table) {
+            $table->id();
+            $table->string('uuid')->unique();
+            $table->text('connection');
+            $table->text('queue');
+            $table->longText('payload');
+            $table->longText('exception');
+            $table->timestamp('failed_at')->useCurrent();
+        });
+    }
+
+    /**
+     * Reverse the migrations.
+     */
+    public function down(): void
+    {
+        Schema::dropIfExists('jobs');
+        Schema::dropIfExists('job_batches');
+        Schema::dropIfExists('failed_jobs');
+    }
+};
+
+
+################################################################################
+# database\migrations\2026_09_21_195542_create_postes_table.php
+################################################################################
+<?php
+
+use Illuminate\Database\Migrations\Migration;
+use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Support\Facades\Schema;
+
+return new class extends Migration
+{
+    /**
+     * Run the migrations.
+     */
+    public function up(): void
+    {
+        Schema::create('postes', function (Blueprint $table) {
+   		$table->id();
+    		$table->string('nom_poste');
+    		$table->string('nom_windows')->nullable();
+    		$table->string('adresse_mac')->nullable();
+    		$table->string('adresse_ip')->nullable();
+    		$table->string('type_connexion')->default('ethernet');
+    		$table->string('etat')->default('disponible');
+    		$table->boolean('actif')->default(true);
+    		$table->timestamp('derniere_communication')->nullable();
+    		$table->timestamps();
+	});
+    }
+
+    /**
+     * Reverse the migrations.
+     */
+    public function down(): void
+    {
+        Schema::dropIfExists('postes');
+    }
+};
+
+
+################################################################################
+# database\migrations\2026_09_21_214819_create_sessions_table.php
+################################################################################
+<?php
+
+use Illuminate\Database\Migrations\Migration;
+use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Support\Facades\Schema;
+
+return new class extends Migration
+{
+    /**
+     * Run the migrations.
+     */
+    public function up(): void
+    {
+	Schema::create('cyber_sessions', function (Blueprint $table) {
+    		$table->id();
+
+    		$table->foreignId('poste_id')
+       			->nullable()
+        		->constrained('postes')
+        		->nullOnDelete();
+
+    		$table->string('type_session'); // ethernet ou wifi
+
+    		$table->dateTime('date_heure_debut')->nullable();
+    		$table->dateTime('date_heure_fin_prevue')->nullable();
+    		$table->dateTime('date_heure_fin_reelle')->nullable();
+
+    		$table->unsignedInteger('duree_prevue')->default(0);
+    		$table->unsignedInteger('duree_consommee')->default(0);
+    		$table->unsignedInteger('temps_restant')->default(0);
+
+    		$table->unsignedInteger('montant_initial')->default(0);
+    		$table->unsignedInteger('montant_recharge')->default(0);
+    		$table->unsignedInteger('montant_total')->default(0);
+    		$table->unsignedInteger('montant_consomme')->default(0);
+    		$table->unsignedInteger('montant_restant')->default(0);
+    		$table->unsignedInteger('montant_a_reverser')->default(0);
+
+    		$table->text('description')->nullable();
+
+    		$table->string('etat')->default('en_attente');
+    		$table->string('motif_fin')->nullable();
+
+    		$table->unsignedBigInteger('volume_entree')->default(0);
+    		$table->unsignedBigInteger('volume_sortie')->default(0);
+    		$table->unsignedBigInteger('volume_total')->default(0);
+
+    		$table->timestamps();
+	});
+    }
+
+    /**
+     * Reverse the migrations.
+     */
+    public function down(): void
+    {
+        Schema::dropIfExists('sessions');
+    }
+};
+
+
+################################################################################
+# database\migrations\2026_09_21_224351_add_suspension_fields_to_cyber_sessions_table.php
+################################################################################
+<?php
+
+use Illuminate\Database\Migrations\Migration;
+use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Support\Facades\Schema;
+
+return new class extends Migration
+{
+    /**
+     * Run the migrations.
+     */
+public function up(): void
+{
+    Schema::table('cyber_sessions', function (Blueprint $table) {
+        $table->dateTime('date_heure_suspension')->nullable()->after('date_heure_fin_reelle');
+        $table->dateTime('date_heure_reprise')->nullable()->after('date_heure_suspension');
+    });
+}
+
+    /**
+     * Reverse the migrations.
+     */
+public function down(): void
+{
+    Schema::table('cyber_sessions', function (Blueprint $table) {
+        $table->dropColumn([
+            'date_heure_suspension',
+            'date_heure_reprise',
+        ]);
+    });
+}
+};
+
+
+################################################################################
+# database\migrations\2026_09_21_225723_add_duree_suspension_to_cyber_sessions_table.php
+################################################################################
+<?php
+
+use Illuminate\Database\Migrations\Migration;
+use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Support\Facades\Schema;
+
+return new class extends Migration
+{
+    /**
+     * Run the migrations.
+     */
+    public function up(): void
+    {
+        Schema::table('cyber_sessions', function (Blueprint $table) {
+            $table->unsignedInteger('duree_suspension')
+                ->default(0)
+                ->after('date_heure_reprise');
+        });
+    }
+
+    /**
+     * Reverse the migrations.
+     */
+    public function down(): void
+    {
+        Schema::table('cyber_sessions', function (Blueprint $table) {
+            $table->dropColumn('duree_suspension');
+        });
+    }
+};
+
+################################################################################
+# database\migrations\2026_09_21_232745_create_recharges_table.php
+################################################################################
+<?php
+
+use Illuminate\Database\Migrations\Migration;
+use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Support\Facades\Schema;
+
+return new class extends Migration
+{
+    /**
+     * Run the migrations.
+     */
+    public function up(): void
+    {
+        Schema::create('recharges', function (Blueprint $table) {
+    $table->id();
+
+    $table->foreignId('session_id')
+        ->constrained('cyber_sessions')
+        ->cascadeOnDelete();
+
+    $table->dateTime('date_heure');
+
+    $table->unsignedInteger('montant');
+
+    $table->unsignedInteger('duree_ajoutee');
+
+    $table->text('description')->nullable();
+
+    $table->timestamps();
+});
+    }
+
+    /**
+     * Reverse the migrations.
+     */
+    public function down(): void
+    {
+        Schema::dropIfExists('recharges');
+    }
+};
+
+
+################################################################################
+# database\migrations\2026_09_22_150003_add_agent_url_to_postes_table.php
+################################################################################
+<?php
+
+use Illuminate\Database\Migrations\Migration;
+use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Support\Facades\Schema;
+
+return new class extends Migration
+{
+    public function up(): void
+    {
+        Schema::table('postes', function (Blueprint $table) {
+            $table->string('agent_url')->nullable()->after('derniere_communication');
+        });
+    }
+
+    public function down(): void
+    {
+        Schema::table('postes', function (Blueprint $table) {
+            $table->dropColumn('agent_url');
+        });
+    }
+};
+
+################################################################################
+# database\migrations\2026_09_25_083407_create_restitutions_table.php
+################################################################################
+<?php
+
+use Illuminate\Database\Migrations\Migration;
+use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Support\Facades\Schema;
+
+return new class extends Migration
+{
+    public function up(): void
+    {
+        Schema::create('restitutions', function (Blueprint $table) {
+            $table->id();
+
+            $table->foreignId('session_id')
+                ->constrained('cyber_sessions')
+                ->cascadeOnDelete();
+
+            $table->dateTime('date_heure');
+
+            $table->unsignedInteger('montant');
+
+            $table->string('motif');
+
+            $table->text('description')->nullable();
+
+            $table->timestamps();
+        });
+    }
+
+    public function down(): void
+    {
+        Schema::dropIfExists('restitutions');
+    }
+};
+
+################################################################################
+# database\migrations\2026_09_25_090141_create_tarifs_table.php
+################################################################################
+<?php
+
+use Illuminate\Database\Migrations\Migration;
+use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Support\Facades\Schema;
+
+return new class extends Migration
+{
+    /**
+     * Run the migrations.
+     */
+    public function up(): void
+    {
+        Schema::create('tarifs', function (Blueprint $table) {
+            $table->id();
+            $table->timestamps();
+        });
+    }
+
+    /**
+     * Reverse the migrations.
+     */
+    public function down(): void
+    {
+        Schema::dropIfExists('tarifs');
+    }
+};
+
+
+################################################################################
+# database\migrations\2026_09_25_090317_add_tarif_id_to_cyber_sessions_table.php
+################################################################################
+<?php
+
+use Illuminate\Database\Migrations\Migration;
+use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Support\Facades\Schema;
+
+return new class extends Migration
+{
+    public function up(): void
+    {
+        Schema::table('cyber_sessions', function (Blueprint $table) {
+            $table->foreignId('tarif_id')
+                ->nullable()
+                ->after('poste_id')
+                ->constrained('tarifs')
+                ->nullOnDelete();
+        });
+    }
+
+    public function down(): void
+    {
+        Schema::table('cyber_sessions', function (Blueprint $table) {
+            $table->dropForeign(['tarif_id']);
+            $table->dropColumn('tarif_id');
+        });
+    }
+};
+
+################################################################################
+# database\migrations\2026_09_25_090551_add_details_to_tarifs_table.php
+################################################################################
+<?php
+
+use Illuminate\Database\Migrations\Migration;
+use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Support\Facades\Schema;
+
+return new class extends Migration
+{
+    public function up(): void
+    {
+        Schema::table('tarifs', function (Blueprint $table) {
+            $table->string('nom')->after('id');
+            $table->unsignedInteger('montant_par_minute')->default(20);
+            $table->unsignedInteger('montant_minimum')->default(300);
+            $table->boolean('actif')->default(true);
+            $table->boolean('personnalise')->default(false);
+            $table->text('description')->nullable();
+        });
+    }
+
+    public function down(): void
+    {
+        Schema::table('tarifs', function (Blueprint $table) {
+            $table->dropColumn([
+                'nom',
+                'montant_par_minute',
+                'montant_minimum',
+                'actif',
+                'personnalise',
+                'description',
+            ]);
+        });
+    }
+};
+
+################################################################################
+# database\migrations\2026_09_25_093109_create_lot_vouchers_table.php
+################################################################################
+<?php
+
+use Illuminate\Database\Migrations\Migration;
+use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Support\Facades\Schema;
+
+return new class extends Migration
+{
+    public function up(): void
+    {
+        Schema::create('lot_vouchers', function (Blueprint $table) {
+            $table->id();
+
+            $table->string('nom');
+
+            $table->unsignedInteger('quantite_prevue');
+
+            $table->unsignedInteger('montant_unitaire');
+
+            $table->unsignedInteger('duree_unitaire');
+
+            $table->unsignedInteger('quantite_generee')->default(0);
+
+            $table->string('source')->default('cyber_manager');
+
+            $table->text('description')->nullable();
+
+            $table->timestamps();
+        });
+    }
+
+    public function down(): void
+    {
+        Schema::dropIfExists('lot_vouchers');
+    }
+};
+
+################################################################################
+# database\migrations\2026_09_25_093115_create_vouchers_table.php
+################################################################################
+<?php
+
+use Illuminate\Database\Migrations\Migration;
+use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Support\Facades\Schema;
+
+return new class extends Migration
+{
+    public function up(): void
+    {
+        Schema::create('vouchers', function (Blueprint $table) {
+            $table->id();
+
+            $table->foreignId('lot_voucher_id')
+                ->nullable()
+                ->constrained('lot_vouchers')
+                ->nullOnDelete();
+
+            /*
+             * Identifiants réellement utilisés par le HotSpot MikroTik.
+             */
+            $table->string('username')->unique();
+
+            $table->string('password');
+
+            /*
+             * Code affichable/imprimable pour le client.
+             * Dans notre fonctionnement, il peut correspondre
+             * au password/code HotSpot.
+             */
+            $table->string('code')->unique();
+
+            $table->unsignedInteger('montant');
+
+            $table->unsignedInteger('duree');
+
+            /*
+             * disponible
+             * utilise
+             * expire
+             * annule
+             */
+            $table->string('etat')->default('disponible');
+
+            /*
+             * cyber_manager = créé par Cyber Manager
+             * mikrotik = récupéré depuis MikroTik/Mikhmon
+             * manuel = créé manuellement
+             */
+            $table->string('source')->default('cyber_manager');
+
+            /*
+             * Identifiant du compte HotSpot sur MikroTik
+             * lorsqu'il est synchronisé.
+             */
+            $table->string('mikrotik_id')->nullable();
+
+            $table->dateTime('date_heure_creation');
+
+            $table->dateTime('date_heure_utilisation')->nullable();
+
+            $table->dateTime('date_heure_expiration')->nullable();
+
+            $table->dateTime('derniere_synchronisation')->nullable();
+
+            $table->text('description')->nullable();
+
+            $table->timestamps();
+
+            $table->index('etat');
+            $table->index('username');
+            $table->index('source');
+        });
+    }
+
+    public function down(): void
+    {
+        Schema::dropIfExists('vouchers');
+    }
+};
+
+################################################################################
+# database\migrations\2026_09_25_093259_add_voucher_id_to_cyber_sessions_table.php
+################################################################################
+<?php
+
+use Illuminate\Database\Migrations\Migration;
+use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Support\Facades\Schema;
+
+return new class extends Migration
+{
+    public function up(): void
+    {
+        Schema::table('cyber_sessions', function (Blueprint $table) {
+            $table->foreignId('voucher_id')
+                ->nullable()
+                ->after('tarif_id')
+                ->constrained('vouchers')
+                ->nullOnDelete();
+        });
+    }
+
+    public function down(): void
+    {
+        Schema::table('cyber_sessions', function (Blueprint $table) {
+            $table->dropForeign(['voucher_id']);
+            $table->dropColumn('voucher_id');
+        });
+    }
+};
+
+################################################################################
+# database\migrations\2026_09_28_150000_add_mikrotik_sync_to_vouchers_table.php
+################################################################################
+<?php
+
+use Illuminate\Database\Migrations\Migration;
+use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Support\Facades\Schema;
+
+return new class extends Migration
+{
+    public function up(): void
+    {
+        Schema::table('vouchers', function (Blueprint $table) {
+            $table->timestamp('mikrotik_synced_at')->nullable();
+            $table->text('mikrotik_sync_error')->nullable();
+        });
+    }
+
+    public function down(): void
+    {
+        Schema::table('vouchers', function (Blueprint $table) {
+            $table->dropColumn(['mikrotik_synced_at', 'mikrotik_sync_error']);
+        });
+    }
+};
+
+################################################################################
+# database\migrations\2026_09_28_200000_add_wifi_fields_to_sessions_table.php
+################################################################################
+<?php
+
+use Illuminate\Database\Migrations\Migration;
+use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Support\Facades\Schema;
+
+return new class extends Migration
+{
+    public function up(): void
+    {
+        Schema::table('cyber_sessions', function (Blueprint $table) {
+            $table->string('mikrotik_active_id')->nullable()->after('voucher_id');
+            $table->string('hotspot_username')->nullable()->after('mikrotik_active_id');
+            $table->string('client_mac')->nullable()->after('hotspot_username');
+            $table->string('client_ip')->nullable()->after('client_mac');
+            $table->timestamp('derniere_sync_at')->nullable()->after('client_ip');
+
+            $table->index('mikrotik_active_id');
+            $table->index('hotspot_username');
+        });
+    }
+
+    public function down(): void
+    {
+        Schema::table('cyber_sessions', function (Blueprint $table) {
+            $table->dropIndex(['mikrotik_active_id']);
+            $table->dropIndex(['hotspot_username']);
+            $table->dropColumn([
+                'mikrotik_active_id',
+                'hotspot_username',
+                'client_mac',
+                'client_ip',
+                'derniere_sync_at',
+            ]);
+        });
+    }
+};
+
+################################################################################
+# database\migrations\2026_09_28_210000_create_appareils_wifi_table.php
+################################################################################
+<?php
+
+use Illuminate\Database\Migrations\Migration;
+use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Support\Facades\Schema;
+
+return new class extends Migration
+{
+    public function up(): void
+    {
+        Schema::create('appareils_wifi', function (Blueprint $table) {
+            $table->id();
+
+            // Le unique() crée déjà l'index sur adresse_mac.
+            // Format normalisé : AA:BB:CC:DD:EE:FF (17 caractères).
+            $table->string('adresse_mac', 17)->unique();
+
+            $table->string('adresse_ip', 45)->nullable(); // 45 = IPv6 max
+            $table->string('host_name')->nullable();
+
+            $table->enum('type_appareil', [
+                'telephone',
+                'ordinateur',
+                'tablette',
+                'inconnu',
+            ])->nullable();
+
+            $table->string('fabricant')->nullable();
+            $table->string('modele')->nullable();
+            $table->string('systeme')->nullable();
+            $table->text('user_agent')->nullable();
+
+            $table->timestamp('premiere_connexion')->nullable();
+            $table->timestamp('derniere_connexion')->nullable();
+
+            $table->timestamps();
+        });
+    }
+
+    public function down(): void
+    {
+        Schema::dropIfExists('appareils_wifi');
+    }
+};
+
+################################################################################
+# database\migrations\2026_09_28_210100_extend_vouchers_for_wifi.php
+################################################################################
+<?php
+
+use Illuminate\Database\Migrations\Migration;
+use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Schema;
+
+return new class extends Migration
+{
+    /** États autorisés (RG57). */
+    private const ETATS = [
+        'disponible',
+        'en_cours',
+        'utilise',
+        'expire',
+        'desactive',
+        'annule',
+    ];
+
+    public function up(): void
+    {
+        // Sécurité : la colonne etat est aujourd'hui un VARCHAR libre.
+        // Si une valeur hors liste existe, la conversion en ENUM la
+        // transformerait en '' (ou échouerait en mode strict) : on s'arrête.
+        $inconnus = DB::table('vouchers')
+            ->whereNotIn('etat', self::ETATS)
+            ->distinct()
+            ->pluck('etat');
+
+        if ($inconnus->isNotEmpty()) {
+            throw new RuntimeException(
+                'Migration annulée : valeurs de vouchers.etat non prévues : '
+                . $inconnus->implode(', ')
+                . '. Corrigez-les avant de relancer.'
+            );
+        }
+
+        // 1) Nouvelles colonnes + FK + index
+        Schema::table('vouchers', function (Blueprint $table) {
+            $table->enum('type_voucher', ['temporaire', 'permanent'])
+                ->default('temporaire')
+                ->after('source');
+
+            $table->foreignId('appareil_wifi_id')
+                ->nullable()
+                ->after('type_voucher')
+                ->constrained('appareils_wifi')
+                ->nullOnDelete();
+
+            $table->index(['type_voucher', 'etat'], 'vouchers_type_etat_index');
+        });
+
+        // 2) VARCHAR → ENUM élargi (les lignes existantes sont conservées)
+        $liste = "'" . implode("','", self::ETATS) . "'";
+        DB::statement(
+            "ALTER TABLE `vouchers` MODIFY `etat` ENUM({$liste}) NOT NULL DEFAULT 'disponible'"
+        );
+    }
+
+    public function down(): void
+    {
+        // Retour au VARCHAR d'origine (avant de retirer les colonnes)
+        DB::statement(
+            "ALTER TABLE `vouchers` MODIFY `etat` VARCHAR(255) NOT NULL DEFAULT 'disponible'"
+        );
+
+        Schema::table('vouchers', function (Blueprint $table) {
+            $table->dropIndex('vouchers_type_etat_index');
+            $table->dropForeign(['appareil_wifi_id']);
+            $table->dropColumn(['appareil_wifi_id', 'type_voucher']);
+        });
+    }
+};
+
+################################################################################
+# database\migrations\2026_09_28_210200_add_ssid_and_appareil_to_cyber_sessions.php
+################################################################################
+<?php
+
+use Illuminate\Database\Migrations\Migration;
+use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Support\Facades\Schema;
+
+return new class extends Migration
+{
+    public function up(): void
+    {
+        Schema::table('cyber_sessions', function (Blueprint $table) {
+            $table->string('ssid', 64)->nullable()->after('client_ip');
+
+            $table->foreignId('appareil_wifi_id')
+                ->nullable()
+                ->after('ssid')
+                ->constrained('appareils_wifi')
+                ->nullOnDelete();
+        });
+    }
+
+    public function down(): void
+    {
+        Schema::table('cyber_sessions', function (Blueprint $table) {
+            $table->dropForeign(['appareil_wifi_id']);
+            $table->dropColumn(['appareil_wifi_id', 'ssid']);
+        });
+    }
+};
+
+################################################################################
+# database\migrations\2026_09_29_100000_add_nom_to_vouchers_table.php
+################################################################################
+<?php
+
+use Illuminate\Database\Migrations\Migration;
+use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Schema;
+
+return new class extends Migration
+{
+    public function up(): void
+    {
+        Schema::table('vouchers', function (Blueprint $table) {
+            $table->string('nom', 100)->nullable()->after('username');
+        });
+
+        // Rétro-remplissage : les permanents existants (seeder étape 1)
+        // prennent leur username comme nom d'affichage.
+        DB::table('vouchers')
+            ->where('type_voucher', 'permanent')
+            ->whereNull('nom')
+            ->update(['nom' => DB::raw('username')]);
+    }
+
+    public function down(): void
+    {
+        Schema::table('vouchers', function (Blueprint $table) {
+            $table->dropColumn('nom');
+        });
+    }
+};
+
+################################################################################
+# database\migrations\2026_09_30_090000_simplify_vouchers_states.php
+################################################################################
+<?php
+
+use Illuminate\Database\Migrations\Migration;
+use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Schema;
+
+return new class extends Migration
+{
+    public function up(): void
+    {
+        // États conservés : disponible, en_cours, utilise.
+        // Les anciens expire/desactive/annule deviennent "utilise" :
+        // rien n'est supprimé automatiquement par cette migration,
+        // la suppression reste un geste manuel et volontaire.
+        DB::table('vouchers')
+            ->whereIn('etat', ['expire', 'desactive', 'annule'])
+            ->update(['etat' => 'utilise']);
+
+        DB::statement(
+            "ALTER TABLE `vouchers` MODIFY `etat` ENUM('disponible','en_cours','utilise') NOT NULL DEFAULT 'disponible'"
+        );
+
+        Schema::table('vouchers', function (Blueprint $table) {
+            // Protection manuelle contre la suppression accidentelle
+            // (ex : identifiant d'un poste Ethernet, accès familial...).
+            // Indépendant du type réutilisable/usage unique et de la source.
+            $table->boolean('protege')->default(false)->after('type_voucher');
+        });
+    }
+
+    public function down(): void
+    {
+        Schema::table('vouchers', function (Blueprint $table) {
+            $table->dropColumn('protege');
+        });
+
+        DB::statement(
+            "ALTER TABLE `vouchers` MODIFY `etat` ENUM('disponible','en_cours','utilise','expire','desactive','annule') NOT NULL DEFAULT 'disponible'"
+        );
+    }
+};
+
+################################################################################
+# database\migrations\2026_10_03_090000_add_mikrotik_fields_to_vouchers.php
+################################################################################
+<?php
+
+use Illuminate\Database\Migrations\Migration;
+use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Support\Facades\Schema;
+
+return new class extends Migration
+{
+    public function up(): void
+    {
+        Schema::table('vouchers', function (Blueprint $table) {
+            // Restreint l'identifiant à un serveur HotSpot précis côté MikroTik.
+            // null/"all" = valable sur tous les serveurs.
+            $table->string('serveur', 64)->nullable()->after('protege');
+
+            // Profil HotSpot MikroTik. null = profil par défaut de l'app.
+            $table->string('profil', 64)->nullable()->after('serveur');
+
+            // Plafond de données en Mo appliqué par le MikroTik (limit-bytes-total).
+            // null/0 = illimité.
+            $table->unsignedInteger('limite_data_mo')->nullable()->after('profil');
+        });
+    }
+
+    public function down(): void
+    {
+        Schema::table('vouchers', function (Blueprint $table) {
+            $table->dropColumn(['serveur', 'profil', 'limite_data_mo']);
+        });
+    }
+};
+
+################################################################################
+# database\migrations\2026_10_03_090100_add_nom_affichage_to_appareils_wifi.php
+################################################################################
+<?php
+
+use Illuminate\Database\Migrations\Migration;
+use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Support\Facades\Schema;
+
+return new class extends Migration
+{
+    public function up(): void
+    {
+        Schema::table('appareils_wifi', function (Blueprint $table) {
+            // Libellé choisi manuellement par le personnel, prioritaire sur host_name.
+            $table->string('nom_affichage', 100)->nullable()->after('host_name');
+        });
+    }
+
+    public function down(): void
+    {
+        Schema::table('appareils_wifi', function (Blueprint $table) {
+            $table->dropColumn('nom_affichage');
+        });
+    }
+};
+
+################################################################################
+# database\migrations\2026_10_03_090200_create_parametres_table.php
+################################################################################
+<?php
+
+use Illuminate\Database\Migrations\Migration;
+use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Support\Facades\Schema;
+
+return new class extends Migration
+{
+    public function up(): void
+    {
+        Schema::create('parametres', function (Blueprint $table) {
+            $table->string('cle', 100)->primary();
+            $table->string('valeur', 255)->nullable();
+            $table->timestamps();
+        });
+    }
+
+    public function down(): void
+    {
+        Schema::dropIfExists('parametres');
+    }
+};
+
+################################################################################
+# database\migrations\2026_10_07_100000_extend_tarifs_for_rules.php
+################################################################################
+<?php
+
+use Illuminate\Database\Migrations\Migration;
+use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Support\Facades\Schema;
+use Illuminate\Support\Facades\DB;
+
+return new class extends Migration
+{
+    public function up(): void
+    {
+        // 1. Retirer les anciennes colonnes, ajouter les nouvelles SANS unique
+        Schema::table('tarifs', function (Blueprint $table) {
+            $table->dropColumn(['nom', 'actif', 'personnalise', 'description']);
+
+            $table->enum('cible', ['unifie', 'ethernet', 'wifi'])
+                ->default('unifie')
+                ->after('id');
+
+            $table->boolean('arrondi_actif')->default(true)->after('montant_minimum');
+            $table->unsignedInteger('unite_arrondi')->default(100)->after('arrondi_actif');
+            $table->unsignedInteger('seuil_arrondi')->default(50)->after('unite_arrondi');
+            $table->string('description', 500)->nullable()->after('seuil_arrondi');
+        });
+
+        // 2. Vider la table (delete plutôt que truncate pour ne pas casser les FK)
+        DB::table('tarifs')->delete();
+
+        // 3. Insérer UNE seule ligne unifiée par défaut
+        DB::table('tarifs')->insert([
+            'cible'              => 'unifie',
+            'montant_par_minute' => 20,
+            'montant_minimum'    => 300,
+            'arrondi_actif'      => 1,
+            'unite_arrondi'      => 100,
+            'seuil_arrondi'      => 50,
+            'description'        => 'Tarif initial du cybercafé (20 Ar/minute, minimum 300 Ar).',
+            'created_at'         => now(),
+            'updated_at'         => now(),
+        ]);
+
+        // 4. Ajouter l'index UNIQUE maintenant qu'il n'y a qu'une ligne
+        Schema::table('tarifs', function (Blueprint $table) {
+            $table->unique('cible', 'tarifs_cible_unique');
+        });
+    }
+
+    public function down(): void
+    {
+        Schema::table('tarifs', function (Blueprint $table) {
+            $table->dropUnique('tarifs_cible_unique');
+            $table->dropColumn([
+                'cible',
+                'arrondi_actif',
+                'unite_arrondi',
+                'seuil_arrondi',
+                'description',
+            ]);
+
+            $table->string('nom')->nullable()->after('id');
+            $table->boolean('actif')->default(true);
+            $table->boolean('personnalise')->default(false);
+            $table->text('description')->nullable();
+        });
+    }
+};
+
+################################################################################
+# database\migrations\2026_10_07_100100_create_tarif_raccourcis_table.php
+################################################################################
+<?php
+
+use Illuminate\Database\Migrations\Migration;
+use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Support\Facades\Schema;
+
+return new class extends Migration
+{
+    public function up(): void
+    {
+        Schema::create('tarif_raccourcis', function (Blueprint $table) {
+            $table->id();
+
+            $table->foreignId('tarif_id')
+                ->constrained('tarifs')
+                ->cascadeOnDelete();
+
+            $table->unsignedInteger('montant');       // ex. 500
+            $table->unsignedInteger('duree');         // minutes, ex. 25
+            $table->string('libelle', 100)->nullable();
+            $table->unsignedSmallInteger('ordre')->default(0);
+
+            $table->timestamps();
+
+            $table->unique(['tarif_id', 'montant']);
+            $table->index(['tarif_id', 'ordre']);
+        });
+    }
+
+    public function down(): void
+    {
+        Schema::dropIfExists('tarif_raccourcis');
+    }
+};
+
+################################################################################
+# database\migrations\2026_10_08_100000_add_wifi_tracking_to_cyber_sessions.php
+################################################################################
+<?php
+
+use Illuminate\Database\Migrations\Migration;
+use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Support\Facades\Schema;
+
+return new class extends Migration
+{
+    public function up(): void
+    {
+        Schema::table('cyber_sessions', function (Blueprint $table) {
+            // État Wi-Fi spécifique (distinct du 'etat' général)
+            $table->enum('etat_wifi', ['connecte', 'deconnecte', 'termine'])
+                ->nullable()
+                ->after('etat');
+
+            // Traçage des déconnexions/reconnexions
+            $table->timestamp('deconnecte_at')->nullable()->after('etat_wifi');
+            $table->timestamp('reconnecte_at')->nullable()->after('deconnecte_at');
+            $table->unsignedInteger('duree_hors_ligne_secondes')->default(0)->after('reconnecte_at');
+
+            // Alarme
+            $table->boolean('alarme_active')->default(false)->after('duree_hors_ligne_secondes');
+            $table->enum('alarme_type', ['duree', 'montant'])->nullable()->after('alarme_active');
+            $table->unsignedInteger('alarme_duree_minutes')->nullable()->after('alarme_type');
+            $table->unsignedInteger('alarme_montant')->nullable()->after('alarme_duree_minutes');
+            $table->timestamp('alarme_fin_prevue')->nullable()->after('alarme_montant');
+            $table->timestamp('alarme_declenchee_at')->nullable()->after('alarme_fin_prevue');
+            $table->string('alarme_message', 255)->nullable()->after('alarme_declenchee_at');
+        });
+    }
+
+    public function down(): void
+    {
+        Schema::table('cyber_sessions', function (Blueprint $table) {
+            $table->dropColumn([
+                'etat_wifi',
+                'deconnecte_at',
+                'reconnecte_at',
+                'duree_hors_ligne_secondes',
+                'alarme_active',
+                'alarme_type',
+                'alarme_duree_minutes',
+                'alarme_montant',
+                'alarme_fin_prevue',
+                'alarme_declenchee_at',
+                'alarme_message',
+            ]);
+        });
+    }
+};
+
+################################################################################
+# database\migrations\2026_10_09_100000_add_pause_state_to_cyber_sessions.php
+################################################################################
+<?php
+
+use Illuminate\Database\Migrations\Migration;
+use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Support\Facades\Schema;
+use Illuminate\Support\Facades\DB;
+
+return new class extends Migration
+{
+    public function up(): void
+    {
+        // Étendre l'ENUM etat_wifi pour inclure "en_pause"
+        DB::statement("
+            ALTER TABLE cyber_sessions
+            MODIFY COLUMN etat_wifi
+            ENUM('connecte','deconnecte','termine','en_pause')
+            NULL DEFAULT NULL
+        ");
+
+        Schema::table('cyber_sessions', function (Blueprint $table) {
+            $table->timestamp('pause_at')->nullable()->after('reconnecte_at');
+            $table->unsignedInteger('duree_pause_secondes')->default(0)->after('pause_at');
+        });
+    }
+
+    public function down(): void
+    {
+        Schema::table('cyber_sessions', function (Blueprint $table) {
+            $table->dropColumn(['pause_at', 'duree_pause_secondes']);
+        });
+
+        DB::statement("
+            ALTER TABLE cyber_sessions
+            MODIFY COLUMN etat_wifi
+            ENUM('connecte','deconnecte','termine')
+            NULL DEFAULT NULL
+        ");
+    }
+};
+
+################################################################################
+# database\migrations\2026_10_09_110000_add_alarme_historique_to_cyber_sessions.php
+################################################################################
+<?php
+
+use Illuminate\Database\Migrations\Migration;
+use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Support\Facades\Schema;
+
+return new class extends Migration
+{
+    public function up(): void
+    {
+        Schema::table('cyber_sessions', function (Blueprint $table) {
+            $table->json('alarme_historique')->nullable()->after('alarme_message');
+        });
+    }
+
+    public function down(): void
+    {
+        Schema::table('cyber_sessions', function (Blueprint $table) {
+            $table->dropColumn('alarme_historique');
+        });
+    }
+};
+
+################################################################################
+# database\migrations\2026_10_12_000000_add_alarme_pause_to_cyber_sessions.php
+################################################################################
+<?php
+
+use Illuminate\Database\Migrations\Migration;
+use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Support\Facades\Schema;
+
+return new class extends Migration
+{
+    public function up(): void
+    {
+        Schema::table('cyber_sessions', function (Blueprint $table) {
+            // Stocke le nombre de secondes restantes de l'alarme lorsque l'appareil est déconnecté
+            $table->unsignedInteger('alarme_secondes_restantes')->nullable()->after('alarme_fin_prevue');
+        });
+    }
+
+    public function down(): void
+    {
+        Schema::table('cyber_sessions', function (Blueprint $table) {
+            $table->dropColumn('alarme_secondes_restantes');
+        });
+    }
+};
+
+################################################################################
+# database\migrations\2026_10_13_120000_add_remarque_to_cyber_sessions.php
+################################################################################
+<?php
+
+use Illuminate\Database\Migrations\Migration;
+use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Support\Facades\Schema;
+
+return new class extends Migration
+{
+    public function up(): void
+    {
+        if (!Schema::hasColumn('cyber_sessions', 'remarque')) {
+            Schema::table('cyber_sessions', function (Blueprint $table) {
+                $table->text('remarque')->nullable()->after('alarme_historique');
+            });
+        }
+    }
+
+    public function down(): void
+    {
+        if (Schema::hasColumn('cyber_sessions', 'remarque')) {
+            Schema::table('cyber_sessions', function (Blueprint $table) {
+                $table->dropColumn('remarque');
+            });
+        }
+    }
+};
+
+################################################################################
+# database\migrations\2026_10_19_100000_add_alarme_derniere_fin_to_cyber_sessions.php
+################################################################################
+<?php
+
+use Illuminate\Database\Migrations\Migration;
+use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Support\Facades\Schema;
+
+return new class extends Migration
+{
+    public function up(): void
+    {
+        if (!Schema::hasColumn('cyber_sessions', 'alarme_derniere_fin_at')) {
+            Schema::table('cyber_sessions', function (Blueprint $table) {
+                $table->timestamp('alarme_derniere_fin_at')->nullable()->after('alarme_fin_prevue');
+            });
+        }
+    }
+
+    public function down(): void
+    {
+        if (Schema::hasColumn('cyber_sessions', 'alarme_derniere_fin_at')) {
+            Schema::table('cyber_sessions', function (Blueprint $table) {
+                $table->dropColumn('alarme_derniere_fin_at');
+            });
+        }
+    }
+};
+
+################################################################################
+# database\migrations\2026_10_20_100000_add_alarme_total_secondes_to_cyber_sessions.php
+################################################################################
+<?php
+
+use Illuminate\Database\Migrations\Migration;
+use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Support\Facades\Schema;
+
+return new class extends Migration
+{
+    public function up(): void
+    {
+        if (!Schema::hasColumn('cyber_sessions', 'alarme_total_secondes')) {
+            Schema::table('cyber_sessions', function (Blueprint $table) {
+                // Durée totale (en secondes) du cycle d'alarme en cours.
+                // Sert à calculer la barre de progression : 1 - restant / total.
+                $table->unsignedInteger('alarme_total_secondes')
+                    ->nullable()
+                    ->after('alarme_secondes_restantes');
+            });
+        }
+    }
+
+    public function down(): void
+    {
+        if (Schema::hasColumn('cyber_sessions', 'alarme_total_secondes')) {
+            Schema::table('cyber_sessions', function (Blueprint $table) {
+                $table->dropColumn('alarme_total_secondes');
+            });
+        }
+    }
+};
+
+################################################################################
+# database\migrations\2026_10_20_150538_create_portail_parametres_table.php
+################################################################################
+<?php
+
+use Illuminate\Database\Migrations\Migration;
+use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Support\Facades\Schema;
+
+return new class extends Migration
+{
+    public function up(): void
+    {
+        Schema::create('portail_parametres', function (Blueprint $table) {
+            $table->id();
+            $table->string('cle')->unique(); // ex: 'logo', 'titre', 'tarif_minute'
+            $table->text('valeur')->nullable();
+            $table->timestamps();
+        });
+    }
+
+    public function down(): void
+    {
+        Schema::dropIfExists('portail_parametres');
+    }
+};
+
+################################################################################
+# database\migrations\2026_11_02_100000_extend_postes_for_agent.php
+################################################################################
+<?php
+
+use Illuminate\Database\Migrations\Migration;
+use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Support\Facades\Schema;
+
+return new class extends Migration
+{
+    public function up(): void
+    {
+        Schema::table('postes', function (Blueprint $table) {
+            // Identifiant unique (GUID) généré par l'agent à l'installation
+            $table->string('identifiant_unique', 64)->nullable()->unique()->after('nom_windows');
+
+            // Token d'authentification de l'agent (envoyé dans X-Agent-Token)
+            $table->string('agent_token', 128)->nullable()->after('agent_url');
+
+            // Heartbeat : dernière fois que l'agent a dit "je suis vivant"
+            $table->timestamp('dernier_heartbeat')->nullable()->after('derniere_communication');
+
+            // Version de l'agent (pour les mises à jour futures)
+            $table->string('agent_version', 32)->nullable()->after('dernier_heartbeat');
+
+            // Identifiants HotSpot MikroTik associés à ce poste
+            $table->string('hotspot_username', 64)->nullable()->after('agent_version');
+            $table->string('hotspot_password', 128)->nullable()->after('hotspot_username');
+
+            // Nouveaux états unifiés : disponible, occupe, suspendu, verrouille, desactive, hors_ligne
+            // On ne touche pas à l'ENUM existant car c'est un VARCHAR, on garde la flexibilité
+        });
+    }
+
+    public function down(): void
+    {
+        Schema::table('postes', function (Blueprint $table) {
+            $table->dropColumn([
+                'identifiant_unique',
+                'agent_token',
+                'dernier_heartbeat',
+                'agent_version',
+                'hotspot_username',
+                'hotspot_password',
+            ]);
+        });
+    }
+};
+
+################################################################################
+# database\migrations\2026_11_02_100100_create_poste_commandes_table.php
+################################################################################
+<?php
+
+use Illuminate\Database\Migrations\Migration;
+use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Support\Facades\Schema;
+
+return new class extends Migration
+{
+    public function up(): void
+    {
+        Schema::create('poste_commandes', function (Blueprint $table) {
+            $table->id();
+
+            $table->foreignId('poste_id')
+                ->constrained('postes')
+                ->cascadeOnDelete();
+
+            // Type de commande : demarrer, fermer, suspendre, reprendre, verrouiller, debloquer, desactiver, arreter
+            $table->string('type', 32);
+
+            // Payload JSON (durée, montant, message, etc.)
+            $table->json('payload')->nullable();
+
+            // Statut : en_attente, recue, executee, echouee
+            $table->enum('statut', ['en_attente', 'recue', 'executee', 'echouee'])
+                ->default('en_attente');
+
+            // Résultat renvoyé par l'agent
+            $table->text('resultat')->nullable();
+
+            $table->timestamp('recue_at')->nullable();
+            $table->timestamp('executee_at')->nullable();
+
+            $table->timestamps();
+
+            $table->index(['poste_id', 'statut']);
+        });
+    }
+
+    public function down(): void
+    {
+        Schema::dropIfExists('poste_commandes');
+    }
+};
+
+################################################################################
+# database\migrations\2026_11_05_100000_create_poste_messages_table.php
+################################################################################
+<?php
+
+use Illuminate\Database\Migrations\Migration;
+use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Support\Facades\Schema;
+
+return new class extends Migration
+{
+    public function up(): void
+    {
+        Schema::create('poste_messages', function (Blueprint $table) {
+            $table->id();
+            $table->foreignId('poste_id')->constrained('postes')->cascadeOnDelete();
+            $table->string('sens', 10);            // admin | client
+            $table->string('contenu', 500);
+            $table->timestamp('lu_at')->nullable();
+            $table->timestamps();
+
+            $table->index(['poste_id', 'id']);
+        });
+    }
+
+    public function down(): void
+    {
+        Schema::dropIfExists('poste_messages');
+    }
+};
+
+################################################################################
+# database\migrations\2026_11_05_100100_add_mode_facturation_to_sessions_table.php
+################################################################################
+<?php
+
+use Illuminate\Database\Migrations\Migration;
+use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Support\Facades\Schema;
+
+return new class extends Migration
+{
+    public function up(): void
+    {
+        if (Schema::hasColumn('sessions', 'mode_facturation')) {
+            return;
+        }
+
+        Schema::table('sessions', function (Blueprint $table) {
+            // forfait (durée limitée) | postpaye (compteur libre) | libre (débloqué, sans facturation)
+            $table->string('mode_facturation', 16)->default('forfait');
+        });
+    }
+
+    public function down(): void
+    {
+        if (Schema::hasColumn('sessions', 'mode_facturation')) {
+            Schema::table('sessions', function (Blueprint $table) {
+                $table->dropColumn('mode_facturation');
+            });
+        }
+    }
+};
+
+################################################################################
+# database\migrations\2026_11_05_103708_add_mode_facturation_to_cyber_sessions_table.php
+################################################################################
+<?php
+
+use Illuminate\Database\Migrations\Migration;
+use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Support\Facades\Schema;
+
+return new class extends Migration
+{
+    public function up(): void
+    {
+        if (!Schema::hasColumn('cyber_sessions', 'mode_facturation')) {
+            Schema::table('cyber_sessions', function (Blueprint $table) {
+                $table->string('mode_facturation', 16)->default('forfait');
+            });
+        }
+    }
+
+    public function down(): void
+    {
+        if (Schema::hasColumn('cyber_sessions', 'mode_facturation')) {
+            Schema::table('cyber_sessions', function (Blueprint $table) {
+                $table->dropColumn('mode_facturation');
+            });
+        }
+    }
+};
+
+################################################################################
+# database\migrations\2026_11_14_100000_create_cyber_settings_table.php
+################################################################################
+<?php
+
+use Illuminate\Database\Migrations\Migration;
+use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Support\Facades\Schema;
+
+return new class extends Migration
+{
+    public function up(): void
+    {
+        Schema::create('cyber_settings', function (Blueprint $table) {
+            $table->id();
+            $table->string('cle', 64)->unique();
+            $table->text('valeur')->nullable();
+            $table->timestamps();
+        });
+    }
+
+    public function down(): void
+    {
+        Schema::dropIfExists('cyber_settings');
+    }
+};
+
+################################################################################
+# database\migrations\2026_11_15_120000_add_identite_columns_to_postes_table.php
+################################################################################
+<?php
+
+use Illuminate\Database\Migrations\Migration;
+use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Support\Facades\Schema;
+
+return new class extends Migration
+{
+    public function up(): void
+    {
+        Schema::table('postes', function (Blueprint $table) {
+            // Dernière adresse réseau vue par le serveur (pas celle que l'agent déclare)
+            $table->string('derniere_ip_vue', 45)->nullable()->after('adresse_ip');
+
+            // Dernier instant où deux ordinateurs ont semblé partager la même identité
+            $table->timestamp('conflit_identite_at')->nullable()->after('derniere_ip_vue');
+        });
+    }
+
+    public function down(): void
+    {
+        Schema::table('postes', function (Blueprint $table) {
+            $table->dropColumn(['derniere_ip_vue', 'conflit_identite_at']);
+        });
+    }
+};
+
+################################################################################
+# database\migrations\2026_11_16_100000_create_agent_versions_table.php
+################################################################################
+<?php
+
+use Illuminate\Database\Migrations\Migration;
+use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Support\Facades\Schema;
+
+return new class extends Migration
+{
+    public function up(): void
+    {
+        Schema::create('agent_versions', function (Blueprint $table) {
+            $table->id();
+            $table->string('version', 32)->unique();
+            $table->string('fichier', 128);
+            $table->string('sha256', 64);
+            $table->unsignedBigInteger('taille')->default(0);
+            $table->text('notes')->nullable();
+            // brouillon | pilote | general | archivee
+            $table->string('statut', 16)->default('brouillon');
+            $table->json('pilotes')->nullable();
+            $table->timestamp('publiee_pilote_at')->nullable();
+            $table->timestamp('publiee_generale_at')->nullable();
+            $table->timestamps();
+        });
+
+        Schema::create('agent_mises_a_jour', function (Blueprint $table) {
+            $table->id();
+            $table->foreignId('poste_id')->constrained('postes')->cascadeOnDelete();
+            $table->string('version', 32);
+            $table->boolean('succes');
+            $table->string('message', 500)->nullable();
+            $table->timestamps();
+
+            $table->index(['poste_id', 'id']);
+        });
+
+        // Reprise de l'ancien manifest.json (version 2.0.0 déjà déposée)
+        try {
+            $chemin = storage_path('app/private/agent-packages/manifest.json');
+            if (is_file($chemin)) {
+                $m = json_decode((string) file_get_contents($chemin), true);
+                $zip = is_array($m) ? storage_path('app/private/agent-packages/' . ($m['fichier'] ?? '')) : '';
+                if (is_array($m) && !empty($m['version']) && !empty($m['fichier']) && is_file($zip)) {
+                    $pilotes = array_map('intval', $m['pilotes'] ?? []);
+                    \DB::table('agent_versions')->insert([
+                        'version'             => (string) $m['version'],
+                        'fichier'             => (string) $m['fichier'],
+                        'sha256'              => strtolower($m['sha256'] ?? hash_file('sha256', $zip)),
+                        'taille'              => filesize($zip),
+                        'notes'               => 'Importée depuis manifest.json',
+                        'statut'              => !empty($m['general']) ? 'general' : ($pilotes ? 'pilote' : 'brouillon'),
+                        'pilotes'             => $pilotes ? json_encode($pilotes) : null,
+                        'publiee_generale_at' => !empty($m['general']) ? now() : null,
+                        'publiee_pilote_at'   => $pilotes ? now() : null,
+                        'created_at'          => now(),
+                        'updated_at'          => now(),
+                    ]);
+                }
+            }
+        } catch (\Throwable) {
+            // L'import est facultatif : on ne bloque jamais la migration.
+        }
+    }
+
+    public function down(): void
+    {
+        Schema::dropIfExists('agent_mises_a_jour');
+        Schema::dropIfExists('agent_versions');
+    }
+};
+
+################################################################################
+# database\migrations\2026_11_16_100100_add_maj_columns_to_postes_table.php
+################################################################################
+<?php
+
+use Illuminate\Database\Migrations\Migration;
+use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Support\Facades\Schema;
+
+return new class extends Migration
+{
+    public function up(): void
+    {
+        Schema::table('postes', function (Blueprint $table) {
+            $table->timestamp('derniere_maj_at')->nullable();
+            $table->string('derniere_maj_resultat', 16)->nullable();   // succes | echec
+            $table->string('derniere_maj_message', 500)->nullable();
+            $table->boolean('mode_maintenance')->default(false);        // appliqué par le Gardien à l'étape 5
+        });
+    }
+
+    public function down(): void
+    {
+        Schema::table('postes', function (Blueprint $table) {
+            $table->dropColumn(['derniere_maj_at', 'derniere_maj_resultat', 'derniere_maj_message', 'mode_maintenance']);
+        });
+    }
+};
+
+################################################################################
+# database\migrations\2026_11_17_100000_add_role_to_users_table.php
+################################################################################
+<?php
+
+use Illuminate\Database\Migrations\Migration;
+use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Schema;
+
+return new class extends Migration
+{
+    public function up(): void
+    {
+        Schema::table('users', function (Blueprint $table) {
+            // Par défaut : personnel (une inscription ne doit jamais créer un admin)
+            $table->string('role', 20)->default('personnel')->after('password');
+        });
+
+        // Les comptes existants sont les administrateurs actuels
+        DB::table('users')->update(['role' => 'admin']);
+    }
+
+    public function down(): void
+    {
+        Schema::table('users', function (Blueprint $table) {
+            $table->dropColumn('role');
+        });
+    }
+};
+
+################################################################################
+# database\migrations\2026_11_17_100000_add_serveur_id_to_cyber_settings.php
+################################################################################
+<?php
+
+use Illuminate\Database\Migrations\Migration;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Schema;
+use Illuminate\Support\Str;
+
+return new class extends Migration
+{
+    /** Identifiant stable du serveur : créé une seule fois, conservé dans les sauvegardes de la base. */
+    public function up(): void
+    {
+        if (!Schema::hasTable('cyber_settings')) {
+            return;
+        }
+        if (DB::table('cyber_settings')->where('cle', 'serveur_id')->exists()) {
+            return;
+        }
+
+        DB::table('cyber_settings')->insert(['cle' => 'serveur_id', 'valeur' => (string) Str::uuid()]);
+    }
+
+    public function down(): void
+    {
+        if (Schema::hasTable('cyber_settings')) {
+            DB::table('cyber_settings')->where('cle', 'serveur_id')->delete();
+        }
+    }
+};
+
+################################################################################
+# database\migrations\2026_11_18_000000_add_avatar_to_users_table.php
+################################################################################
+<?php
+
+use Illuminate\Database\Migrations\Migration;
+use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Support\Facades\Schema;
+
+return new class extends Migration
+{
+    public function up(): void
+    {
+        Schema::table('users', function (Blueprint $table) {
+            // Chemin relatif dans storage/app/public/avatars/ (ex: "avatars/12.jpg")
+            $table->string('avatar', 255)->nullable()->after('email_verified_at');
+        });
+    }
+
+    public function down(): void
+    {
+        Schema::table('users', function (Blueprint $table) {
+            $table->dropColumn('avatar');
+        });
+    }
+};
+
+################################################################################
+# database\migrations\2026_11_18_000000_add_reseau_config_to_cyber_settings.php
+################################################################################
+<?php
+
+use Illuminate\Database\Migrations\Migration;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Schema;
+
+return new class extends Migration
+{
+    /**
+     * Aucune valeur par défaut : adresse, utilisateur et mot de passe du routeur
+     * sont saisis par le gérant (Paramètres > Portail Captif > Réseau).
+     */
+    public function up(): void
+    {
+        // volontairement vide
+    }
+
+    public function down(): void
+    {
+        if (!Schema::hasTable('cyber_settings')) {
+            return;
+        }
+        DB::table('cyber_settings')->whereIn('cle', [
+            'mikrotik_host', 'mikrotik_user', 'mikrotik_password', 'mikrotik_port', 'portail_ip_serveur',
+        ])->delete();
+    }
+};
+
+################################################################################
+# database\migrations\2026_11_18_000001_add_portail_domaine_to_cyber_settings.php
+################################################################################
+<?php
+
+use Illuminate\Database\Migrations\Migration;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Schema;
+
+return new class extends Migration
+{
+    public function up(): void
+    {
+        if (!Schema::hasTable('cyber_settings')) return;
+
+        if (!DB::table('cyber_settings')->where('cle', 'portail_domaine')->exists()) {
+            DB::table('cyber_settings')->insert([
+                'cle' => 'portail_domaine',
+                'valeur' => 'portail.izara', // Valeur par défaut, modifiable via l'interface
+                'created_at' => now(),
+                'updated_at' => now(),
+            ]);
+        }
+    }
+
+    public function down(): void
+    {
+        if (Schema::hasTable('cyber_settings')) {
+            DB::table('cyber_settings')->where('cle', 'portail_domaine')->delete();
+        }
+    }
+};
+
+################################################################################
+# database\migrations\2026_11_18_100000_add_profil_fields_to_users_table.php
+################################################################################
+<?php
+
+use Illuminate\Database\Migrations\Migration;
+use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Support\Facades\Schema;
+
+return new class extends Migration
+{
+    public function up(): void
+    {
+        Schema::table('users', function (Blueprint $table) {
+            $table->string('telephone', 30)->nullable()->after('avatar');
+            $table->text('notes_internes')->nullable()->after('telephone');
+            $table->timestamp('last_login_at')->nullable()->after('notes_internes');
+            $table->string('last_login_ip', 45)->nullable()->after('last_login_at');
+            $table->timestamp('avatar_maj_at')->nullable()->after('last_login_ip');
+        });
+    }
+
+    public function down(): void
+    {
+        Schema::table('users', function (Blueprint $table) {
+            $table->dropColumn(['telephone', 'notes_internes', 'last_login_at', 'last_login_ip', 'avatar_maj_at']);
+        });
+    }
+};
+
+################################################################################
+# database\migrations\2026_11_19_000000_add_verification_codes_to_users_table.php
+################################################################################
+<?php
+
+use Illuminate\Database\Migrations\Migration;
+use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Support\Facades\Schema;
+
+return new class extends Migration
+{
+    public function up(): void
+    {
+        Schema::table('users', function (Blueprint $table) {
+            $table->string('verification_code', 6)->nullable()->after('email_verified_at');
+            $table->timestamp('verification_code_expires_at')->nullable()->after('verification_code');
+            $table->string('reset_password_code', 6)->nullable()->after('verification_code_expires_at');
+            $table->timestamp('reset_password_code_expires_at')->nullable()->after('reset_password_code');
+        });
+    }
+
+    public function down(): void
+    {
+        Schema::table('users', function (Blueprint $table) {
+            $table->dropColumn([
+                'verification_code', 'verification_code_expires_at',
+                'reset_password_code', 'reset_password_code_expires_at'
+            ]);
+        });
+    }
+};
+
+################################################################################
+# database\migrations\2026_11_19_000000_clean_legacy_reseau_defaults.php
+################################################################################
+<?php
+
+use Illuminate\Database\Migrations\Migration;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Schema;
+
+return new class extends Migration
+{
+    /**
+     * Efface les anciennes valeurs en dur, UNIQUEMENT si elles sont encore à leur valeur d'origine
+     * (jamais modifiées par le gérant). Une configuration saisie par le gérant n'est pas touchée.
+     */
+    public function up(): void
+    {
+        if (!Schema::hasTable('cyber_settings')) {
+            return;
+        }
+
+        $val = fn (string $cle) => DB::table('cyber_settings')->where('cle', $cle)->value('valeur');
+
+        if ($val('mikrotik_password') === 'RootAdmin' && $val('mikrotik_host') === '128.0.1.1') {
+            DB::table('cyber_settings')
+                ->whereIn('cle', ['mikrotik_host', 'mikrotik_user', 'mikrotik_password'])
+                ->update(['valeur' => null, 'updated_at' => now()]);
+        }
+    }
+
+    public function down(): void
+    {
+        // irréversible volontairement
+    }
+};
+
+################################################################################
+# database\migrations\2026_11_19_000100_add_internet_to_postes_table.php
+################################################################################
+<?php
+
+use Illuminate\Database\Migrations\Migration;
+use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Support\Facades\Schema;
+
+return new class extends Migration
+{
+    public function up(): void
+    {
+        Schema::table('postes', function (Blueprint $table) {
+            $table->string('internet_etat', 16)->nullable();   // autorise | coupe | erreur | non_gere
+            $table->timestamp('internet_maj_at')->nullable();
+        });
+    }
+
+    public function down(): void
+    {
+        Schema::table('postes', function (Blueprint $table) {
+            $table->dropColumn(['internet_etat', 'internet_maj_at']);
+        });
+    }
+};
+
+################################################################################
+# database\migrations\2026_11_19_100000_add_login_security_to_users_table.php
+################################################################################
+<?php
+
+use Illuminate\Database\Migrations\Migration;
+use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Support\Facades\Schema;
+
+return new class extends Migration
+{
+    public function up(): void
+    {
+        Schema::table('users', function (Blueprint $table) {
+            $table->unsignedTinyInteger('failed_login_attempts')->default(0)->after('password');
+            $table->timestamp('locked_until')->nullable()->after('failed_login_attempts');
+        });
+    }
+
+    public function down(): void
+    {
+        Schema::table('users', function (Blueprint $table) {
+            $table->dropColumn(['failed_login_attempts', 'locked_until']);
+        });
+    }
+};
+
+################################################################################
+# database\migrations\2026_11_20_000000_add_empreinte_to_postes_table.php
+################################################################################
+<?php
+
+use Illuminate\Database\Migrations\Migration;
+use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Support\Facades\Schema;
+
+return new class extends Migration
+{
+    public function up(): void
+    {
+        Schema::table('postes', function (Blueprint $table) {
+            $table->string('empreinte_uuid', 40)->nullable();   // UUID SMBIOS (jamais un secret)
+            $table->text('empreinte_macs')->nullable();         // JSON : MAC des cartes physiques
+        });
+    }
+
+    public function down(): void
+    {
+        Schema::table('postes', function (Blueprint $table) {
+            $table->dropColumn(['empreinte_uuid', 'empreinte_macs']);
+        });
+    }
+};
+
+================================================================================
+FIN DU CONTEXTE ÉTAPE 1.0
+================================================================================

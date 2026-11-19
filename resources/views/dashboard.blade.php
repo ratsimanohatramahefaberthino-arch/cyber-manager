@@ -1,222 +1,214 @@
-@extends('layouts.cyber-manager', ['title' => 'Dashboard — Cyber Manager'])
+@extends('layouts.cyber-manager', ['title' => 'Tableau de bord — Cyber Manager'])
 
 @section('content')
+<div class="space-y-6">
 
-{{-- ============================================================= --}}
-{{-- Bandeau état MikroTik --}}
-{{-- ============================================================= --}}
-@if($stats['mikrotik']['connecte'])
-
-    <div class="bg-green-50 border border-green-200 rounded-lg p-4 mb-6">
-        <div class="flex items-center gap-2 text-green-800 font-semibold">
-            <span class="w-2 h-2 rounded-full bg-green-500"></span>
-            MikroTik connecté —
-            {{ $stats['mikrotik']['identity'] }}
-            (v{{ $stats['mikrotik']['version'] }})
+    {{-- En-tête : Salutations & Statut Système --}}
+    <div class="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+        <div>
+            <h1 class="text-2xl font-bold tracking-tight text-slate-900 dark:text-white">
+                Tableau de bord
+            </h1>
+            <p class="text-sm text-slate-500 dark:text-slate-400">
+                Aujourd'hui, {{ now()->locale('fr')->isoFormat('dddd D MMMM YYYY') }}
+            </p>
         </div>
-        <div class="text-sm text-green-700 mt-1">
-            Board : {{ $stats['mikrotik']['board'] }}
-            &middot; Uptime : {{ $stats['mikrotik']['uptime'] }}
-        </div>
-    </div>
 
-@else
-
-    <div class="bg-red-50 border border-red-200 rounded-lg p-4 mb-6">
-        <div class="flex items-center gap-2 text-red-800 font-semibold">
-            <span class="w-2 h-2 rounded-full bg-red-500"></span>
-            MikroTik injoignable
-        </div>
-        <div class="text-sm text-red-700 mt-1 break-all">
-            {{ $stats['mikrotik']['erreur'] }}
-        </div>
-        <div class="text-xs text-red-600 mt-2">
-            Les statistiques HotSpot ci-dessous sont indisponibles.
-            Les statistiques locales (postes, vouchers, sessions) restent valides.
-        </div>
-    </div>
-
-@endif
-
-
-{{-- ============================================================= --}}
-{{-- Cartes synthèse --}}
-{{-- ============================================================= --}}
-<div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
-
-    {{-- Postes --}}
-    <div class="bg-white border border-gray-200 rounded-lg p-5">
-        <div class="text-sm text-gray-500 mb-1">Postes</div>
-        <div class="text-3xl font-bold text-gray-800">
-            {{ $stats['postes']['en_utilisation'] }}
-            <span class="text-base font-normal text-gray-400">
-                / {{ $stats['postes']['total'] }}
-            </span>
-        </div>
-        <div class="text-xs text-gray-500 mt-2">
-            {{ $stats['postes']['disponible'] }} disponibles
-            &middot; {{ $stats['postes']['suspendu'] }} suspendus
-        </div>
-    </div>
-
-    {{-- Sessions en cours --}}
-    <div class="bg-white border border-gray-200 rounded-lg p-5">
-        <div class="text-sm text-gray-500 mb-1">Sessions en cours</div>
-        <div class="text-3xl font-bold text-blue-600">
-            {{ $stats['sessions']['en_cours'] }}
-        </div>
-        <div class="text-xs text-gray-500 mt-2">
-            {{ $stats['sessions']['suspendue'] }} suspendues
-            &middot; {{ $stats['sessions']['aujourdhui'] }} aujourd'hui
-        </div>
-    </div>
-
-    {{-- HotSpot actifs --}}
-    <div class="bg-white border border-gray-200 rounded-lg p-5">
-        <div class="text-sm text-gray-500 mb-1">Clients Wi-Fi actifs</div>
-        <div class="text-3xl font-bold text-purple-600">
+        <div class="flex items-center gap-2">
             @if($stats['mikrotik']['connecte'])
-                {{ $stats['mikrotik']['active'] }}
+                <span class="inline-flex items-center gap-1.5 rounded-full border border-emerald-200 bg-emerald-50 px-3 py-1 text-xs font-semibold text-emerald-800 dark:border-emerald-800 dark:bg-emerald-950/40 dark:text-emerald-300">
+                    <span class="h-2 w-2 rounded-full bg-emerald-500"></span>
+                    {{ $stats['mikrotik']['identity'] }} en ligne
+                </span>
             @else
-                <span class="text-gray-300">—</span>
-            @endif
-        </div>
-        <div class="text-xs text-gray-500 mt-2">
-            @if($stats['mikrotik']['connecte'])
-                {{ $stats['hotspot']['users_total'] }} comptes configurés
-            @else
-                indisponible
-            @endif
-        </div>
-    </div>
-
-    {{-- Vouchers --}}
-    <div class="bg-white border border-gray-200 rounded-lg p-5">
-        <div class="text-sm text-gray-500 mb-1">Vouchers disponibles</div>
-        <div class="text-3xl font-bold text-amber-600">
-            {{ $stats['vouchers']['disponible'] }}
-        </div>
-        <div class="text-xs text-gray-500 mt-2">
-            {{ $stats['vouchers']['total'] }} au total
-            @if($stats['vouchers']['non_sync'] > 0)
-                &middot;
-                <span class="text-red-600 font-semibold">
-                    {{ $stats['vouchers']['non_sync'] }} non synchronisés
+                <span class="inline-flex items-center gap-1.5 rounded-full border border-rose-200 bg-rose-50 px-3 py-1 text-xs font-semibold text-rose-800 dark:border-rose-800 dark:bg-rose-950/40 dark:text-rose-300"
+                      title="{{ $stats['mikrotik']['erreur'] }}">
+                    <span class="h-2 w-2 rounded-full bg-rose-500"></span>
+                    Routeur déconnecté
                 </span>
             @endif
         </div>
     </div>
 
-</div>
+    {{-- 4 Grandes Cartes Principales (KPIs) --}}
+    <div class="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-4">
 
-
-{{-- ============================================================= --}}
-{{-- Deux colonnes : détail postes / détail vouchers+hotspot --}}
-{{-- ============================================================= --}}
-<div class="grid grid-cols-1 lg:grid-cols-2 gap-4">
-
-    {{-- Postes --}}
-    <div class="bg-white border border-gray-200 rounded-lg p-5">
-        <h2 class="font-semibold text-gray-800 mb-3">État des postes</h2>
-
-        <dl class="space-y-2 text-sm">
-            <div class="flex justify-between">
-                <dt class="text-gray-600">Disponibles</dt>
-                <dd class="font-semibold text-green-600">
-                    {{ $stats['postes']['disponible'] }}
-                </dd>
+        {{-- Carte 1 : Recette du jour --}}
+        <div class="relative overflow-hidden rounded-2xl border border-slate-200 bg-white p-5 shadow-sm dark:border-slate-800 dark:bg-slate-900">
+            <div class="flex items-center justify-between">
+                <span class="text-xs font-bold uppercase tracking-wider text-slate-400">Caisse du jour</span>
+                <span class="flex h-9 w-9 items-center justify-center rounded-xl bg-emerald-50 text-emerald-600 dark:bg-emerald-950/50 dark:text-emerald-400">
+                    <x-icone nom="tag" class="h-5 w-5" />
+                </span>
             </div>
-            <div class="flex justify-between">
-                <dt class="text-gray-600">En utilisation</dt>
-                <dd class="font-semibold text-blue-600">
-                    {{ $stats['postes']['en_utilisation'] }}
-                </dd>
+            <div class="mt-3">
+                <div class="text-3xl font-extrabold text-slate-900 dark:text-white">
+                    {{ number_format($stats['recette']['total'], 0, ',', ' ') }} <span class="text-base font-semibold text-emerald-600">Ar</span>
+                </div>
+                <div class="mt-2 flex items-center gap-3 text-xs text-slate-500 dark:text-slate-400">
+                    <span>💻 PC : <strong>{{ number_format($stats['recette']['postes'], 0, ',', ' ') }} Ar</strong></span>
+                    <span>•</span>
+                    <span>📶 Wi-Fi : <strong>{{ number_format($stats['recette']['wifi'], 0, ',', ' ') }} Ar</strong></span>
+                </div>
             </div>
-            <div class="flex justify-between">
-                <dt class="text-gray-600">Suspendus</dt>
-                <dd class="font-semibold text-amber-600">
-                    {{ $stats['postes']['suspendu'] }}
-                </dd>
-            </div>
-            <div class="flex justify-between">
-                <dt class="text-gray-600">Désactivés</dt>
-                <dd class="font-semibold text-gray-400">
-                    {{ $stats['postes']['inactif'] }}
-                </dd>
-            </div>
-        </dl>
-
-        <div class="mt-4 pt-4 border-t border-gray-100 text-right">
-            <a href="{{ route('postes.index') }}"
-               class="text-sm text-blue-600 hover:text-blue-800">
-                Voir les postes →
-            </a>
         </div>
+
+        {{-- Carte 2 : Occupation des Postes --}}
+        <div class="relative overflow-hidden rounded-2xl border border-slate-200 bg-white p-5 shadow-sm dark:border-slate-800 dark:bg-slate-900">
+            <div class="flex items-center justify-between">
+                <span class="text-xs font-bold uppercase tracking-wider text-slate-400">Postes PC</span>
+                <span class="flex h-9 w-9 items-center justify-center rounded-xl bg-violet-50 text-violet-600 dark:bg-violet-950/50 dark:text-violet-400">
+                    <x-icone nom="desktop" class="h-5 w-5" />
+                </span>
+            </div>
+            <div class="mt-3">
+                <div class="flex items-baseline gap-2">
+                    <span class="text-3xl font-extrabold text-slate-900 dark:text-white">{{ $stats['postes']['occupes'] }}</span>
+                    <span class="text-base font-semibold text-slate-400">/ {{ $stats['postes']['total'] }} occupés</span>
+                </div>
+                {{-- Petite jauge visuelle --}}
+                <div class="mt-3 h-2 w-full overflow-hidden rounded-full bg-slate-100 dark:bg-slate-800">
+                    <div class="h-full rounded-full bg-violet-600 transition-all duration-500" style="width: {{ $stats['postes']['taux'] }}%"></div>
+                </div>
+                <div class="mt-2 flex justify-between text-xs text-slate-500 dark:text-slate-400">
+                    <span>{{ $stats['postes']['disponibles'] }} libres</span>
+                    <span>{{ $stats['postes']['taux'] }}% d'occupation</span>
+                </div>
+            </div>
+        </div>
+
+        {{-- Carte 3 : Wi-Fi en direct --}}
+        <div class="relative overflow-hidden rounded-2xl border border-slate-200 bg-white p-5 shadow-sm dark:border-slate-800 dark:bg-slate-900">
+            <div class="flex items-center justify-between">
+                <span class="text-xs font-bold uppercase tracking-wider text-slate-400">Clients Wi-Fi</span>
+                <span class="flex h-9 w-9 items-center justify-center rounded-xl bg-indigo-50 text-indigo-600 dark:bg-indigo-950/50 dark:text-indigo-400">
+                    <x-icone nom="wifi" class="h-5 w-5" />
+                </span>
+            </div>
+            <div class="mt-3">
+                <div class="text-3xl font-extrabold text-slate-900 dark:text-white">
+                    {{ $stats['wifi']['clients_actifs'] }}
+                </div>
+                <p class="mt-2 text-xs text-slate-500 dark:text-slate-400">
+                    Appareils actuellement connectés au réseau
+                </p>
+            </div>
+        </div>
+
+        {{-- Carte 4 : Vouchers disponibles --}}
+        <div class="relative overflow-hidden rounded-2xl border border-slate-200 bg-white p-5 shadow-sm dark:border-slate-800 dark:bg-slate-900">
+            <div class="flex items-center justify-between">
+                <span class="text-xs font-bold uppercase tracking-wider text-slate-400">Tickets Wi-Fi</span>
+                <span class="flex h-9 w-9 items-center justify-center rounded-xl bg-amber-50 text-amber-600 dark:bg-amber-950/50 dark:text-amber-400">
+                    <x-icone nom="key" class="h-5 w-5" />
+                </span>
+            </div>
+            <div class="mt-3">
+                <div class="flex items-baseline gap-2">
+                    <span class="text-3xl font-extrabold text-slate-900 dark:text-white">{{ $stats['vouchers']['disponibles'] }}</span>
+                    <span class="text-xs text-slate-400">en stock</span>
+                </div>
+                <div class="mt-2 text-xs">
+                    @if($stats['vouchers']['disponibles'] < 10)
+                        <span class="font-semibold text-amber-600 dark:text-amber-400">⚠️ Stock bientôt bas</span>
+                    @else
+                        <span class="text-slate-500 dark:text-slate-400">Prêts pour la vente</span>
+                    @endif
+                </div>
+            </div>
+        </div>
+
     </div>
 
-    {{-- HotSpot + Vouchers --}}
-    <div class="bg-white border border-gray-200 rounded-lg p-5">
-        <h2 class="font-semibold text-gray-800 mb-3">HotSpot &amp; Vouchers</h2>
+    {{-- Section Inférieure : Raccourcis Rapides + Dernières Activités --}}
+    <div class="grid grid-cols-1 gap-6 lg:grid-cols-12">
 
-        @if($stats['mikrotik']['connecte'])
-            <dl class="space-y-2 text-sm">
-                <div class="flex justify-between">
-                    <dt class="text-gray-600">Comptes HotSpot (MikroTik)</dt>
-                    <dd class="font-semibold">{{ $stats['hotspot']['users_total'] }}</dd>
-                </div>
-                <div class="flex justify-between">
-                    <dt class="text-gray-600">&nbsp;&nbsp;dont créés par Cyber Manager</dt>
-                    <dd class="font-semibold text-blue-600">
-                        {{ $stats['hotspot']['users_cm'] }}
-                    </dd>
-                </div>
-                <div class="flex justify-between">
-                    <dt class="text-gray-600">&nbsp;&nbsp;dont hérités (Mikhmon / manuels)</dt>
-                    <dd class="font-semibold text-gray-500">
-                        {{ $stats['hotspot']['users_autres'] }}
-                    </dd>
-                </div>
-                <div class="flex justify-between">
-                    <dt class="text-gray-600">Profils HotSpot</dt>
-                    <dd class="font-semibold">{{ $stats['mikrotik']['profiles'] }}</dd>
-                </div>
-            </dl>
-        @else
-            <p class="text-sm text-gray-400 italic">
-                Informations MikroTik indisponibles.
-            </p>
-        @endif
+        {{-- Colonne Gauche : Accès Rapides (5 colonnes) --}}
+        <div class="space-y-4 lg:col-span-5">
+            <div class="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm dark:border-slate-800 dark:bg-slate-900">
+                <h2 class="text-base font-bold text-slate-900 dark:text-white">Accès directs</h2>
+                <p class="mt-1 text-xs text-slate-500 dark:text-slate-400">Passez à l'action en un clic.</p>
 
-        <div class="mt-4 pt-4 border-t border-gray-100">
-            <dl class="space-y-2 text-sm">
-                <div class="flex justify-between">
-                    <dt class="text-gray-600">Vouchers disponibles</dt>
-                    <dd class="font-semibold text-green-600">
-                        {{ $stats['vouchers']['disponible'] }}
-                    </dd>
+                <div class="mt-4 grid grid-cols-2 gap-3">
+                    <a href="{{ route('postes.index') }}"
+                       class="flex flex-col items-center justify-center gap-2 rounded-xl border border-slate-200 bg-slate-50 p-4 text-center transition hover:border-violet-300 hover:bg-violet-50/50 dark:border-slate-800 dark:bg-slate-800/60 dark:hover:border-violet-700">
+                        <span class="flex h-10 w-10 items-center justify-center rounded-full bg-violet-600 text-white shadow-sm">
+                            <x-icone nom="desktop" class="h-5 w-5" />
+                        </span>
+                        <span class="text-xs font-bold text-slate-800 dark:text-slate-200">Gérer les Postes</span>
+                    </a>
+
+                    <a href="{{ route('wifi.index') }}"
+                       class="flex flex-col items-center justify-center gap-2 rounded-xl border border-slate-200 bg-slate-50 p-4 text-center transition hover:border-indigo-300 hover:bg-indigo-50/50 dark:border-slate-800 dark:bg-slate-800/60 dark:hover:border-indigo-700">
+                        <span class="flex h-10 w-10 items-center justify-center rounded-full bg-indigo-600 text-white shadow-sm">
+                            <x-icone nom="wifi" class="h-5 w-5" />
+                        </span>
+                        <span class="text-xs font-bold text-slate-800 dark:text-slate-200">Gérer le Wi-Fi</span>
+                    </a>
+
+                    <a href="{{ route('hotspot.index') }}"
+                       class="flex flex-col items-center justify-center gap-2 rounded-xl border border-slate-200 bg-slate-50 p-4 text-center transition hover:border-amber-300 hover:bg-amber-50/50 dark:border-slate-800 dark:bg-slate-800/60 dark:hover:border-amber-700">
+                        <span class="flex h-10 w-10 items-center justify-center rounded-full bg-amber-500 text-white shadow-sm">
+                            <x-icone nom="key" class="h-5 w-5" />
+                        </span>
+                        <span class="text-xs font-bold text-slate-800 dark:text-slate-200">Tickets HotSpot</span>
+                    </a>
+
+                    <a href="{{ route('tarifs.index') }}"
+                       class="flex flex-col items-center justify-center gap-2 rounded-xl border border-slate-200 bg-slate-50 p-4 text-center transition hover:border-slate-300 hover:bg-slate-100 dark:border-slate-800 dark:bg-slate-800/60 dark:hover:border-slate-700">
+                        <span class="flex h-10 w-10 items-center justify-center rounded-full bg-slate-700 text-white shadow-sm dark:bg-slate-600">
+                            <x-icone nom="tag" class="h-5 w-5" />
+                        </span>
+                        <span class="text-xs font-bold text-slate-800 dark:text-slate-200">Tarifs & Prix</span>
+                    </a>
                 </div>
-                <div class="flex justify-between">
-                    <dt class="text-gray-600">Vouchers utilisés</dt>
-                    <dd class="font-semibold">{{ $stats['vouchers']['utilise'] }}</dd>
-                </div>
-                <div class="flex justify-between">
-                    <dt class="text-gray-600">Vouchers annulés</dt>
-                    <dd class="font-semibold text-gray-400">
-                        {{ $stats['vouchers']['annule'] }}
-                    </dd>
-                </div>
-                @if($stats['vouchers']['non_sync'] > 0)
-                    <div class="flex justify-between">
-                        <dt class="text-red-600">Non synchronisés vers MikroTik</dt>
-                        <dd class="font-semibold text-red-600">
-                            {{ $stats['vouchers']['non_sync'] }}
-                        </dd>
+            </div>
+        </div>
+
+        {{-- Colonne Droite : Dernières Sessions / Activité récente (7 colonnes) --}}
+        <div class="lg:col-span-7">
+            <div class="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm dark:border-slate-800 dark:bg-slate-900">
+                <div class="flex items-center justify-between">
+                    <div>
+                        <h2 class="text-base font-bold text-slate-900 dark:text-white">Sessions récentes</h2>
+                        <p class="text-xs text-slate-500 dark:text-slate-400">Derniers passages enregistrés.</p>
                     </div>
-                @endif
-            </dl>
+                    <a href="{{ route('historique.index') }}" class="text-xs font-semibold text-violet-600 hover:underline dark:text-violet-400">
+                        Voir tout l'historique →
+                    </a>
+                </div>
+
+                <div class="mt-4 divide-y divide-slate-100 dark:divide-slate-800">
+                    @forelse($stats['recentes'] as $session)
+                        <div class="flex items-center justify-between py-3">
+                            <div class="flex items-center gap-3">
+                                <span class="flex h-9 w-9 items-center justify-center rounded-lg {{ $session['type'] === 'ethernet' ? 'bg-violet-50 text-violet-600 dark:bg-violet-950/60 dark:text-violet-400' : 'bg-indigo-50 text-indigo-600 dark:bg-indigo-950/60 dark:text-indigo-400' }}">
+                                    <x-icone :nom="$session['type'] === 'ethernet' ? 'desktop' : 'wifi'" class="h-4 w-4" />
+                                </span>
+                                <div>
+                                    <p class="text-sm font-semibold text-slate-900 dark:text-white">{{ $session['nom'] }}</p>
+                                    <p class="text-xs text-slate-400">{{ $session['date_formatee'] }} &middot; {{ $session['duree_min'] }} min</p>
+                                </div>
+                            </div>
+                            <div class="text-right">
+                                <p class="text-sm font-bold text-slate-900 dark:text-white">
+                                    {{ number_format($session['montant'], 0, ',', ' ') }} Ar
+                                </p>
+                                <span class="inline-block rounded px-1.5 py-0.5 text-[10px] font-medium {{ $session['etat'] === 'en_cours' ? 'bg-emerald-50 text-emerald-700 dark:bg-emerald-950/50 dark:text-emerald-400' : 'bg-slate-100 text-slate-600 dark:bg-slate-800 dark:text-slate-400' }}">
+                                    {{ $session['etat'] === 'en_cours' ? 'En cours' : 'Terminé' }}
+                                </span>
+                            </div>
+                        </div>
+                    @empty
+                        <div class="py-8 text-center text-sm text-slate-400">
+                            Aucune session enregistrée aujourd'hui.
+                        </div>
+                    @endforelse
+                </div>
+            </div>
         </div>
+
     </div>
 
 </div>
-
 @endsection

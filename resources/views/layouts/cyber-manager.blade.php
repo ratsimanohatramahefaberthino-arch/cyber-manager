@@ -79,10 +79,9 @@
     $cyber = \App\Models\CyberSetting::tous();
     $estAdmin = Auth::user()?->estAdmin() ?? false;
 
-    $liens = [
-        ['route' => 'dashboard',          'motif' => 'dashboard',        'label' => 'Dashboard',    'icone' => 'home'],
+$liens = [
+        ['route' => 'dashboard',          'motif' => 'dashboard',        'label' => 'Tableau de Bord',    'icone' => 'home'],
         ['route' => 'postes.index',       'motif' => 'postes.*',         'label' => 'Postes',       'icone' => 'desktop'],
-        ['route' => 'sessions.index',     'motif' => 'sessions.*',       'label' => 'Sessions',     'icone' => 'clock'],
         ['route' => 'wifi.index',         'motif' => 'wifi.*',           'label' => 'Wi-Fi',        'icone' => 'wifi'],
         ['route' => 'hotspot.index',      'motif' => 'hotspot.*',        'label' => 'HotSpot',      'icone' => 'key'],
         ['route' => 'tarifs.index',       'motif' => 'tarifs.*',         'label' => 'Tarifs',       'icone' => 'tag'],
